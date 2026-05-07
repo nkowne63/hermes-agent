@@ -1704,6 +1704,11 @@ class GatewayRunner:
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
+        channel_override = self._resolve_channel_model_override(source)
+        if channel_override:
+            override_model = channel_override.get("model") or channel_override.get("default")
+            if override_model:
+                model = str(override_model)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -1734,6 +1739,10 @@ class GatewayRunner:
             )
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
+        if channel_override:
+            for key in ("provider", "api_key", "base_url", "api_mode"):
+                if key in channel_override and channel_override.get(key) is not None:
+                    runtime_kwargs[key] = channel_override.get(key)
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -1756,6 +1765,45 @@ class GatewayRunner:
                 pass
 
         return model, runtime_kwargs
+
+    def _resolve_channel_model_override(self, source: Optional[SessionSource]) -> dict | None:
+        """Resolve platform per-channel model overrides from config.yaml.
+
+        Config shape:
+
+            discord:
+              channel_model_overrides:
+                "1234567890":
+                  model: gpt-5.5
+                  provider: openai-codex
+                  base_url: https://chatgpt.com/backend-api/codex
+                  reasoning_effort: low
+
+        Exact chat/thread channel ID wins; parent channel ID is used as fallback
+        so Discord threads can inherit a parent channel's override.
+        """
+        if source is None:
+            return None
+        try:
+            platform_cfg = getattr(self, "config", None).platforms.get(source.platform)  # type: ignore[union-attr]
+        except Exception:
+            platform_cfg = None
+        extra = getattr(platform_cfg, "extra", None) or {}
+        overrides = extra.get("channel_model_overrides") or {}
+        if not isinstance(overrides, dict):
+            return None
+        ids = (
+            getattr(source, "chat_id", None),
+            getattr(source, "thread_id", None),
+            getattr(source, "parent_chat_id", None),
+        )
+        for channel_id in ids:
+            if not channel_id:
+                continue
+            entry = overrides.get(str(channel_id))
+            if isinstance(entry, dict):
+                return entry
+        return None
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
@@ -2115,6 +2163,15 @@ class GatewayRunner:
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+        channel_override = self._resolve_channel_model_override(source)
+        if channel_override:
+            effort = channel_override.get("reasoning_effort") or channel_override.get("reasoning")
+            if isinstance(effort, str):
+                effort = effort.strip().lower()
+                if effort == "none":
+                    return {"enabled": False}
+                if effort in ("minimal", "low", "medium", "high", "xhigh"):
+                    return {"enabled": True, "effort": effort}
         return self._load_reasoning_config()
 
     def _set_session_reasoning_override(
