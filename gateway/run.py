@@ -1766,6 +1766,79 @@ class GatewayRunner:
 
         return model, runtime_kwargs
 
+
+    def _extract_scope_flag(self, raw_args: str, flag: str) -> bool:
+        """Return True when a command contains a boolean scope flag."""
+        return f"--{flag}" in (raw_args or "").split()
+
+    def _remove_scope_flag(self, raw_args: str, flag: str) -> str:
+        """Remove a boolean scope flag while preserving the remaining args."""
+        return " ".join(part for part in (raw_args or "").split() if part != f"--{flag}")
+
+    def _channel_override_id_for_source(self, source: Optional[SessionSource]) -> str | None:
+        """Return the config key used for a per-channel override."""
+        if source is None:
+            return None
+        return str(getattr(source, "chat_id", None) or getattr(source, "thread_id", None) or "") or None
+
+    def _save_channel_model_override(self, source: Optional[SessionSource], override: dict) -> bool:
+        """Persist a model/provider override for the current platform channel/thread."""
+        channel_id = self._channel_override_id_for_source(source)
+        if not source or not channel_id:
+            return False
+        try:
+            import yaml
+            cfg_path = _hermes_home / "config.yaml"
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            platform_key = _platform_config_key(source.platform)
+            platform_cfg = cfg.setdefault(platform_key, {})
+            if not isinstance(platform_cfg, dict):
+                platform_cfg = {}
+                cfg[platform_key] = platform_cfg
+            overrides = platform_cfg.setdefault("channel_model_overrides", {})
+            if not isinstance(overrides, dict):
+                overrides = {}
+                platform_cfg["channel_model_overrides"] = overrides
+            entry = dict(overrides.get(channel_id) or {})
+            for key in ("model", "provider", "api_key", "base_url", "api_mode"):
+                if key in override and override.get(key) is not None:
+                    entry[key] = override.get(key)
+            overrides[channel_id] = entry
+            atomic_yaml_write(cfg_path, cfg)
+            return True
+        except Exception as exc:
+            logger.error("Failed to save channel model override: %s", exc)
+            return False
+
+    def _save_channel_reasoning_override(self, source: Optional[SessionSource], effort: str) -> bool:
+        """Persist reasoning_effort for the current platform channel/thread."""
+        channel_id = self._channel_override_id_for_source(source)
+        if not source or not channel_id:
+            return False
+        try:
+            import yaml
+            cfg_path = _hermes_home / "config.yaml"
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            platform_key = _platform_config_key(source.platform)
+            platform_cfg = cfg.setdefault(platform_key, {})
+            if not isinstance(platform_cfg, dict):
+                platform_cfg = {}
+                cfg[platform_key] = platform_cfg
+            overrides = platform_cfg.setdefault("channel_model_overrides", {})
+            if not isinstance(overrides, dict):
+                overrides = {}
+                platform_cfg["channel_model_overrides"] = overrides
+            entry = dict(overrides.get(channel_id) or {})
+            entry["reasoning_effort"] = effort
+            overrides[channel_id] = entry
+            atomic_yaml_write(cfg_path, cfg)
+            return True
+        except Exception as exc:
+            logger.error("Failed to save channel reasoning override: %s", exc)
+            return False
+
     def _resolve_channel_model_override(self, source: Optional[SessionSource]) -> dict | None:
         """Resolve platform per-channel model overrides from config.yaml.
 
@@ -7923,9 +7996,13 @@ class GatewayRunner:
         from hermes_cli.providers import get_label
 
         raw_args = event.get_command_args().strip()
+        persist_channel = self._extract_scope_flag(raw_args, "channel")
+        raw_args = self._remove_scope_flag(raw_args, "channel")
 
         # Parse --provider and --global flags
         model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
+        if persist_channel and persist_global:
+            return "⚠️ Use either `--channel` or `--global`, not both."
 
         # Read current model/provider from config
         current_model = ""
@@ -7952,9 +8029,16 @@ class GatewayRunner:
         except Exception:
             pass
 
-        # Check for session override
+        # Check for channel/session overrides. Session overrides remain most specific,
+        # but /model should display the effective per-channel default when present.
         source = event.source
         session_key = self._session_key_for_source(source)
+        channel_override = self._resolve_channel_model_override(source)
+        if channel_override:
+            current_model = channel_override.get("model") or channel_override.get("default") or current_model
+            current_provider = channel_override.get("provider", current_provider)
+            current_base_url = channel_override.get("base_url", current_base_url)
+            current_api_key = channel_override.get("api_key", current_api_key)
         override = self._session_model_overrides.get(session_key, {})
         if override:
             current_model = override.get("model", current_model)
@@ -8103,7 +8187,13 @@ class GatewayRunner:
 
             # Fallback: text list (for platforms without picker or if picker failed)
             provider_label = get_label(current_provider)
-            lines = [f"Current: `{current_model or 'unknown'}` on {provider_label}", ""]
+            if override:
+                scope_label = "session override"
+            elif channel_override:
+                scope_label = f"channel override `{self._channel_override_id_for_source(source) or 'unknown'}`"
+            else:
+                scope_label = "global config"
+            lines = [f"Current: `{current_model or 'unknown'}` on {provider_label}", f"Scope: {scope_label}", ""]
 
             try:
                 providers = list_authenticated_providers(
@@ -8127,9 +8217,10 @@ class GatewayRunner:
             except Exception:
                 pass
 
-            lines.append("`/model <name>` — switch model")
+            lines.append("`/model <name>` — switch model for this session")
             lines.append("`/model <name> --provider <slug>` — switch provider")
-            lines.append("`/model <name> --global` — persist")
+            lines.append("`/model <name> --channel` — persist as this channel/thread default")
+            lines.append("`/model <name> --global` — persist globally")
             return "\n".join(lines)
 
         # Perform the switch
@@ -8178,8 +8269,7 @@ class GatewayRunner:
             f"Adjust your self-identification accordingly.]"
         )
 
-        # Store session override so next agent creation uses the new model
-        self._session_model_overrides[session_key] = {
+        model_override_payload = {
             "model": result.new_model,
             "provider": result.target_provider,
             "api_key": result.api_key,
@@ -8187,9 +8277,21 @@ class GatewayRunner:
             "api_mode": result.api_mode,
         }
 
+        # Store session override so next agent creation uses the new model,
+        # unless the caller requested a channel/global default instead.
+        if not persist_channel and not persist_global:
+            self._session_model_overrides[session_key] = model_override_payload
+
         # Evict cached agent so the next turn creates a fresh agent from the
         # override rather than relying on cache signature mismatch detection.
         self._evict_cached_agent(session_key)
+
+        # Persist to config if --channel
+        if persist_channel:
+            saved_channel = self._save_channel_model_override(source, model_override_payload)
+            if not saved_channel:
+                self._session_model_overrides[session_key] = model_override_payload
+                logger.warning("Failed to persist channel model override; stored session override instead")
 
         # Persist to config if --global
         if persist_global:
@@ -8257,10 +8359,13 @@ class GatewayRunner:
         if result.warning_message:
             lines.append(f"Warning: {result.warning_message}")
 
-        if persist_global:
+        if persist_channel:
+            channel_id = self._channel_override_id_for_source(source) or "unknown"
+            lines.append(f"Saved to config.yaml for channel/thread `{channel_id}` (`--channel`)")
+        elif persist_global:
             lines.append("Saved to config.yaml (`--global`)")
         else:
-            lines.append("_(session only -- add `--global` to persist)_")
+            lines.append("_(session only -- add `--channel` for this channel or `--global` to persist globally)_")
 
         return "\n".join(lines)
 
@@ -9383,7 +9488,11 @@ class GatewayRunner:
         import yaml
 
         raw_args = event.get_command_args().strip()
+        persist_channel = self._extract_scope_flag(raw_args, "channel")
+        raw_args = self._remove_scope_flag(raw_args, "channel")
         args, persist_global = self._parse_reasoning_command_args(raw_args)
+        if persist_channel and persist_global:
+            return "⚠️ Use either `--channel` or `--global`, not both."
         config_path = _hermes_home / "config.yaml"
         session_key = self._session_key_for_source(event.source)
         self._show_reasoning = self._load_show_reasoning()
@@ -9423,13 +9532,19 @@ class GatewayRunner:
                 level = rc.get("effort", "medium")
             display_state = "on ✓" if self._show_reasoning else "off"
             has_session_override = session_key in (getattr(self, "_session_reasoning_overrides", {}) or {})
-            scope = "session override" if has_session_override else "global config"
+            has_channel_override = bool(self._resolve_channel_model_override(event.source))
+            if has_session_override:
+                scope = "session override"
+            elif has_channel_override:
+                scope = f"channel override `{self._channel_override_id_for_source(event.source) or 'unknown'}`"
+            else:
+                scope = "global config"
             return (
                 "🧠 **Reasoning Settings**\n\n"
                 f"**Effort:** `{level}`\n"
                 f"**Scope:** {scope}\n"
                 f"**Display:** {display_state}\n\n"
-                "_Usage:_ `/reasoning <none|minimal|low|medium|high|xhigh|reset|show|hide> [--global]`"
+                "_Usage:_ `/reasoning <none|minimal|low|medium|high|xhigh|reset|show|hide> [--channel|--global]`"
             )
 
         # Display toggle (per-platform)
@@ -9465,10 +9580,20 @@ class GatewayRunner:
                 f"⚠️ Unknown argument: `{effort or raw_args.lower()}`\n\n"
                 "**Valid levels:** none, minimal, low, medium, high, xhigh\n"
                 "**Display:** show, hide\n"
-                "**Persist:** add `--global` to save beyond this session"
+                "**Persist:** add `--channel` for this channel or `--global` globally"
             )
 
         self._reasoning_config = parsed
+        if persist_channel:
+            if self._save_channel_reasoning_override(event.source, effort):
+                self._set_session_reasoning_override(session_key, None)
+                self._evict_cached_agent(session_key)
+                channel_id = self._channel_override_id_for_source(event.source) or "unknown"
+                return f"🧠 ✓ Reasoning effort set to `{effort}` for channel/thread `{channel_id}`\n_(takes effect on next message)_"
+            self._set_session_reasoning_override(session_key, parsed)
+            self._evict_cached_agent(session_key)
+            return f"🧠 ✓ Reasoning effort set to `{effort}` (session only — channel config save failed)\n_(takes effect on next message)_"
+
         if persist_global:
             if _save_config_key("agent.reasoning_effort", effort):
                 self._set_session_reasoning_override(session_key, None)
