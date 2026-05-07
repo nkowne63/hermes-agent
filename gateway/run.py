@@ -1776,10 +1776,40 @@ class GatewayRunner:
         return " ".join(part for part in (raw_args or "").split() if part != f"--{flag}")
 
     def _channel_override_id_for_source(self, source: Optional[SessionSource]) -> str | None:
-        """Return the config key used for a per-channel override."""
+        """Return the config key used when saving a per-channel override.
+
+        For thread conversations, save to the parent channel when known. That
+        makes `/model ... --channel` inside an auto-created Discord thread set
+        the default for the whole parent channel, and future spawned threads
+        inherit it.
+        """
         if source is None:
             return None
+        if getattr(source, "chat_type", None) == "thread" and getattr(source, "parent_chat_id", None):
+            return str(getattr(source, "parent_chat_id"))
         return str(getattr(source, "chat_id", None) or getattr(source, "thread_id", None) or "") or None
+
+    def _channel_override_match_id_for_source(self, source: Optional[SessionSource]) -> str | None:
+        """Return the channel/thread id whose override currently matches source."""
+        if source is None:
+            return None
+        try:
+            platform_cfg = getattr(self, "config", None).platforms.get(source.platform)  # type: ignore[union-attr]
+        except Exception:
+            platform_cfg = None
+        extra = getattr(platform_cfg, "extra", None) or {}
+        overrides = extra.get("channel_model_overrides") or {}
+        if not isinstance(overrides, dict):
+            return None
+        ids = (
+            getattr(source, "chat_id", None),
+            getattr(source, "thread_id", None),
+            getattr(source, "parent_chat_id", None),
+        )
+        for channel_id in ids:
+            if channel_id and str(channel_id) in overrides:
+                return str(channel_id)
+        return None
 
     def _save_channel_model_override(self, source: Optional[SessionSource], override: dict) -> bool:
         """Persist a model/provider override for the current platform channel/thread."""
@@ -8190,7 +8220,7 @@ class GatewayRunner:
             if override:
                 scope_label = "session override"
             elif channel_override:
-                scope_label = f"channel override `{self._channel_override_id_for_source(source) or 'unknown'}`"
+                scope_label = f"channel override `{self._channel_override_match_id_for_source(source) or self._channel_override_id_for_source(source) or 'unknown'}`"
             else:
                 scope_label = "global config"
             lines = [f"Current: `{current_model or 'unknown'}` on {provider_label}", f"Scope: {scope_label}", ""]
@@ -9536,7 +9566,7 @@ class GatewayRunner:
             if has_session_override:
                 scope = "session override"
             elif has_channel_override:
-                scope = f"channel override `{self._channel_override_id_for_source(event.source) or 'unknown'}`"
+                scope = f"channel override `{self._channel_override_match_id_for_source(event.source) or self._channel_override_id_for_source(event.source) or 'unknown'}`"
             else:
                 scope = "global config"
             return (
