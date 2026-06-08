@@ -136,6 +136,15 @@ def _has_env(name: str) -> bool:
 def _has_brave_search_key() -> bool:
     return _has_env("BRAVE_SEARCH_API_KEY") or _has_env("BRAVE_API_KEY")
 
+def _native_extract_importable() -> bool:
+    for module_name in ("rs_trafilatura", "trafilatura", "readability"):
+        try:
+            __import__(module_name)
+            return True
+        except ImportError:
+            continue
+    return False
+
 def _load_web_config() -> dict:
     """Load the ``web:`` section from ~/.hermes/config.yaml."""
     try:
@@ -148,7 +157,7 @@ def _load_web_config() -> dict:
 # ``web.search_backend`` / ``web.extract_backend``). Kept as a single source of
 # truth for config validation across the selection helpers.
 _KNOWN_WEB_BACKENDS = frozenset(
-    {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}
+    {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "native"}
 )
 
 # Backends that only service web_search (their provider's ``supports_extract()``
@@ -266,6 +275,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "native":
+        return _native_extract_importable()
     if backend == "searxng":
         return _has_env("SEARXNG_URL")
     if backend == "brave-free":
@@ -1148,8 +1159,8 @@ async def web_extract_tool(
                             "error": (
                                 f"{provider.display_name} is a search-only "
                                 "backend and cannot extract URL content. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
+                                "Set web.extract_backend to native, "
+                                "firecrawl, tavily, exa, or parallel."
                             ),
                         },
                         ensure_ascii=False,
@@ -1161,8 +1172,8 @@ async def web_extract_tool(
                             "success": False,
                             "error": (
                                 "No web extract provider configured. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
+                                "Set web.extract_backend to native, "
+                                "firecrawl, tavily, exa, or parallel."
                             ),
                         },
                         ensure_ascii=False,
