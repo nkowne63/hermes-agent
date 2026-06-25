@@ -1175,9 +1175,11 @@ def _build_child_agent(
         effective_acp_args = []
 
     if override_acp_command:
-        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
-        # so run_agent.py initializes the CopilotACPClient.
-        effective_provider = "copilot-acp"
+        # If explicitly forcing an ACP transport override, keep the current
+        # external-process provider when we already have one; otherwise fall
+        # back to Copilot ACP so run_agent.py still initializes an ACP client.
+        if effective_provider not in {"copilot-acp", "devin-acp"}:
+            effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
     # Resolve reasoning config: delegation override > parent inherit
