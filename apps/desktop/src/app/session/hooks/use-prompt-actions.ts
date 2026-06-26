@@ -27,22 +27,17 @@ import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { setSessionYolo } from '@/lib/yolo-session'
-import { openCommandPalettePage } from '@/store/command-palette'
 import {
   $composerAttachments,
   clearComposerAttachments,
   type ComposerAttachment,
   setComposerAttachmentUploadState,
-  setComposerDraft,
   terminalContextBlocksFromDraft,
   updateComposerAttachment
 } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { setPetScale } from '@/store/pet-gallery'
-import { $petGenInput, openPetGenerate } from '@/store/pet-generate'
-import { clearPreviewArtifacts } from '@/store/preview-status'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   $busy,
@@ -62,7 +57,6 @@ import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 
 import type {
-  BrowserManageResponse,
   ClientSessionState,
   FileAttachResponse,
   HandoffFailResponse,
@@ -156,13 +150,6 @@ async function withSessionBusyRetry<T>(call: () => Promise<T>): Promise<T> {
     }
   }
 }
-
-// Hard guard: at most one prompt.submit in flight per session. Every submit
-// path — user Enter, queue drain, busy-retry, slash fallthrough — funnels
-// through submitPromptText. Without this, a stalled turn (e.g. a context-bloated
-// session whose first call hangs) let the SAME prompt launch several real turns
-// at once (the "message stacked 5×" bug). Keyed by stored/active session id.
-const _submitInFlight = new Set<string>()
 
 function base64FromDataUrl(dataUrl: string): string {
   const comma = dataUrl.indexOf(',')
@@ -389,31 +376,6 @@ function visibleUserOrdinal(messages: readonly ChatMessage[], end: number): numb
   return messages.slice(0, end).filter(m => m.role === 'user' && !m.hidden).length
 }
 
-function visibleUserIndexAtOrdinal(messages: readonly ChatMessage[], targetOrdinal: number): number {
-  let ordinal = 0
-
-  for (let index = 0; index < messages.length; index += 1) {
-    const message = messages[index]
-
-    if (message.role !== 'user' || message.hidden) {
-      continue
-    }
-
-    if (ordinal === targetOrdinal) {
-      return index
-    }
-
-    ordinal += 1
-  }
-
-  return -1
-}
-
-interface RestoreMessageTarget {
-  text?: string
-  userOrdinal?: number | null
-}
-
 export function usePromptActions({
   activeSessionId,
   activeSessionIdRef,
@@ -585,15 +547,7 @@ export function usePromptActions({
     async (rawText: string, options?: SubmitTextOptions) => {
       const visibleText = rawText.trim()
       const usingComposerAttachments = !options?.attachments
-
-      // Drop undefined/null holes a session switch or draft restore can leave in
-      // the attachments array (same bug class as AttachmentList #49624). Without
-      // this, the sibling iterations below (a.kind / a.label / a.refText, and the
-      // sync step) throw "Cannot read properties of undefined (reading 'refText')"
-      // and break the chat surface.
-      const attachments = (options?.attachments ?? $composerAttachments.get()).filter((a): a is ComposerAttachment =>
-        Boolean(a)
-      )
+      const attachments = options?.attachments ?? $composerAttachments.get()
 
       const terminalContextBlocks = terminalContextBlocksFromDraft(rawText).join('\n\n')
       const hasImage = attachments.some(a => a.kind === 'image')
@@ -606,18 +560,14 @@ export function usePromptActions({
       let attachmentRefs = attachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
 
       const buildContextText = (atts: ComposerAttachment[]): string => {
-        // atts may be the post-sync array, which can reintroduce holes; filter
-        // before touching a.refText / a.kind.
-        const present = atts.filter((a): a is ComposerAttachment => Boolean(a))
-
-        const contextRefs = present
+        const contextRefs = atts
           .map(a => a.refText)
           .filter(Boolean)
           .join('\n')
 
         return (
           [contextRefs, terminalContextBlocks, visibleText].filter(Boolean).join('\n\n') ||
-          (present.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
+          (atts.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
         )
       }
 
@@ -631,24 +581,6 @@ export function usePromptActions({
         return false
       }
 
-      // One submit in flight per session — drop any concurrent re-fire so a
-      // stalled turn can't stack the same prompt into multiple real turns.
-      const submitLockKey = selectedStoredSessionIdRef.current || activeSessionId || '__pending_new__'
-
-      if (_submitInFlight.has(submitLockKey)) {
-        return false
-      }
-
-      _submitInFlight.add(submitLockKey)
-      let submitLockReleased = false
-
-      const releaseSubmitLock = () => {
-        if (!submitLockReleased) {
-          submitLockReleased = true
-          _submitInFlight.delete(submitLockKey)
-        }
-      }
-
       const optimisticId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
       const buildUserMessage = (): ChatMessage => ({
@@ -659,7 +591,6 @@ export function usePromptActions({
       })
 
       const releaseBusy = () => {
-        releaseSubmitLock()
         setMutableRef(busyRef, false)
         setBusy(false)
         setAwaitingResponse(false)
@@ -801,10 +732,6 @@ export function usePromptActions({
           clearComposerAttachments()
         }
 
-        // Submit landed — the turn now runs (busy stays true), but the submit
-        // window is closed, so release the lock for the next (sequential) send.
-        releaseSubmitLock()
-
         return true
       } catch (err) {
         releaseBusy()
@@ -849,7 +776,6 @@ export function usePromptActions({
     },
     [
       activeSessionId,
-      activeSessionIdRef,
       busyRef,
       copy,
       createBackendSessionForSend,
@@ -985,9 +911,31 @@ export function usePromptActions({
           return
         }
 
-        const handleDispatch = async (
-          dispatch: NonNullable<ReturnType<typeof parseCommandDispatch>>
-        ): Promise<void> => {
+        try {
+          const result = await requestGateway<SlashExecResponse>('slash.exec', {
+            session_id: sessionId,
+            command: command.replace(/^\/+/, '')
+          })
+
+          const body = result?.output || `/${name}: no output`
+          renderSlashOutput(result?.warning ? `warning: ${result.warning}\n${body}` : body)
+
+          return
+        } catch {
+          // Fall back to command.dispatch for skill/send/alias directives.
+        }
+
+        try {
+          const dispatch = parseCommandDispatch(
+            await requestGateway<unknown>('command.dispatch', { session_id: sessionId, name, arg })
+          )
+
+          if (!dispatch) {
+            renderSlashOutput('error: invalid response: command.dispatch')
+
+            return
+          }
+
           if (dispatch.type === 'exec' || dispatch.type === 'plugin') {
             renderSlashOutput(dispatch.output ?? '(no output)')
 
@@ -1000,25 +948,7 @@ export function usePromptActions({
             return
           }
 
-          // send / prefill carry an optional `notice` (e.g. "⊙ Goal set …")
-          // that the backend wants shown as a system line before the message
-          // is acted on. Mirrors the TUI's createSlashHandler — without it a
-          // `/goal <text>` looked like it did nothing.
-          if ((dispatch.type === 'send' || dispatch.type === 'prefill') && dispatch.notice?.trim()) {
-            renderSlashOutput(dispatch.notice.trim())
-          }
-
           const message = ('message' in dispatch ? dispatch.message : '')?.trim() ?? ''
-
-          // /undo returns a prefill directive: drop the backed-up message into
-          // the composer for editing instead of submitting it immediately.
-          if (dispatch.type === 'prefill') {
-            if (message) {
-              setComposerDraft(message)
-            }
-
-            return
-          }
 
           if (!message) {
             renderSlashOutput(
@@ -1039,43 +969,6 @@ export function usePromptActions({
           }
 
           await submitPromptText(message)
-        }
-
-        try {
-          const result = await requestGateway<unknown>('slash.exec', {
-            session_id: sessionId,
-            command: command.replace(/^\/+/, '')
-          })
-
-          const dispatch = parseCommandDispatch(result)
-
-          if (dispatch) {
-            await handleDispatch(dispatch)
-
-            return
-          }
-
-          const output = result && typeof result === 'object' ? (result as SlashExecResponse) : null
-          const body = output?.output || `/${name}: no output`
-          renderSlashOutput(output?.warning ? `warning: ${output.warning}\n${body}` : body)
-
-          return
-        } catch {
-          // Fall back to command.dispatch for skill/send/alias directives.
-        }
-
-        try {
-          const dispatch = parseCommandDispatch(
-            await requestGateway<unknown>('command.dispatch', { session_id: sessionId, name, arg })
-          )
-
-          if (!dispatch) {
-            renderSlashOutput('error: invalid response: command.dispatch')
-
-            return
-          }
-
-          await handleDispatch(dispatch)
         } catch (err) {
           renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
         }
@@ -1243,122 +1136,6 @@ export function usePromptActions({
             const catalog = await requestGateway<CommandsCatalogLike>('commands.catalog', { session_id: sessionId })
 
             renderSlashOutput(renderCommandsCatalog(catalog, copy))
-          } catch (err) {
-            renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
-          }
-        },
-        // /hatch opens the pet generator overlay (the desktop's rich, multi-step
-        // generate→pick→hatch→adopt flow). A typed description seeds the prompt
-        // so `/hatch a cyber fox` lands on the composer step prefilled.
-        hatch: async ({ arg }) => {
-          const concept = arg.trim()
-
-          if (concept) {
-            $petGenInput.set(concept)
-          }
-
-          openPetGenerate()
-        },
-        pet: async ctx => {
-          const [sub = '', rawValue = ''] = ctx.arg.trim().split(/\s+/)
-          const lower = sub.toLowerCase()
-
-          if (lower === 'list' || lower === 'gallery' || lower === 'browse' || lower === 'all') {
-            openCommandPalettePage('pets')
-
-            return
-          }
-
-          // `/pet scale <n>` resizes the floating pet locally (instant) and
-          // persists via the store — no round-trip to the slash worker.
-          if (lower === 'scale') {
-            const value = Number(rawValue)
-
-            if (!rawValue || Number.isNaN(value)) {
-              const resolved = await withSlashOutput(ctx)
-              resolved?.render('usage: /pet scale <factor>  (e.g. /pet scale 0.5)')
-
-              return
-            }
-
-            setPetScale(requestGateway, value)
-
-            return
-          }
-
-          await runExec(ctx)
-        },
-        // /browser connect|disconnect|status manages the live CDP connection on
-        // the gateway host, mirroring the TUI's browser.manage RPC. It mutates
-        // BROWSER_CDP_URL (and may launch Chrome) in the gateway process — only
-        // meaningful when that process runs on this machine, so it's gated to
-        // local connections. A remote gateway would act on the wrong host.
-        browser: async ctx => {
-          const resolved = await withSlashOutput(ctx)
-
-          if (!resolved) {
-            return
-          }
-
-          const { render: renderSlashOutput, sessionId } = resolved
-
-          if ($connection.get()?.mode === 'remote') {
-            renderSlashOutput(
-              '/browser manages a Chromium-family browser on the gateway host — only available when connected to a local gateway.'
-            )
-
-            return
-          }
-
-          const [rawAction = 'status', ...rest] = ctx.arg.trim().split(/\s+/).filter(Boolean)
-          const cmdAction = rawAction.toLowerCase()
-
-          if (!['connect', 'disconnect', 'status'].includes(cmdAction)) {
-            renderSlashOutput(
-              'usage: /browser [connect|disconnect|status] [url] · persistent: set browser.cdp_url in config.yaml'
-            )
-
-            return
-          }
-
-          const url = cmdAction === 'connect' ? rest.join(' ').trim() || 'http://127.0.0.1:9222' : undefined
-
-          if (url) {
-            renderSlashOutput(`checking Chromium-family browser remote debugging at ${url}...`)
-          }
-
-          try {
-            const result = await requestGateway<BrowserManageResponse>('browser.manage', {
-              action: cmdAction,
-              session_id: sessionId,
-              ...(url && { url })
-            })
-
-            // Without a streamed session subscription, the gateway bundles its
-            // progress lines into `messages` — flush them inline.
-            result?.messages?.forEach(message => renderSlashOutput(message))
-
-            if (cmdAction === 'status') {
-              renderSlashOutput(
-                result?.connected
-                  ? `browser connected: ${result.url || '(url unavailable)'}`
-                  : 'browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)'
-              )
-
-              return
-            }
-
-            if (cmdAction === 'disconnect') {
-              renderSlashOutput('browser disconnected')
-
-              return
-            }
-
-            if (result?.connected) {
-              renderSlashOutput('Browser connected to live Chromium-family browser via CDP')
-              renderSlashOutput(`Endpoint: ${result.url || '(url unavailable)'}`)
-              renderSlashOutput('next browser tool call will use this CDP endpoint')
-            }
           } catch (err) {
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           }
@@ -1697,85 +1474,61 @@ export function usePromptActions({
   // mechanism — `prompt.submit` with `truncate_before_user_ordinal` drops that
   // user turn and everything after it from the session history, then the same
   // text is submitted as a fresh turn. Callers confirm before invoking; errors
-  // are rethrown so callers can surface failures. Idle rewinds submit directly:
-  // interrupting an idle agent can leave a stale interrupt flag that cancels the
-  // fresh turn. Live/stuck turns interrupt first, and a raced "session busy"
-  // response interrupts + retries through the shared busy gate.
+  // are rethrown so the confirmation dialog can surface them inline.
+  // Submit a rewind (truncate-before-ordinal + resubmit). Because edit/restore
+  // can fire while a turn is streaming, interrupt the live turn first — the
+  // cooperative interrupt takes a beat, so the shared busy-retry rides it out.
   const submitRewindPrompt = useCallback(
-    async (sessionId: string, text: string, truncateOrdinal: number | undefined, interruptFirst: boolean) => {
-      const interrupt = async () => {
+    async (sessionId: string, text: string, truncateOrdinal: number | undefined, wasRunning: boolean) => {
+      if (wasRunning) {
         try {
           await requestGateway('session.interrupt', { session_id: sessionId })
         } catch {
-          // Best-effort. The submit path still gates on the gateway state.
+          // Best-effort — the busy-retry below still gates the submit.
         }
       }
 
-      const submit = () =>
+      await withSessionBusyRetry(() =>
         requestGateway('prompt.submit', {
           session_id: sessionId,
           text,
           ...(truncateOrdinal !== undefined && { truncate_before_user_ordinal: truncateOrdinal })
         })
-
-      if (interruptFirst) {
-        await interrupt()
-      }
-
-      try {
-        await submit()
-      } catch (err) {
-        if (!isSessionBusyError(err)) {
-          throw err
-        }
-
-        await interrupt()
-        await withSessionBusyRetry(submit)
-      }
+      )
     },
     [requestGateway]
   )
 
   const restoreToMessage = useCallback(
-    async (messageId: string, target?: RestoreMessageTarget) => {
+    async (messageId: string) => {
       const sessionId = activeSessionId || activeSessionIdRef.current
 
       if (!sessionId) {
-        throw new Error('No active session to restore.')
+        return
       }
 
       const messages = $messages.get()
-      const idIndex = messages.findIndex(m => m.id === messageId && m.role === 'user')
-
-      const fallbackIndex =
-        target?.userOrdinal === null || target?.userOrdinal === undefined
-          ? -1
-          : visibleUserIndexAtOrdinal(messages, target.userOrdinal)
-
-      const sourceIndex = idIndex >= 0 ? idIndex : fallbackIndex
+      const sourceIndex = messages.findIndex(m => m.id === messageId)
       const source = messages[sourceIndex]
 
       if (!source || source.role !== 'user') {
-        throw new Error('Could not find the message to restore.')
+        return
       }
 
-      const text = (chatMessageText(source).trim() || target?.text?.trim() || '').trim()
+      const text = chatMessageText(source).trim()
 
       if (!text) {
-        throw new Error('Cannot restore an empty message.')
+        return
       }
 
-      const truncateBeforeUserOrdinal =
-        target?.userOrdinal === null || target?.userOrdinal === undefined
-          ? visibleUserOrdinal(messages, sourceIndex)
-          : target.userOrdinal
+      const wasRunning = $busy.get()
+      const truncateBeforeUserOrdinal = visibleUserOrdinal(messages, sourceIndex)
 
       // The turns we're discarding may have spawned todos and background
       // processes; they belong to the abandoned timeline, so wipe their status
       // rows (and kill the live processes) before the fresh run repopulates.
       clearSessionTodos(sessionId)
       resetSessionBackground(sessionId)
-      clearPreviewArtifacts(sessionId)
 
       clearNotifications()
       setMutableRef(busyRef, true)
@@ -1792,21 +1545,12 @@ export function usePromptActions({
       }))
 
       try {
-        await submitRewindPrompt(sessionId, text, truncateBeforeUserOrdinal, busyRef.current || $busy.get())
+        await submitRewindPrompt(sessionId, text, truncateBeforeUserOrdinal, wasRunning)
       } catch (err) {
-        // The rewind never landed (e.g. the gateway stayed busy past the retry
-        // deadline). Roll the optimistic truncation back to the full original
-        // history so the UI doesn't desync from what's persisted — leaving it
-        // truncated is what made subsequent sends look duplicative.
         setMutableRef(busyRef, false)
         setBusy(false)
         setAwaitingResponse(false)
-        updateSessionState(sessionId, state => ({
-          ...state,
-          busy: false,
-          awaitingResponse: false,
-          messages
-        }))
+        updateSessionState(sessionId, state => ({ ...state, busy: false, awaitingResponse: false }))
         throw err
       }
     },
@@ -1832,8 +1576,9 @@ export function usePromptActions({
       }
 
       // Sending an edit is a revert: rewind to this prompt and re-run with the
-      // new text. It can fire mid-turn; submitRewindPrompt always interrupts
-      // first, so a live turn is wound down before the resubmit.
+      // new text. It can fire mid-turn, so capture the live state — the submit
+      // helper interrupts first when a turn is running.
+      const wasRunning = $busy.get()
 
       // Failed turn: optimistic user msg never reached the gateway, so truncating
       // by ordinal would 422. Submit as a plain resend instead.
@@ -1846,7 +1591,6 @@ export function usePromptActions({
       // processes) before the re-run repopulates them.
       clearSessionTodos(sessionId)
       resetSessionBackground(sessionId)
-      clearPreviewArtifacts(sessionId)
 
       clearNotifications()
       setMutableRef(busyRef, true)
@@ -1870,7 +1614,7 @@ export function usePromptActions({
           sessionId,
           text,
           isFailedTurn ? undefined : visibleUserOrdinal(messages, sourceIndex),
-          busyRef.current || $busy.get()
+          wasRunning
         )
       } catch (err) {
         let surfaced = err
@@ -1886,13 +1630,10 @@ export function usePromptActions({
           }
         }
 
-        // Roll the optimistic edit/truncation back to the original history so the
-        // UI stays in sync with what's persisted instead of stranding a partial
-        // timeline.
         setMutableRef(busyRef, false)
         setBusy(false)
         setAwaitingResponse(false)
-        updateSessionState(sessionId, state => ({ ...state, busy: false, awaitingResponse: false, messages }))
+        updateSessionState(sessionId, state => ({ ...state, busy: false, awaitingResponse: false }))
         notifyError(surfaced, copy.editFailed)
       }
     },

@@ -882,6 +882,29 @@ class S6ServiceManager:
         m = re.search(r"\(pid (\d+)\)", result.stdout)
         return int(m.group(1)) if m else None
 
+    def _supervised_pid(self, name: str) -> int | None:
+        """Return the PID of the supervised gateway process, or None.
+
+        Parses ``s6-svstat`` output (``up (pid NNNN) ...``). Used to
+        mark an operator-initiated stop with the planned-stop marker so
+        the gateway's shutdown handler classifies the incoming SIGTERM
+        as intentional rather than an unexpected kill (issue #42675).
+        Best-effort: any parse/exec failure returns None.
+        """
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                [f"{_S6_BIN_DIR}/s6-svstat", str(self.scandir / name)],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        m = re.search(r"\(pid (\d+)\)", result.stdout)
+        return int(m.group(1)) if m else None
+
     def stop(self, name: str) -> None:
         """Bring down a registered service (``s6-svc -d``).
 

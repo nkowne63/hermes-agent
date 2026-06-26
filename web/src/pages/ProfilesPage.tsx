@@ -7,7 +7,6 @@ import {
   useState,
 } from "react";
 import { useNavigate } from "react-router-dom";
-import { useProfileScope } from "@/contexts/useProfileScope";
 import {
   AlignLeft,
   Check,
@@ -260,7 +259,6 @@ export default function ProfilesPage() {
   const { toast, showToast } = useToast();
   const { t } = useI18n();
   const { setEnd } = usePageHeader();
-  const { setProfile } = useProfileScope();
 
   // Locale strings with English fallbacks. The enriched keys are optional in
   // the i18n type so untranslated locales don't break the build — they render
@@ -307,7 +305,7 @@ export default function ProfilesPage() {
       manageSkills: p.manageSkills ?? "Manage skills & tools",
       activeSetHint:
         p.activeSetHint ??
-        "Dashboard switched to manage {name}. New CLI/gateway runs will use this profile too.",
+        "Applies to new CLI/gateway runs. This dashboard still manages its own profile — use “Manage skills & tools” to edit {name}.",
     };
   }, [t.profiles]);
 
@@ -497,7 +495,10 @@ export default function ProfilesPage() {
       // The backend normalizes/validates the name; trust the canonical
       // value it returns rather than the raw input.
       const { active } = await api.setActiveProfile(name);
-      setProfile(active);
+      // "Set as active" only flips the sticky default for FUTURE CLI/gateway
+      // invocations — it does NOT retarget this running dashboard. Say so,
+      // or users assume skill/tool toggles now apply to the activated
+      // profile (they don't — that's what "Manage skills & tools" is for).
       showToast(
         `${L.activeSet}: ${active} — ${L.activeSetHint.replace("{name}", active)}`,
         "success",

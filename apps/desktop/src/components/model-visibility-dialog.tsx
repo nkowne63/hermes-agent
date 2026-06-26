@@ -14,9 +14,10 @@ import {
   $visibleModels,
   collapseModelFamilies,
   effectiveVisibleKeys,
+  emptyProviderSentinelKey,
+  isProviderSentinel,
   modelVisibilityKey,
-  setVisibleModels,
-  toggleModelVisibility
+  setVisibleModels
 } from '@/store/model-visibility'
 import type { ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
 
@@ -60,7 +61,25 @@ export function ModelVisibilityDialog({
   const visible = effectiveVisibleKeys(stored, providers)
 
   const toggle = (provider: ModelOptionProvider, model: string) => {
-    setVisibleModels(toggleModelVisibility($visibleModels.get(), providers, provider.slug, model))
+    const next = new Set(effectiveVisibleKeys($visibleModels.get(), providers))
+    const key = modelVisibilityKey(provider.slug, model)
+    const sentinel = emptyProviderSentinelKey(provider.slug)
+
+    if (next.has(key)) {
+      next.delete(key)
+
+      // Check if this was the last real model for this provider.
+      const remainingForProvider = [...next].some(k => k.startsWith(`${provider.slug}::`) && !isProviderSentinel(k))
+
+      if (!remainingForProvider) {
+        next.add(sentinel)
+      }
+    } else {
+      next.delete(sentinel)
+      next.add(key)
+    }
+
+    setVisibleModels(next)
   }
 
   const q = search.trim().toLowerCase()

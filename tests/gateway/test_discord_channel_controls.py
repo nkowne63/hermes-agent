@@ -281,6 +281,34 @@ async def test_no_thread_with_auto_thread_disabled_is_noop(adapter, monkeypatch)
     adapter.handle_message.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_thread_response_overrides_reply_suppression(adapter, monkeypatch):
+    """thread_response should still auto-thread reply messages when mentioned."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    monkeypatch.setattr(discord_platform.discord, "MessageType", SimpleNamespace(reply="reply"), raising=False)
+    monkeypatch.setattr(adapter, "_discord_thread_response_for", lambda channel, channel_ids: True)
+    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999, name="auto-thread"))
+
+    bot_user = adapter._client.user
+    message = make_message(
+        channel=FakeTextChannel(channel_id=800),
+        content=f"<@{bot_user.id}> reply mention",
+        mentions=[bot_user],
+    )
+    message.type = "reply"
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+
+
 # ── config.py bridging ───────────────────────────────────────────────
 
 

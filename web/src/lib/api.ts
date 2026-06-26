@@ -60,11 +60,10 @@ export function getManagementProfile(): string {
 
 // Endpoint families that honor ?profile= on the backend (web_server.py
 // _profile_scope or explicit per-profile DB opens). Anything else — ops,
-// pairing, cron (which has its own per-job profile params), profiles
-// themselves — is machine-global or self-scoped and must NOT be rewritten.
+// pairing, telegram onboarding, cron (which has its own per-job profile
+// params), profiles themselves — is machine-global or self-scoped and must
+// NOT be rewritten.
 const PROFILE_SCOPED_PREFIXES = [
-  "/api/status",
-  "/api/gateway",
   "/api/analytics",
   "/api/skills",
   "/api/tools/toolsets",
@@ -72,11 +71,9 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/env",
   "/api/mcp",
   "/api/messaging/platforms",
-  "/api/messaging/telegram/onboarding",
   "/api/model/info",
   "/api/model/set",
   "/api/model/auxiliary",
-  "/api/model/moa",
   "/api/model/options",
 ];
 
@@ -345,25 +342,13 @@ export const api = {
       window.location.assign("/login");
       return r;
     }),
-  getSessions: (
-    limit = 20,
-    offset = 0,
-    profile = getManagementProfile(),
-    order: "created" | "recent" = "created",
-  ) =>
+  getSessions: (limit = 20, offset = 0, profile = getManagementProfile()) =>
     fetchJSON<PaginatedSessions>(
-      appendProfileParam(
-        `/api/sessions?limit=${limit}&offset=${offset}&order=${order}`,
-        profile,
-      ),
+      appendProfileParam(`/api/sessions?limit=${limit}&offset=${offset}`, profile),
     ),
   getSessionMessages: (id: string, profile = getManagementProfile()) =>
     fetchJSON<SessionMessagesResponse>(
       appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/messages`, profile),
-    ),
-  getSessionDetail: (id: string, profile = getManagementProfile()) =>
-    fetchJSON<SessionInfo>(
-      appendProfileParam(`/api/sessions/${encodeURIComponent(id)}`, profile),
     ),
   getSessionLatestDescendant: (id: string) =>
     fetchJSON<SessionLatestDescendantResponse>(
@@ -424,21 +409,12 @@ export const api = {
     fetchJSON<ManagedFileReadResponse>(
       `/api/files/read?path=${encodeURIComponent(path)}`,
     ),
-  uploadFile: (path: string, file: File, overwrite = true) => {
-    // Stream the raw bytes as multipart/form-data. Do NOT set Content-Type —
-    // the browser adds the multipart boundary automatically. Sending the file
-    // as base64 JSON (the old path) inflated the body ~33%, buffered the whole
-    // file in memory, and 502'd on large backup archives behind the proxy
-    // (NS-501).
-    const form = new FormData();
-    form.append("path", path);
-    form.append("overwrite", String(overwrite));
-    form.append("file", file, file.name);
-    return fetchJSON<ManagedFileWriteResponse>("/api/files/upload-stream", {
+  uploadFile: (path: string, dataUrl: string, overwrite = true) =>
+    fetchJSON<ManagedFileWriteResponse>("/api/files/upload", {
       method: "POST",
-      body: form,
-    });
-  },
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, data_url: dataUrl, overwrite }),
+    }),
   createDirectory: (path: string) =>
     fetchJSON<ManagedFileWriteResponse>("/api/files/mkdir", {
       method: "POST",
@@ -473,13 +449,6 @@ export const api = {
   getModelInfo: () => fetchJSON<ModelInfoResponse>("/api/model/info"),
   getModelOptions: () => fetchJSON<ModelOptionsResponse>("/api/model/options"),
   getAuxiliaryModels: () => fetchJSON<AuxiliaryModelsResponse>("/api/model/auxiliary"),
-  getMoaModels: () => fetchJSON<MoaConfigResponse>("/api/model/moa"),
-  saveMoaModels: (body: MoaConfigResponse) =>
-    fetchJSON<MoaConfigResponse & { ok: boolean }>("/api/model/moa", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
   setModelAssignment: (body: ModelAssignmentRequest) =>
     fetchJSON<ModelAssignmentResponse>("/api/model/set", {
       method: "POST",
@@ -802,7 +771,7 @@ export const api = {
 
   // Messaging platforms (gateway channels)
   getMessagingPlatforms: () =>
-    fetchJSON<MessagingPlatformsResponse>("/api/messaging/platforms"),
+    fetchJSON<{ platforms: MessagingPlatform[] }>("/api/messaging/platforms"),
   updateMessagingPlatform: (id: string, body: MessagingPlatformUpdate) =>
     fetchJSON<{ ok: boolean; platform: string }>(
       `/api/messaging/platforms/${encodeURIComponent(id)}`,
@@ -832,7 +801,7 @@ export const api = {
     ),
   applyTelegramOnboarding: (
     pairingId: string,
-    body: { allowed_user_ids: string[]; profile?: string },
+    body: { allowed_user_ids: string[] },
   ) =>
     fetchJSON<TelegramOnboardingApplyResponse>(
       `/api/messaging/telegram/onboarding/${encodeURIComponent(pairingId)}/apply`,
@@ -1321,17 +1290,6 @@ export interface McpCatalogEntry {
   transport: "http" | "stdio";
   auth_type: "api_key" | "oauth" | "none";
   required_env: Array<{ name: string; prompt: string; required: boolean }>;
-  // Transport details — what actually connects (http) or runs (stdio).
-  command: string | null;
-  args: string[];
-  url: string | null;
-  // Git bootstrap (only set for entries that clone + build locally).
-  install_url: string | null;
-  install_ref: string | null;
-  bootstrap: string[];
-  // Default tool pre-selection (null = all tools pre-checked) + guidance text.
-  default_enabled: string[] | null;
-  post_install: string;
   needs_install: boolean;
   installed: boolean;
   enabled: boolean;
@@ -1366,7 +1324,6 @@ export interface MessagingPlatformEnvVar {
   redacted_value: string | null;
   description: string;
   prompt: string;
-  help: string;
   url: string | null;
   is_password: boolean;
   advanced: boolean;
@@ -1382,7 +1339,7 @@ export interface MessagingPlatform {
   gateway_running: boolean;
   /**
    * "connected" | "disabled" | "not_configured" | "pending_restart" |
-   * "gateway_stopped" | "startup_failed" | "disconnected" | "fatal" | string
+   * "gateway_stopped" | "disconnected" | "fatal" | string
    */
   state: string;
   error_code: string | null;
@@ -1390,12 +1347,6 @@ export interface MessagingPlatform {
   updated_at: string | null;
   home_channel: { platform: string; chat_id: string; name: string; thread_id?: string } | null;
   env_vars: MessagingPlatformEnvVar[];
-}
-
-export interface MessagingPlatformsResponse {
-  env_path: string;
-  gateway_start_command: string;
-  platforms: MessagingPlatform[];
 }
 
 export interface MessagingPlatformUpdate {
@@ -1619,9 +1570,6 @@ export interface StatusResponse {
    * Empty in loopback mode; empty + ``auth_required=true`` is a
    * fail-closed state (the dashboard will refuse to bind). */
   auth_providers?: string[];
-  /** False when the dashboard is running in a hosted/managed layout where
-   * updates are handled by the outer launcher instead of ``hermes update``. */
-  can_update_hermes?: boolean;
   config_path: string;
   config_version: number;
   env_path: string;
@@ -2067,30 +2015,6 @@ export interface AuxiliaryTaskAssignment {
 export interface AuxiliaryModelsResponse {
   tasks: AuxiliaryTaskAssignment[];
   main: { provider: string; model: string };
-}
-
-export interface MoaModelSlot {
-  provider: string;
-  model: string;
-}
-
-export interface MoaConfigResponse {
-  default_preset: string;
-  active_preset: string;
-  presets: Record<string, {
-    reference_models: MoaModelSlot[];
-    aggregator: MoaModelSlot;
-    reference_temperature: number;
-    aggregator_temperature: number;
-    max_tokens: number;
-    enabled: boolean;
-  }>;
-  reference_models: MoaModelSlot[];
-  aggregator: MoaModelSlot;
-  reference_temperature: number;
-  aggregator_temperature: number;
-  max_tokens: number;
-  enabled: boolean;
 }
 
 export interface ModelAssignmentRequest {

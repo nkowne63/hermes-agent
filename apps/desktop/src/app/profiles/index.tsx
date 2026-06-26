@@ -11,7 +11,7 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
-import { SanitizedInput } from '@/components/ui/sanitized-input'
+import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import {
@@ -26,7 +26,6 @@ import {
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Pencil, Save, Terminal, Trash2, Users } from '@/lib/icons'
-import { slug } from '@/lib/sanitize'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 
@@ -520,13 +519,12 @@ function CreateProfileDialog({
             <label className="text-xs font-medium" htmlFor="new-profile-name">
               {p.nameLabel}
             </label>
-            <SanitizedInput
+            <Input
               aria-invalid={invalid}
               autoFocus
               id="new-profile-name"
-              onValueChange={setName}
+              onChange={event => setName(event.target.value)}
               placeholder="my-profile"
-              sanitize={slug}
               value={name}
             />
             <p className={cn('text-[0.66rem] leading-4', invalid ? 'text-destructive' : 'text-muted-foreground')}>
@@ -653,12 +651,11 @@ function RenameProfileDialog({
             <label className="text-xs font-medium" htmlFor="rename-profile-name">
               {p.newNameLabel}
             </label>
-            <SanitizedInput
+            <Input
               aria-invalid={invalid}
               autoFocus
               id="rename-profile-name"
-              onValueChange={setName}
-              sanitize={slug}
+              onChange={event => setName(event.target.value)}
               value={name}
             />
             <p className={cn('text-[0.66rem] leading-4', invalid ? 'text-destructive' : 'text-muted-foreground')}>

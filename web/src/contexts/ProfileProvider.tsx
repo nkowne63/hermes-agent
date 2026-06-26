@@ -26,12 +26,10 @@ import { ProfileContext } from "@/contexts/profile-context";
  * truth, the effect below re-asserts `?profile=` onto the new location
  * after each navigation, so the scope survives nav and stays deep-linkable.
  *
- * This exists because "Set as active" on the Profiles page historically only
- * flipped the sticky active_profile file (future CLI/gateway runs). The
- * switcher is the dashboard's write-target selector for Chat and management
- * pages. We now sync the switcher when the sticky active profile differs from
- * the dashboard process on load, and ProfilesPage updates the switcher when
- * you click "Set as active".
+ * This exists because "Set as active" on the Profiles page only flips the
+ * sticky active_profile file (future CLI/gateway runs) — it cannot retarget
+ * the running dashboard. The switcher is the dashboard's own, visible,
+ * write-target selector.
  */
 export function ProfileProvider({ children }: { children: ReactNode }) {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -79,34 +77,14 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
   }, [pathname, profile]);
 
   useEffect(() => {
-    let cancelled = false;
-    const urlProfile = searchParams.get("profile");
-
-    Promise.all([api.getProfiles(), api.getActiveProfile()])
-      .then(([profilesRes, info]) => {
-        if (cancelled) return;
-
-        setProfiles(profilesRes.profiles.map((p) => p.name));
-
-        const current = info.current || "default";
-        const active = info.active || "default";
-        setCurrentProfile(current);
-
-        // Deep links (?profile=) win. Otherwise align the switcher with the
-        // sticky active profile so Chat and management pages match what the
-        // Profiles page shows as "active" (machine dashboard runs as
-        // `current`, usually default).
-        if (urlProfile === null && active !== current) {
-          setManagementProfile(active);
-          setProfileState(active);
-        }
-      })
+    api
+      .getProfiles()
+      .then((res) => setProfiles(res.profiles.map((p) => p.name)))
       .catch(() => {});
-
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    api
+      .getActiveProfile()
+      .then((info) => setCurrentProfile(info.current || "default"))
+      .catch(() => {});
   }, []);
 
   const setProfile = useCallback(
