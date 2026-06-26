@@ -1709,10 +1709,8 @@ export const en: Translations = {
       loadingQuestion: 'Loading question…',
       other: 'Other (type your answer)',
       placeholder: 'Type your answer…',
-      shortcutSuffix: ' to send',
-      back: 'Back',
       skip: 'Skip',
-      send: 'Send'
+      continueLabel: 'Continue'
     },
     tool: {
       code: 'Code',
