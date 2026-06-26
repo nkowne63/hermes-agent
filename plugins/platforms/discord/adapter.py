@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,43 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
 )
 from tools.url_safety import is_safe_url
+
+
+async def _wait_for_ready_or_bot_exit(
+    ready_event: asyncio.Event,
+    bot_task: asyncio.Task,
+    timeout: float,
+) -> None:
+    """Wait until Discord is ready, or surface early bot startup failure.
+
+    ``discord.py`` startup errors (including SOCKS/proxy failures from
+    aiohttp-socks/python-socks) happen inside ``Bot.start()``.  If ``connect()``
+    only waits on ``ready_event``, a dead background task still burns the full
+    ready timeout before the gateway supervisor can reconnect.  Racing the ready
+    event against the bot task keeps failures fast and preserves the original
+    exception for logging/classification.
+    """
+    ready_task = asyncio.create_task(ready_event.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {ready_task, bot_task},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            raise asyncio.TimeoutError
+        if bot_task in done:
+            exc = bot_task.exception()
+            if exc is not None:
+                raise exc
+            if not ready_task.done():
+                raise RuntimeError("Discord bot task exited before ready")
+        await ready_task
+    finally:
+        if not ready_task.done():
+            ready_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await ready_task
 
 
 def _find_discord_windows_bundled_opus(discord_module: Any = None) -> Optional[str]:
@@ -520,6 +558,7 @@ class VoiceReceiver:
                 ],
                 check=True,
                 timeout=10,
+                stdin=subprocess.DEVNULL,
             )
         finally:
             try:
@@ -601,6 +640,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
+        # Resolves the current voice-reply mode ("off"|"voice_only"|"all") for a
+        # linked text-channel id; set by run.py. Lets the inactivity timer leave
+        # the bot in the channel when the user deliberately picked text-only
+        # (/voice off) instead of leaving (/voice leave).
+        self._voice_mode_getter: Optional[Callable] = None  # set by run.py
         # Phase 3: continuous voice mixer (ambient idle bed + ducked speech).
         # Installed once per guild on join; lets acks / TTS / the "thinking"
         # loop overlap in one outgoing stream instead of stop-and-swap.
@@ -616,6 +660,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
+        # True while disconnect() is intentionally closing discord.py. The
+        # bot task's done callback uses this to distinguish an operator/service
+        # shutdown from a runtime websocket crash.
+        self._disconnecting = False
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
@@ -627,6 +675,65 @@ class DiscordAdapter(BasePlatformAdapter):
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+
+    def _handle_bot_task_done(self, task: asyncio.Task) -> None:
+        """Surface post-startup discord.py task exits to the gateway supervisor.
+
+        discord.py reconnects normal gateway interruptions internally. When its
+        top-level ``Bot.start()`` task actually exits after the adapter has been
+        marked running, the Discord websocket is dead while the Hermes gateway
+        process can remain alive. Treat that split-brain state as a retryable
+        fatal adapter error so ``GatewayRunner._handle_adapter_fatal_error`` can
+        remove this adapter and queue Discord for the existing reconnect watcher.
+        """
+        if getattr(self, "_disconnecting", False):
+            # Intentional service/operator shutdown. Drain the task result so
+            # asyncio doesn't emit "exception was never retrieved" warnings.
+            with suppress(asyncio.CancelledError, Exception):
+                task.exception()
+            return
+
+        # Ignore stale callbacks from an older client if a reconnect already
+        # installed a newer Bot.start() task on this adapter instance.
+        if self._bot_task is not None and task is not self._bot_task:
+            with suppress(asyncio.CancelledError, Exception):
+                task.exception()
+            return
+
+        if not self._running:
+            # Startup failures are handled by _wait_for_ready_or_bot_exit() in
+            # connect(); this callback is only for post-startup split-brain.
+            with suppress(asyncio.CancelledError, Exception):
+                task.exception()
+            return
+
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as err:  # pragma: no cover - defensive
+            exc = err
+
+        if exc is None:
+            message = "Discord gateway task exited without an exception"
+        else:
+            message = f"Discord gateway task exited: {exc}"
+
+        logger.error("[%s] %s", self.name, message, exc_info=exc if exc else False)
+        self._set_fatal_error("discord_gateway_task_exited", message, retryable=True)
+
+        async def _notify() -> None:
+            try:
+                await self._notify_fatal_error()
+            except Exception as notify_exc:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "[%s] Failed to notify gateway supervisor about Discord task exit: %s",
+                    self.name,
+                    notify_exc,
+                    exc_info=True,
+                )
+
+        asyncio.create_task(_notify())
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -788,6 +895,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Must run BEFORE the user allowlist check so that bots
                 # permitted by DISCORD_ALLOW_BOTS are not rejected for
                 # not being in DISCORD_ALLOWED_USERS (fixes #4466).
+                _role_authorized = False
                 if getattr(message.author, "bot", False):
                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
                     if allow_bots == "none":
@@ -811,6 +919,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         is_dm=_is_dm,
                     ):
                         return
+                    _role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
                 
                 # Multi-agent filtering: if the message mentions specific bots
                 # but NOT this bot, the sender is talking to another agent —
@@ -850,9 +959,10 @@ class DiscordAdapter(BasePlatformAdapter):
                         if _parent_id:
                             _channel_ids.add(_parent_id)
                         if "*" not in _free_channels and not (_channel_ids & _free_channels):
-                            return
+                            if adapter_self._discord_require_mention_for(message.channel):
+                                return
 
-                await self._handle_message(message)
+                await self._handle_message(message, role_authorized=_role_authorized)
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -892,25 +1002,55 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._register_slash_commands()
 
             # Start the bot in background
+            self._disconnecting = False
             self._bot_task = asyncio.create_task(self._client.start(self.config.token))
+            self._bot_task.add_done_callback(self._handle_bot_task_done)
 
-            # Wait for ready
-            await asyncio.wait_for(self._ready_event.wait(), timeout=30)
+            # Wait for ready, but fail fast if discord.py's background startup
+            # task dies first (for example on SOCKS/proxy connect errors).
+            await _wait_for_ready_or_bot_exit(self._ready_event, self._bot_task, timeout=30)
 
             self._running = True
             return True
 
         except asyncio.TimeoutError:
             logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
+            # Cancel the background bot task so it cannot fire on_message after
+            # this adapter is discarded.  Without this, the task keeps running and
+            # a later successful reconnect leaves two active Discord clients that
+            # each process every message, producing duplicate threads/responses.
+            await self._cancel_bot_task()
             self._release_platform_lock()
             return False
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
+            # Same zombie-client hazard as the timeout branch: the background
+            # client.start() task may already be running when a later setup
+            # step raises. Cancel it so the discarded adapter cannot connect.
+            await self._cancel_bot_task()
             self._release_platform_lock()
             return False
 
+    async def _cancel_bot_task(self) -> None:
+        """Cancel and await the background client.start() task, if running."""
+        if self._bot_task and not self._bot_task.done():
+            self._bot_task.cancel()
+            try:
+                await self._bot_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._bot_task = None
+
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
+        self._disconnecting = True
+        # Cancel the bot task before closing the client.  If connect() timed out
+        # and returned False, the background client.start() task may still be
+        # running; calling client.close() alone is not enough to stop it because
+        # discord.py's reconnect loop can ignore the closed flag while a
+        # WebSocket handshake is in flight.  Explicitly cancelling the task here
+        # ensures the zombie client cannot receive or dispatch any further events.
+        await self._cancel_bot_task()
         # Clean up all active voice connections before closing the client
         for guild_id in list(self._voice_clients.keys()):
             try:
@@ -2264,6 +2404,20 @@ class DiscordAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             return
         text_ch_id = self._voice_text_channels.get(guild_id)
+        # ``/voice off`` mutes spoken replies but deliberately keeps the bot in
+        # the channel (leaving is ``/voice leave``). The inactivity timer only
+        # counts the bot's OWN audio as activity, so under voice-off mode it
+        # fires every VOICE_TIMEOUT seconds, yanks the bot out, and spams the
+        # text channel with "Left voice channel (inactivity timeout)." Honor the
+        # user's choice: skip the auto-disconnect while voice replies are off.
+        # (The timer re-arms when the bot next speaks or hears a user.)
+        _mode_getter = getattr(self, "_voice_mode_getter", None)
+        if text_ch_id is not None and _mode_getter is not None:
+            try:
+                if _mode_getter(str(text_ch_id)) == "off":
+                    return
+            except Exception:
+                pass
         await self.leave_voice_channel(guild_id)
         # Notify the runner so it can clean up voice_mode state
         if self._on_voice_disconnect and text_ch_id:
@@ -2394,6 +2548,11 @@ class DiscordAdapter(BasePlatformAdapter):
                         is_dm=False,
                     ):
                         continue
+                    # A user speaking to the bot is activity too — not just the
+                    # bot's own playback. Reset the inactivity timer so an active
+                    # listener isn't disconnected mid-conversation (this also
+                    # covers voice-on text-only sessions that never play audio).
+                    self._reset_voice_timeout(guild_id)
                     await self._process_voice_input(guild_id, user_id, pcm_data)
         except asyncio.CancelledError:
             pass
@@ -3825,10 +3984,96 @@ class DiscordAdapter(BasePlatformAdapter):
         """Return whether Discord channel messages require a bot mention."""
         configured = self.config.extra.get("require_mention")
         if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() not in {"false", "0", "no", "off"}
-            return bool(configured)
+            return self._discord_bool(configured, default=True)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
+
+    @staticmethod
+    def _discord_bool(value: Any, *, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            stripped = value.strip().lower()
+            if stripped in {"true", "1", "yes", "on"}:
+                return True
+            if stripped in {"false", "0", "no", "off"}:
+                return False
+            return default
+        return bool(value)
+
+    def _discord_scope_ids(self, channel: Any) -> tuple[list[str], str | None, str | None]:
+        """Return channel candidates, category id, and guild id for scoped config.
+
+        Channel candidates are ordered most-specific first.  For a thread this
+        means the thread id, then its parent channel id.  Category and guild
+        scope then follow in the caller, giving channel > category > guild
+        precedence.
+        """
+        channel_ids: list[str] = []
+        channel_id = str(getattr(channel, "id", "") or "")
+        if channel_id:
+            channel_ids.append(channel_id)
+
+        parent = getattr(channel, "parent", None)
+        parent_id = str(getattr(channel, "parent_id", "") or "") or str(getattr(parent, "id", "") or "")
+        if parent_id and parent_id not in channel_ids:
+            channel_ids.append(parent_id)
+
+        category = getattr(channel, "category", None)
+        category_id = (
+            str(getattr(channel, "category_id", "") or "")
+            or str(getattr(category, "id", "") or "")
+        )
+        if not category_id and parent is not None:
+            parent_category = getattr(parent, "category", None)
+            category_id = (
+                str(getattr(parent, "category_id", "") or "")
+                or str(getattr(parent_category, "id", "") or "")
+                or str(getattr(parent, "parent_id", "") or "")
+            )
+
+        guild = getattr(channel, "guild", None) or getattr(parent, "guild", None)
+        guild_id = str(getattr(guild, "id", "") or "")
+        return channel_ids, category_id or None, guild_id or None
+
+    def _discord_scoped_bool_value(
+        self,
+        key: str,
+        channel: Any,
+    ) -> bool | None:
+        """Resolve a bool from channel_defaults > category_defaults > guild_defaults."""
+        channel_ids, category_id, guild_id = self._discord_scope_ids(channel)
+        scopes = (
+            ("channel_defaults", channel_ids),
+            ("category_defaults", [category_id] if category_id else []),
+            ("guild_defaults", [guild_id] if guild_id else []),
+        )
+        for scope_name, ids in scopes:
+            scope_cfg = self.config.extra.get(scope_name)
+            if not isinstance(scope_cfg, dict):
+                continue
+            for scope_id in ids:
+                raw = scope_cfg.get(str(scope_id))
+                if not isinstance(raw, dict) or key not in raw:
+                    continue
+                return self._discord_bool(raw.get(key), default=False)
+        return None
+
+    def _discord_scoped_bool(
+        self,
+        key: str,
+        channel: Any,
+        *,
+        default: bool,
+    ) -> bool:
+        scoped = self._discord_scoped_bool_value(key, channel)
+        return default if scoped is None else scoped
+
+    def _discord_require_mention_for(self, channel: Any) -> bool:
+        return self._discord_scoped_bool(
+            "require_mention",
+            channel,
+            default=self._discord_require_mention(),
+        )
 
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
@@ -3907,6 +4152,31 @@ class DiscordAdapter(BasePlatformAdapter):
         if s:
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
+
+    def _discord_thread_response_channels(self) -> set:
+        """Return Discord channel IDs where channel messages should create threads.
+
+        This can overlap with ``free_response_channels``.  In that case the bot
+        accepts mention-less messages in the channel, then creates/reuses a
+        thread for the response instead of replying directly in the channel.
+        """
+        raw = self.config.extra.get("thread_response_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_THREAD_RESPONSE_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
+
+    def _discord_thread_response_for(self, channel: Any, channel_ids: set[str]) -> bool:
+        """Return whether a message in ``channel`` should auto-thread its reply."""
+        scoped = self._discord_scoped_bool_value("thread_response", channel)
+        if scoped is not None:
+            return scoped
+        thread_response_channels = self._discord_thread_response_channels()
+        return "*" in thread_response_channels or bool(channel_ids & thread_response_channels)
 
     def _discord_thread_require_mention(self) -> bool:
         """Return whether thread participation requires @mention to follow up.
@@ -4701,7 +4971,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     raise Exception(f"HTTP {resp.status}")
                 return await resp.read()
 
-    async def _handle_message(self, message: DiscordMessage) -> None:
+    async def _handle_message(self, message: DiscordMessage, role_authorized: bool = False) -> None:
         """Handle incoming Discord messages."""
         # In server channels (not DMs), require the bot to be @mentioned
         # UNLESS the channel is in the free-response list or the message is
@@ -4769,7 +5039,8 @@ class DiscordAdapter(BasePlatformAdapter):
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
 
-            require_mention = self._discord_require_mention()
+            scoped_require_mention = self._discord_scoped_bool_value("require_mention", message.channel)
+            require_mention = self._discord_require_mention_for(message.channel)
             # Voice-linked text channels act as free-response while voice is active.
             # Only the exact bound channel gets the exemption, not sibling threads.
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
@@ -4779,6 +5050,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 "*" in free_channels
                 or bool(channel_ids & free_channels)
                 or is_voice_linked_channel
+                or scoped_require_mention is False
             )
 
             # Skip the mention check if the message is in a thread where
@@ -4803,10 +5075,16 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
+            force_thread = self._discord_thread_response_for(message.channel, channel_ids)
+            skip_thread = bool(channel_ids & no_thread_channels) or (is_free_channel and not force_thread)
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            # Explicit thread-routing should override Discord reply-message
+            # suppression.  This lets category/channel-scoped thread_response
+            # settings keep working even when the user replies with a mention.
+            if auto_thread and not skip_thread and not is_voice_linked_channel and (
+                not is_reply_message or force_thread
+            ):
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
@@ -4885,6 +5163,7 @@ class DiscordAdapter(BasePlatformAdapter):
             guild_id=str(guild.id) if guild else None,
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
+            role_authorized=role_authorized,
         )
 
         # Build media URLs -- download image attachments to local cache so the
@@ -5610,6 +5889,7 @@ def _define_discord_view_classes() -> None:
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
             self._selected_provider: str = ""
+            self._pending_expensive_model: str = ""
 
             self._build_provider_select()
 
@@ -5692,6 +5972,41 @@ def _define_discord_view_classes() -> None:
             cancel_btn.callback = self._on_cancel
             self.add_item(cancel_btn)
 
+        def _build_expensive_confirm(self, model_id: str):
+            """Build confirmation buttons for unusually expensive models."""
+            self.clear_items()
+            self._pending_expensive_model = model_id
+
+            confirm_btn = discord.ui.Button(
+                label="Switch anyway",
+                style=discord.ButtonStyle.red,
+                custom_id="model_expensive_confirm",
+            )
+            confirm_btn.callback = self._on_expensive_confirm
+            self.add_item(confirm_btn)
+
+            cancel_btn = discord.ui.Button(
+                label="Cancel",
+                style=discord.ButtonStyle.grey,
+                custom_id="model_expensive_cancel",
+            )
+            cancel_btn.callback = self._on_cancel
+            self.add_item(cancel_btn)
+
+        async def _expensive_warning_for(self, model_id: str):
+            try:
+                from hermes_cli.model_cost_guard import expensive_model_warning
+
+                # Pricing lookup can hit models.dev / a /models endpoint on a
+                # cache miss — keep it off the event loop.
+                return await asyncio.to_thread(
+                    expensive_model_warning,
+                    model_id,
+                    provider=self._selected_provider,
+                )
+            except Exception:
+                return None
+
         async def _on_provider_selected(self, interaction: discord.Interaction):
             if not self._check_auth(interaction):
                 await interaction.response.send_message(
@@ -5721,7 +6036,11 @@ def _define_discord_view_classes() -> None:
                 view=self,
             )
 
-        async def _on_model_selected(self, interaction: discord.Interaction):
+        async def _switch_selected_model(
+            self,
+            interaction: discord.Interaction,
+            model_id: str,
+        ):
             if self.resolved:
                 await interaction.response.send_message(
                     "Already resolved~", ephemeral=True
@@ -5734,7 +6053,6 @@ def _define_discord_view_classes() -> None:
                 return
 
             self.resolved = True
-            model_id = interaction.data["values"][0]
             self.clear_items()
             await interaction.response.edit_message(
                 embed=discord.Embed(
@@ -5761,6 +6079,50 @@ def _define_discord_view_classes() -> None:
                     color=discord.Color.green(),
                 ),
                 view=None,
+            )
+
+        async def _on_model_selected(self, interaction: discord.Interaction):
+            if self.resolved:
+                await interaction.response.send_message(
+                    "Already resolved~", ephemeral=True
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+
+            model_id = interaction.data["values"][0]
+            warning = await self._expensive_warning_for(model_id)
+            if warning is not None:
+                self._build_expensive_confirm(model_id)
+                await interaction.response.edit_message(
+                    embed=discord.Embed(
+                        title="⚠ Expensive Model Warning",
+                        description=warning.message,
+                        color=discord.Color.red(),
+                    ),
+                    view=self,
+                )
+                return
+
+            await self._switch_selected_model(interaction, model_id)
+
+        async def _on_expensive_confirm(self, interaction: discord.Interaction):
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+            if not self._pending_expensive_model:
+                await interaction.response.send_message(
+                    "Model selection expired.", ephemeral=True
+                )
+                return
+            await self._switch_selected_model(
+                interaction,
+                self._pending_expensive_model,
             )
 
         async def _on_back(self, interaction: discord.Interaction):
@@ -6373,7 +6735,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     ``DISCORD_IGNORED_CHANNELS``, ``DISCORD_ALLOWED_CHANNELS``,
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
-    ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``).
+    ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``,
+    ``DISCORD_THREAD_RESPONSE_CHANNELS``).
     Rather than rewrite ~50 call sites inside the adapter to read from
     ``PlatformConfig.extra`` instead, this hook keeps the existing
     env-driven model and merely owns the YAML→env translation here, next to
@@ -6381,9 +6744,15 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
 
     Env vars take precedence over YAML — every assignment is guarded by
     ``not os.getenv(...)`` so explicit env vars survive a config.yaml
-    update.  Returns ``None`` because no extras are seeded into
-    ``PlatformConfig.extra`` directly (everything flows through env).
+    update.  Scoped defaults are returned as ``PlatformConfig.extra`` because
+    they need per-message channel/category/guild context.
     """
+    returned_extra: dict[str, Any] = {}
+    for scoped_key in ("channel_defaults", "category_defaults", "guild_defaults"):
+        scoped_cfg = discord_cfg.get(scoped_key)
+        if isinstance(scoped_cfg, dict):
+            returned_extra[scoped_key] = scoped_cfg
+
     if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
         os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
     if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
@@ -6409,6 +6778,11 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
         os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
+    trc = discord_cfg.get("thread_response_channels")
+    if trc is not None and not os.getenv("DISCORD_THREAD_RESPONSE_CHANNELS"):
+        if isinstance(trc, list):
+            trc = ",".join(str(v) for v in trc)
+        os.environ["DISCORD_THREAD_RESPONSE_CHANNELS"] = str(trc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
@@ -6463,7 +6837,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     if _discord_rtm is not None and not os.getenv("DISCORD_REPLY_TO_MODE"):
         _rtm_str = "off" if _discord_rtm is False else str(_discord_rtm).lower()
         os.environ["DISCORD_REPLY_TO_MODE"] = _rtm_str
-    return None  # all settings flow through env; nothing to merge into extras
+    return returned_extra or None
 
 
 def _is_connected(config) -> bool:

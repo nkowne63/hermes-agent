@@ -222,13 +222,17 @@ class ThreadParticipationTracker:
     def __init__(self, platform_name: str, max_tracked: int = 500):
         self._platform = platform_name
         self._max_tracked = max_tracked
-        self._threads: dict[str, None] = {
-            str(thread_id): None for thread_id in self._load()
-        }
+        self._state_file = self._resolve_state_path()
+        self._state_mtime_ns = 0
+        self._threads: dict[str, None] = {}
+        self._refresh_from_disk(force=True)
 
-    def _state_path(self) -> Path:
+    def _resolve_state_path(self) -> Path:
         from hermes_constants import get_hermes_home
         return get_hermes_home() / f"{self._platform}_threads.json"
+
+    def _state_path(self) -> Path:
+        return self._state_file
 
     def _load(self) -> list[str]:
         path = self._state_path()
@@ -241,6 +245,32 @@ class ThreadParticipationTracker:
                 pass
         return []
 
+    def _refresh_from_disk(self, *, force: bool = False) -> None:
+        """Pick up thread ids appended by out-of-process REST scripts.
+
+        Cron scripts can create Discord threads without going through the live
+        gateway adapter. They persist the thread id to the same state file, and
+        the adapter refreshes lazily so follow-up replies work without a gateway
+        restart.
+        """
+        path = self._state_path()
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            if force:
+                self._threads = {}
+                self._state_mtime_ns = 0
+            return
+        except Exception:
+            return
+        if not force and stat.st_mtime_ns <= self._state_mtime_ns:
+            return
+        loaded = self._load()
+        if len(loaded) > self._max_tracked:
+            loaded = loaded[-self._max_tracked:]
+        self._threads = dict.fromkeys(loaded)
+        self._state_mtime_ns = stat.st_mtime_ns
+
     def _save(self) -> None:
         path = self._state_path()
         thread_list = list(self._threads)
@@ -248,14 +278,20 @@ class ThreadParticipationTracker:
             thread_list = thread_list[-self._max_tracked:]
             self._threads = dict.fromkeys(thread_list)
         atomic_json_write(path, thread_list, indent=None)
+        try:
+            self._state_mtime_ns = path.stat().st_mtime_ns
+        except Exception:
+            pass
 
     def mark(self, thread_id: str) -> None:
         """Mark *thread_id* as participated and persist."""
+        self._refresh_from_disk()
         if thread_id not in self._threads:
             self._threads[thread_id] = None
             self._save()
 
     def __contains__(self, thread_id: str) -> bool:
+        self._refresh_from_disk()
         return thread_id in self._threads
 
     def clear(self) -> None:
