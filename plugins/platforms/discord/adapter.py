@@ -4761,6 +4761,7 @@ class DiscordAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        current_account: str = "",
     ) -> SendResult:
         """Send an interactive select-menu model picker.
 
@@ -4786,11 +4787,12 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception:
                 provider_label = current_provider
 
+            account_line = f"\n{current_account}" if current_account else ""
             embed = discord.Embed(
                 title="⚙ Model Configuration",
                 description=(
                     f"Current model: `{current_model or 'unknown'}`\n"
-                    f"Provider: {provider_label}\n\n"
+                    f"Provider: {provider_label}{account_line}\n\n"
                     f"Select a provider:"
                 ),
                 color=discord.Color.blue(),

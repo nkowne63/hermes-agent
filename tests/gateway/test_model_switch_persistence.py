@@ -164,6 +164,33 @@ class TestApplySessionModelOverride:
 
         assert rt["base_url"] == ""  # empty string overwrites
 
+    def test_credential_identity_metadata_is_preserved(self):
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+
+        runner._session_model_overrides[sk] = {
+            "model": "gpt-5.4-mini",
+            "provider": "openai-codex",
+            "api_key": "token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "codex_responses",
+            "credential_id": "cred-a",
+            "credential_label": "user@example.com",
+            "credential_source": "manual:device_code",
+        }
+
+        model, rt = runner._apply_session_model_override(
+            sk,
+            "fallback-model",
+            {"provider": "openrouter", "api_key": "or-key"},
+        )
+
+        assert model == "gpt-5.4-mini"
+        assert rt["provider"] == "openai-codex"
+        assert rt["credential_id"] == "cred-a"
+        assert rt["credential_label"] == "user@example.com"
+        assert rt["credential_source"] == "manual:device_code"
+
     def test_different_session_key_not_affected(self):
         runner = _make_runner()
         sk = build_session_key(_make_source())

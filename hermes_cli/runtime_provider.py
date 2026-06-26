@@ -418,6 +418,9 @@ def _resolve_runtime_from_pool_entry(
         "base_url": base_url,
         "api_key": api_key,
         "source": getattr(entry, "source", "pool"),
+        "credential_id": getattr(entry, "id", ""),
+        "credential_label": getattr(entry, "label", ""),
+        "credential_source": getattr(entry, "source", ""),
         "credential_pool": pool,
         "requested_provider": requested_provider,
     }

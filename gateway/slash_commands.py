@@ -32,6 +32,7 @@ from typing import Any, Optional, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from gateway.config import HomeChannel, Platform, PlatformConfig
+from gateway.model_identity import credential_account_line
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
 from hermes_cli.config import cfg_get
@@ -947,9 +948,8 @@ class GatewaySlashCommandsMixin:
         import yaml
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_flags,
-            list_authenticated_providers,
-            list_picker_providers,
         )
+        import hermes_cli.model_switch as _model_switch_mod
         from hermes_cli.providers import get_label
 
         raw_args = event.get_command_args().strip()
@@ -1005,6 +1005,24 @@ class GatewaySlashCommandsMixin:
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
 
+        current_runtime_identity = {
+            "provider": current_provider,
+            "api_key": current_api_key,
+            "source": override.get("source") if override else "",
+            "credential_id": override.get("credential_id") if override else "",
+            "credential_label": override.get("credential_label") if override else "",
+            "credential_source": override.get("credential_source") if override else "",
+        }
+        if not credential_account_line(current_runtime_identity):
+            try:
+                from gateway.run import _resolve_runtime_agent_kwargs
+
+                runtime_identity = _resolve_runtime_agent_kwargs()
+                if runtime_identity.get("provider") == current_provider:
+                    current_runtime_identity = runtime_identity
+            except Exception:
+                pass
+
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
             # Try interactive picker if the platform supports it
@@ -1016,7 +1034,8 @@ class GatewaySlashCommandsMixin:
 
             if has_picker:
                 try:
-                    providers = list_picker_providers(
+                    providers = await asyncio.to_thread(
+                        _model_switch_mod.list_picker_providers,
                         current_provider=current_provider,
                         current_base_url=current_base_url,
                         current_model=current_model,
@@ -1104,6 +1123,9 @@ class GatewaySlashCommandsMixin:
                             "api_key": result.api_key,
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
+                            "credential_id": result.credential_id,
+                            "credential_label": result.credential_label,
+                            "credential_source": result.credential_source,
                         }
 
                         # Evict cached agent so the next turn creates a fresh
@@ -1115,6 +1137,15 @@ class GatewaySlashCommandsMixin:
                         plabel = result.provider_label or result.target_provider
                         lines = [t("gateway.model.switched", model=result.new_model)]
                         lines.append(t("gateway.model.provider_label", provider=plabel))
+                        _account_line = credential_account_line({
+                            "provider": result.target_provider,
+                            "api_key": result.api_key,
+                            "credential_id": result.credential_id,
+                            "credential_label": result.credential_label,
+                            "credential_source": result.credential_source,
+                        })
+                        if _account_line:
+                            lines.append(_account_line)
                         mi = result.model_info
                         from hermes_cli.model_switch import resolve_display_context_length
                         _sw_config_ctx = None
@@ -1153,6 +1184,7 @@ class GatewaySlashCommandsMixin:
                         providers=providers,
                         current_model=current_model,
                         current_provider=current_provider,
+                        current_account=credential_account_line(current_runtime_identity),
                         session_key=session_key,
                         on_model_selected=_on_model_selected,
                         metadata=metadata,
@@ -1162,10 +1194,15 @@ class GatewaySlashCommandsMixin:
 
             # Fallback: text list (for platforms without picker or if picker failed)
             provider_label = get_label(current_provider)
-            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
+            account_line = credential_account_line(current_runtime_identity)
+            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label)]
+            if account_line:
+                lines.append(account_line)
+            lines.append("")
 
             try:
-                providers = list_authenticated_providers(
+                providers = await asyncio.to_thread(
+                    _model_switch_mod.list_authenticated_providers,
                     current_provider=current_provider,
                     current_base_url=current_base_url,
                     current_model=current_model,
@@ -1260,6 +1297,9 @@ class GatewaySlashCommandsMixin:
                 "api_key": result.api_key,
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
+                "credential_id": result.credential_id,
+                "credential_label": result.credential_label,
+                "credential_source": result.credential_source,
             }
 
             # Evict cached agent so the next turn creates a fresh agent from the
@@ -1302,6 +1342,15 @@ class GatewaySlashCommandsMixin:
             provider_label = result.provider_label or result.target_provider
             lines = [t("gateway.model.switched", model=result.new_model)]
             lines.append(t("gateway.model.provider_label", provider=provider_label))
+            account_line = credential_account_line({
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "credential_id": result.credential_id,
+                "credential_label": result.credential_label,
+                "credential_source": result.credential_source,
+            })
+            if account_line:
+                lines.append(account_line)
 
             # Context: always resolve via the provider-aware chain so Codex OAuth,
             # Copilot, and Nous-enforced caps win over the raw models.dev entry.

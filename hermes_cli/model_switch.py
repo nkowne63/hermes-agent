@@ -292,6 +292,9 @@ class ModelSwitchResult:
     warning_message: str = ""
     provider_label: str = ""
     resolved_via_alias: str = ""
+    credential_id: str = ""
+    credential_label: str = ""
+    credential_source: str = ""
     capabilities: Optional[ModelCapabilities] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
@@ -916,6 +919,9 @@ def switch_model(
     api_key = current_api_key
     base_url = current_base_url
     api_mode = ""
+    credential_id = ""
+    credential_label = ""
+    credential_source = ""
 
     if provider_changed or explicit_provider:
         import os
@@ -950,6 +956,9 @@ def switch_model(
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
                 api_mode = runtime.get("api_mode", "")
+                credential_id = runtime.get("credential_id", "")
+                credential_label = runtime.get("credential_label", "")
+                credential_source = runtime.get("credential_source", runtime.get("source", ""))
             except Exception:
                 api_key = _ukey
                 base_url = _user_pdef.base_url
@@ -967,6 +976,9 @@ def switch_model(
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
+                credential_id = runtime.get("credential_id", "")
+                credential_label = runtime.get("credential_label", "")
+                credential_source = runtime.get("credential_source", runtime.get("source", ""))
             except Exception as e:
                 return ModelSwitchResult(
                     success=False,
@@ -991,6 +1003,9 @@ def switch_model(
             api_key = runtime.get("api_key", "")
             base_url = runtime.get("base_url", "")
             api_mode = runtime.get("api_mode", "")
+            credential_id = runtime.get("credential_id", "")
+            credential_label = runtime.get("credential_label", "")
+            credential_source = runtime.get("credential_source", runtime.get("source", ""))
         except Exception:
             pass
 
@@ -1133,6 +1148,9 @@ def switch_model(
         warning_message=" | ".join(warnings) if warnings else "",
         provider_label=provider_label,
         resolved_via_alias=resolved_alias,
+        credential_id=credential_id,
+        credential_label=credential_label,
+        credential_source=credential_source,
         capabilities=capabilities,
         model_info=model_info,
         is_global=is_global,

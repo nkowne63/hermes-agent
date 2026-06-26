@@ -1963,6 +1963,7 @@ class MatrixAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        current_account: str = "",
     ) -> SendResult:
         """Send a Matrix reaction-based model picker."""
         if not self._client:

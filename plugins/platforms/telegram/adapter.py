@@ -3264,6 +3264,7 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        current_account: str = "",
     ) -> SendResult:
         """Send an interactive inline-keyboard model picker.
 
@@ -3284,11 +3285,13 @@ class TelegramAdapter(BasePlatformAdapter):
             keyboard = self._build_provider_keyboard(providers)
 
             provider_label = get_label(current_provider)
+            account_line = f"{current_account}\n" if current_account else ""
             text = self.format_message(
                 (
                     f"⚙ *Model Configuration*\n\n"
                     f"Current model: `{current_model or 'unknown'}`\n"
-                    f"Provider: {provider_label}\n\n"
+                    f"Provider: {provider_label}\n"
+                    f"{account_line}\n"
                     f"Select a provider:"
                 )
             )
