@@ -29,6 +29,15 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     )
     auth_add.add_argument("--label", help="Optional display label")
     auth_add.add_argument(
+        "--from-codex-cli",
+        action="store_true",
+        help=(
+            "For openai-codex, import the current Codex CLI credentials from "
+            "~/.codex/auth.json into the credential pool instead of starting "
+            "a new device-code login."
+        ),
+    )
+    auth_add.add_argument(
         "--api-key", help="API key value (otherwise prompted securely)"
     )
     auth_add.add_argument("--portal-url", help="Nous portal base URL")

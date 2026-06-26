@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sys
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 import uuid
 
@@ -308,7 +309,25 @@ def auth_add_command(args) -> None:
         return
 
     if provider == "openai-codex":
-        creds = auth_mod._codex_device_code_login()
+        if bool(getattr(args, "from_codex_cli", False)):
+            tokens = auth_mod._import_codex_cli_tokens()
+            if not tokens:
+                raise SystemExit(
+                    "No usable Codex CLI credentials found at ~/.codex/auth.json. "
+                    "Run `codex login` first, then retry."
+                )
+            creds = {
+                "tokens": tokens,
+                "base_url": auth_mod.DEFAULT_CODEX_BASE_URL,
+                "last_refresh": (
+                    tokens.get("last_refresh")
+                    or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                ),
+            }
+            source_label = "Codex CLI"
+        else:
+            creds = auth_mod._codex_device_code_login()
+            source_label = "OAuth"
         label = (getattr(args, "label", None) or "").strip() or label_from_token(
             creds["tokens"]["access_token"],
             _oauth_default_label(provider, len(pool.entries()) + 1),
@@ -341,7 +360,7 @@ def auth_add_command(args) -> None:
         # _save_provider_state). Subsequent adds leave the active provider as-is.
         if first_credential:
             auth_mod.mark_provider_active_if_unset(provider)
-        print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
+        print(f'Added {provider} {source_label} credential #{len(pool.entries())}: "{entry.label}"')
         return
 
     if provider == "xai-oauth":

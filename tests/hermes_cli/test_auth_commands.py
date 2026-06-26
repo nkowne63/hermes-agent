@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import argparse
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -23,6 +24,28 @@ def _jwt_with_email(email: str) -> str:
         json.dumps({"email": email}).encode()
     ).rstrip(b"=").decode()
     return f"{header}.{payload}.signature"
+
+
+def test_auth_add_parser_accepts_codex_cli_import_flag():
+    from hermes_cli.subcommands.auth import build_auth_parser
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="cmd")
+    build_auth_parser(subparsers, cmd_auth=lambda _args: None)
+
+    args = parser.parse_args([
+        "auth",
+        "add",
+        "openai-codex",
+        "--from-codex-cli",
+        "--label",
+        "second@example.com",
+    ])
+
+    assert args.auth_action == "add"
+    assert args.provider == "openai-codex"
+    assert args.from_codex_cli is True
+    assert args.label == "second@example.com"
 
 
 @pytest.fixture(autouse=True)
@@ -480,6 +503,70 @@ def test_auth_add_codex_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch
     # No singleton block — the add path is now pool-only.
     assert "openai-codex" not in payload.get("providers", {})
     # First add activated the provider; second add left it as-is.
+    assert payload["active_provider"] == "openai-codex"
+
+
+def test_auth_add_codex_from_cli_imports_as_second_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    existing_token = _jwt_with_email("first@example.com")
+    imported_token = _jwt_with_email("second@example.com")
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {},
+            "active_provider": "openai-codex",
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "first",
+                        "label": "first@example.com",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": existing_token,
+                        "refresh_token": "first-refresh",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: {
+            "access_token": imported_token,
+            "refresh_token": "imported-refresh",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda: pytest.fail("device-code flow should not run for --from-codex-cli"),
+    )
+
+    from types import SimpleNamespace
+    from hermes_cli.auth_commands import auth_add_command
+
+    auth_add_command(SimpleNamespace(
+        provider="openai-codex",
+        auth_type="oauth",
+        api_key=None,
+        label="second@example.com",
+        from_codex_cli=True,
+    ))
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = payload["credential_pool"]["openai-codex"]
+    assert [entry["label"] for entry in entries] == [
+        "first@example.com",
+        "second@example.com",
+    ]
+    assert [entry["priority"] for entry in entries] == [0, 1]
+    imported = entries[1]
+    assert imported["source"] == "manual:device_code"
+    assert imported["access_token"] == imported_token
+    assert imported["refresh_token"] == "imported-refresh"
+    assert "openai-codex" not in payload.get("providers", {})
     assert payload["active_provider"] == "openai-codex"
 
 
