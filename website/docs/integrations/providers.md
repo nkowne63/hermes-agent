@@ -217,12 +217,13 @@ hermes chat --provider devin-acp --model claude-opus-4.6
 
 Hermes passes non-sentinel model names to Devin through `DEVIN_MODEL`, so `/model claude-opus-4.6 --provider devin-acp` works in the CLI and through gateway slash commands such as Discord `/model`.
 
-By default, Hermes launches Devin with a temporary `--agent-config` that denies Devin's own tools and allows only MCP-style `mcp__hermes__*` tools. Hermes still executes its own tool calls through the Hermes ACP bridge. You can tune that behavior in `config.yaml`:
+By default, Hermes launches Devin with a temporary `--agent-config` that denies Devin's own tools and exposes Hermes tool-call schemas from the configured platform toolset (`discord` by default). Hermes still executes those tool calls locally. You can tune that behavior in `config.yaml`:
 
 ```yaml
 acp:
   devin:
     hermes_tools_only: true
+    tool_platform: discord
     allowed_tools: ["mcp__hermes__*"]
     deny_tools: ["*"]
     # Optional: use your own Devin agent config instead of Hermes' generated one.
@@ -233,6 +234,27 @@ acp:
 |---------------------|-------------|
 | `HERMES_DEVIN_ACP_COMMAND` | Override the Devin CLI binary path (default: `devin`) |
 | `HERMES_DEVIN_ACP_ARGS` | Override ACP args (default: `acp`) |
+
+**`claude-acp` — Claude Agent ACP backend**. Spawns the ACP adapter for Claude Agent SDK instead of calling Anthropic OAuth credentials directly:
+
+```bash
+hermes chat --provider claude-acp --model claude-sonnet-4.5
+# Uses: npx -y @agentclientprotocol/claude-agent-acp
+```
+
+Hermes passes non-sentinel model names through `ANTHROPIC_MODEL`. In tools-only mode, Hermes disables Claude Code's native built-in tools/MCP servers and exposes Hermes tool-call schemas from the configured platform toolset (`discord` by default):
+
+```yaml
+acp:
+  claude:
+    hermes_tools_only: true
+    tool_platform: discord
+```
+
+| Environment variable | Description |
+|---------------------|-------------|
+| `HERMES_CLAUDE_ACP_COMMAND` | Override the launcher command (default: `npx`) |
+| `HERMES_CLAUDE_ACP_ARGS` | Override ACP args (default: `-y @agentclientprotocol/claude-agent-acp`) |
 
 ### First-Class API-Key Providers
 

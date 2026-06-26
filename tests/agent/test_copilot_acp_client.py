@@ -336,3 +336,80 @@ def test_devin_tools_only_rejects_fs_request(tmp_path):
     payload = json.loads(process.stdin.getvalue())
     assert payload["error"]["code"] == -32601
     assert "disabled by Hermes configuration" in payload["error"]["message"]
+
+
+def test_run_prompt_passes_claude_model_env_for_claude_acp(monkeypatch, tmp_path):
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+
+    captured = {}
+    client = CopilotACPClient(
+        api_key="claude-acp",
+        base_url="acp://claude",
+        acp_command="npx",
+        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Claude ACP command"):
+            client._run_prompt("hello", model="claude-sonnet-4.5", timeout_seconds=1)
+
+    assert captured["kwargs"]["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4.5"
+    assert captured["cmd"] == ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+
+
+def test_claude_tools_only_disables_fs_client_capabilities(tmp_path):
+    client = CopilotACPClient(
+        api_key="claude-acp",
+        base_url="acp://claude",
+        acp_command="npx",
+        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        assert client._provider_adapter.client_capabilities() == {}
+        assert client._provider_adapter.supports_client_method("fs/read_text_file") is False
+        assert client._provider_adapter.supports_client_method("session/request_permission") is True
+
+
+def test_claude_session_params_disable_native_tools(tmp_path):
+    client = CopilotACPClient(
+        api_key="claude-acp",
+        base_url="acp://claude",
+        acp_command="npx",
+        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    params = client._provider_adapter.session_new_params(
+        {"cwd": str(tmp_path), "mcpServers": []},
+        model="claude-sonnet-4.5",
+    )
+
+    options = params["_meta"]["claudeCode"]["options"]
+    assert options["tools"] == []
+    assert options["mcpServers"] == {}
+    assert "Bash" in options["disallowedTools"]
+    assert options["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4.5"
+    assert options["settings"]["availableModels"] == ["claude-sonnet-4.5"]
+
+
+def test_acp_tools_only_uses_discord_platform_tools(tmp_path):
+    client = CopilotACPClient(
+        api_key="claude-acp",
+        base_url="acp://claude",
+        acp_command="npx",
+        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_cwd=str(tmp_path),
+    )
+    original = [
+        {"type": "function", "function": {"name": "terminal", "parameters": {}}},
+    ]
+    discord_tools = [
+        {"type": "function", "function": {"name": "discord", "parameters": {}}},
+    ]
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        with _patch("agent.copilot_acp_client._platform_tool_definitions", return_value=discord_tools):
+            assert client._provider_adapter.prompt_tools(original) == discord_tools

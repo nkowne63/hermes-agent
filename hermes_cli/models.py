@@ -223,6 +223,16 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "devin-acp": [
         "devin-acp",
     ],
+    "claude-acp": [
+        "claude-acp",
+        "claude-sonnet-4.6",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+        "claude-opus-4.8",
+        "claude-opus-4.6",
+        "claude-haiku-4.5",
+    ],
     "copilot": [
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -1006,6 +1016,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
+    ProviderEntry("claude-acp",     "Claude ACP",               "Claude ACP (Spawns @agentclientprotocol/claude-agent-acp via Claude Code)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
     ProviderEntry("google-gemini-cli", "Google Gemini (OAuth)",   "Google Gemini via OAuth + Code Assist (Code Assist OAuth flow)"),
@@ -1187,6 +1198,8 @@ _PROVIDER_ALIASES = {
     "minimax_oauth": "minimax-oauth",
     "claude": "anthropic",
     "claude-code": "anthropic",
+    "claude-agent-acp": "claude-acp",
+    "anthropic-acp": "claude-acp",
     "deep-seek": "deepseek",
     "opencode": "opencode-zen",
     "zen": "opencode-zen",
@@ -2181,9 +2194,11 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return get_codex_model_ids(access_token=access_token)
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
-    if normalized in {"copilot", "copilot-acp", "devin-acp"}:
+    if normalized in {"copilot", "copilot-acp", "devin-acp", "claude-acp"}:
         if normalized == "devin-acp":
             return list(_PROVIDER_MODELS.get("devin-acp", []))
+        if normalized == "claude-acp":
+            return list(_PROVIDER_MODELS.get("claude-acp", []))
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
             if live:
@@ -3689,6 +3704,25 @@ def validate_requested_model(
             "message": (
                 f"Note: Hermes cannot verify Devin CLI model `{requested}` locally. "
                 "The model name will be passed to Devin via DEVIN_MODEL."
+            ),
+        }
+
+    if normalized == "claude-acp":
+        catalog_models = provider_model_ids(normalized)
+        if requested_for_lookup in set(catalog_models):
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
+        return {
+            "accepted": True,
+            "persist": True,
+            "recognized": False,
+            "message": (
+                f"Note: Hermes cannot verify Claude ACP model `{requested}` locally. "
+                "The model name will be passed to Claude Agent ACP via ANTHROPIC_MODEL."
             ),
         }
 

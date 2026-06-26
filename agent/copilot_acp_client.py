@@ -103,6 +103,46 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _load_acp_settings(provider_key: str, legacy_key: str) -> dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    acp_cfg = cfg.get("acp") if isinstance(cfg, dict) else {}
+    provider_cfg = acp_cfg.get(provider_key) if isinstance(acp_cfg, dict) else {}
+    legacy_cfg = cfg.get(legacy_key) if isinstance(cfg, dict) else {}
+    merged: dict[str, Any] = {}
+    if isinstance(legacy_cfg, dict):
+        merged.update(legacy_cfg)
+    if isinstance(provider_cfg, dict):
+        merged.update(provider_cfg)
+    return merged
+
+
+def _platform_tool_definitions(platform: str) -> list[dict[str, Any]]:
+    platform = (platform or "").strip()
+    if not platform:
+        return []
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import get_tool_definitions
+
+        cfg = load_config()
+        enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
+        agent_cfg = cfg.get("agent") or {}
+        disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+        return get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+        )
+    except Exception:
+        return []
+
+
 class ACPProviderAdapter:
     """Provider-specific behavior for subprocess-backed ACP CLIs."""
 
@@ -144,6 +184,13 @@ class ACPProviderAdapter:
 
     def supports_client_method(self, method: str) -> bool:
         return True
+
+    def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        return tools
+
+    def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
+        del model
+        return params
 
     def missing_command_error(self, command: str) -> str:
         return (
@@ -200,21 +247,7 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
     command_names = ("devin", "devin.exe")
 
     def _settings(self) -> dict[str, Any]:
-        try:
-            from hermes_cli.config import load_config
-
-            cfg = load_config()
-        except Exception:
-            cfg = {}
-        acp_cfg = cfg.get("acp") if isinstance(cfg, dict) else {}
-        devin_cfg = acp_cfg.get("devin") if isinstance(acp_cfg, dict) else {}
-        legacy_cfg = cfg.get("devin_acp") if isinstance(cfg, dict) else {}
-        merged: dict[str, Any] = {}
-        if isinstance(legacy_cfg, dict):
-            merged.update(legacy_cfg)
-        if isinstance(devin_cfg, dict):
-            merged.update(devin_cfg)
-        return merged
+        return _load_acp_settings("devin", "devin_acp")
 
     def _hermes_tools_only(self) -> bool:
         settings = self._settings()
@@ -244,6 +277,10 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         if isinstance(raw, list):
             return [str(item).strip() for item in raw if str(item).strip()]
         return ["*"]
+
+    def _tool_platform(self) -> str:
+        settings = self._settings()
+        return str(settings.get("tool_platform") or "discord").strip()
 
     def subprocess_env(
         self,
@@ -307,6 +344,11 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
             return False
         return True
 
+    def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        if not self._hermes_tools_only():
+            return tools
+        return _platform_tool_definitions(self._tool_platform()) or tools
+
     def missing_command_error(self, command: str) -> str:
         return (
             f"Could not start Devin ACP command '{command}'. "
@@ -314,7 +356,106 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         )
 
 
+class ClaudeACPProviderAdapter(ACPProviderAdapter):
+    display_name = "Claude ACP"
+    default_model = "claude-acp"
+    marker_prefixes = ("acp://claude",)
+    command_names = ("claude-agent-acp", "claude-agent-acp.exe", "npx", "npx.cmd")
+
+    _DISALLOWED_BUILTIN_TOOLS = [
+        "Agent",
+        "Bash",
+        "BashOutput",
+        "Edit",
+        "Glob",
+        "Grep",
+        "KillBash",
+        "LS",
+        "MultiEdit",
+        "NotebookEdit",
+        "Read",
+        "Task",
+        "TodoWrite",
+        "WebFetch",
+        "WebSearch",
+        "Write",
+    ]
+
+    def _settings(self) -> dict[str, Any]:
+        return _load_acp_settings("claude", "claude_acp")
+
+    def _hermes_tools_only(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_tools_only", settings.get("tools_only", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _tool_platform(self) -> str:
+        settings = self._settings()
+        return str(settings.get("tool_platform") or "discord").strip()
+
+    def subprocess_env(
+        self,
+        env: dict[str, str],
+        *,
+        model: str | None,
+    ) -> dict[str, str]:
+        model_value = (model or "").strip()
+        if model_value and model_value.lower() not in {"claude", "claude-acp"}:
+            env["ANTHROPIC_MODEL"] = model_value
+        return env
+
+    def client_capabilities(self) -> dict[str, Any]:
+        if self._hermes_tools_only():
+            return {}
+        return super().client_capabilities()
+
+    def supports_client_method(self, method: str) -> bool:
+        if self._hermes_tools_only() and method.startswith("fs/"):
+            return False
+        return True
+
+    def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        if not self._hermes_tools_only():
+            return tools
+        return _platform_tool_definitions(self._tool_platform()) or tools
+
+    def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
+        if not self._hermes_tools_only():
+            return params
+
+        model_value = (model or "").strip()
+        options: dict[str, Any] = {
+            "tools": [],
+            "disallowedTools": list(self._DISALLOWED_BUILTIN_TOOLS),
+            "mcpServers": {},
+        }
+        if model_value and model_value.lower() not in {"claude", "claude-acp"}:
+            options["env"] = {"ANTHROPIC_MODEL": model_value}
+            options["settings"] = {"availableModels": [model_value]}
+
+        merged = dict(params)
+        meta = dict(merged.get("_meta") or {})
+        claude_code = dict(meta.get("claudeCode") or {})
+        existing_options = dict(claude_code.get("options") or {})
+        claude_code["options"] = {**options, **existing_options}
+        meta["claudeCode"] = claude_code
+        merged["_meta"] = meta
+        return merged
+
+    def missing_command_error(self, command: str) -> str:
+        return (
+            f"Could not start Claude ACP command '{command}'. "
+            "Install with `npm install -g @agentclientprotocol/claude-agent-acp`, "
+            "or set HERMES_CLAUDE_ACP_COMMAND/HERMES_CLAUDE_ACP_ARGS."
+        )
+
+
 _ACP_PROVIDER_ADAPTERS: tuple[ACPProviderAdapter, ...] = (
+    ClaudeACPProviderAdapter(),
     DevinACPProviderAdapter(),
     CopilotACPProviderAdapter(),
 )
@@ -607,10 +748,11 @@ class CopilotACPClient:
         tool_choice: Any = None,
         **_: Any,
     ) -> Any:
+        effective_tools = self._provider_adapter.prompt_tools(tools)
         prompt_text = _format_messages_as_prompt(
             messages or [],
             model=model,
-            tools=tools,
+            tools=effective_tools,
             tool_choice=tool_choice,
         )
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
@@ -794,10 +936,13 @@ class CopilotACPClient:
             )
             session = _request(
                 "session/new",
-                {
-                    "cwd": self._acp_cwd,
-                    "mcpServers": [],
-                },
+                self._provider_adapter.session_new_params(
+                    {
+                        "cwd": self._acp_cwd,
+                        "mcpServers": [],
+                    },
+                    model=model,
+                ),
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
             if not session_id:

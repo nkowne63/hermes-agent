@@ -988,3 +988,24 @@ class TestDevinACPModelValidation:
 
         assert r["accepted"] is True
         assert r["recognized"] is True
+
+
+class TestClaudeACPModelValidation:
+    def test_claude_acp_accepts_curated_model(self):
+        from hermes_cli.models import validate_requested_model
+
+        r = validate_requested_model("claude-sonnet-4.5", "claude-acp")
+
+        assert r["accepted"] is True
+        assert r["recognized"] is True
+        assert r["message"] is None
+
+    def test_claude_acp_accepts_cli_model_name_without_local_catalog(self):
+        from hermes_cli.models import validate_requested_model
+
+        r = validate_requested_model("opus", "claude-acp")
+
+        assert r["accepted"] is True
+        assert r["persist"] is True
+        assert r["recognized"] is False
+        assert "ANTHROPIC_MODEL" in (r["message"] or "")

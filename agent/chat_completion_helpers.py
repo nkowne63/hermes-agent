@@ -1267,6 +1267,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "base_url": fb_base_url,
                 **({"default_headers": dict(fb_headers)} if fb_headers else {}),
             }
+            if fb_provider in {"copilot-acp", "devin-acp", "claude-acp"}:
+                agent._client_kwargs["command"] = getattr(fb_client, "_acp_command", None)
+                agent._client_kwargs["args"] = list(getattr(fb_client, "_acp_args", []) or [])
             if _fb_timeout is not None:
                 agent._client_kwargs["timeout"] = _fb_timeout
                 # Rebuild the shared OpenAI client so the configured

@@ -90,6 +90,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_CLAUDE_ACP_BASE_URL = "acp://claude"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -248,6 +249,20 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
             "args_env_var": "HERMES_DEVIN_ACP_ARGS",
             "default_args": ["acp"],
             "api_key_placeholder": "devin-acp",
+        },
+    ),
+    "claude-acp": ProviderConfig(
+        id="claude-acp",
+        name="Claude ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CLAUDE_ACP_BASE_URL,
+        base_url_env_var="CLAUDE_ACP_BASE_URL",
+        extra={
+            "command_env_vars": ("HERMES_CLAUDE_ACP_COMMAND", "CLAUDE_AGENT_ACP_PATH"),
+            "default_command": "npx",
+            "args_env_var": "HERMES_CLAUDE_ACP_ARGS",
+            "default_args": ["-y", "@agentclientprotocol/claude-agent-acp"],
+            "api_key_placeholder": "claude-acp",
         },
     ),
     "gemini": ProviderConfig(
@@ -1535,6 +1550,7 @@ def resolve_provider(
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
         "alibaba_coding_plan": "alibaba-coding-plan",
         "claude": "anthropic", "claude-code": "anthropic",
+        "claude-agent-acp": "claude-acp", "anthropic-acp": "claude-acp",
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
@@ -5905,6 +5921,8 @@ def _resolve_external_process_command(pconfig: ProviderConfig) -> str:
         return "copilot"
     if pconfig.id == "devin-acp":
         return "devin"
+    if pconfig.id == "claude-acp":
+        return "npx"
     return ""
 
 
@@ -5921,6 +5939,8 @@ def _resolve_external_process_args(pconfig: ProviderConfig) -> list[str]:
         return ["--acp", "--stdio"]
     if pconfig.id == "devin-acp":
         return ["acp"]
+    if pconfig.id == "claude-acp":
+        return ["-y", "@agentclientprotocol/claude-agent-acp"]
     return []
 
 
@@ -6132,6 +6152,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         missing_name = {
             "copilot-acp": "GitHub Copilot CLI",
             "devin-acp": "Devin CLI",
+            "claude-acp": "Claude ACP adapter",
         }.get(provider_id, command or provider_id)
         raise AuthError(
             f"Could not find the {missing_name} command '{command}'. "
