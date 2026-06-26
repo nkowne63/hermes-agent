@@ -1797,6 +1797,66 @@ def _model_flow_copilot_acp(config, current_model=""):
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
 
+
+def _model_flow_devin_acp(config, current_model=""):
+    """Devin ACP flow using the local Devin CLI."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        deactivate_provider,
+        get_external_process_provider_status,
+        resolve_external_process_provider_credentials,
+    )
+    from hermes_cli.config import load_config, save_config
+
+    del config
+
+    provider_id = "devin-acp"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = status.get("resolved_command") or status.get("command") or "devin"
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+
+    print("  Devin ACP delegates Hermes turns to `devin acp`.")
+    print("  Hermes will launch Devin as an external ACP subprocess for each request.")
+    print(f"  Command: {resolved_command}")
+    print(f"  Backend marker: {effective_base}")
+    print()
+
+    try:
+        creds = resolve_external_process_provider_credentials(provider_id)
+    except Exception as exc:
+        print(f"  ⚠ {exc}")
+        print(
+            "  Set HERMES_DEVIN_ACP_COMMAND or DEVIN_CLI_PATH if Devin CLI is installed elsewhere."
+        )
+        return
+
+    effective_base = creds.get("base_url") or effective_base
+    selected = (current_model or "").strip() or "devin-acp"
+    try:
+        answer = input(f"Model name [{selected}]: ").strip()
+        if answer:
+            selected = answer
+    except (KeyboardInterrupt, EOFError):
+        print("No change.")
+        return
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = effective_base
+    model["api_mode"] = "chat_completions"
+    model["default"] = selected
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {selected} (via {pconfig.name})")
+
+
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.
 
