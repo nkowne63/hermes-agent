@@ -3346,9 +3346,19 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, "/reset", "Session reset~")
 
         @tree.command(name="model", description="Show or change the model")
-        @discord.app_commands.describe(name="Model name (e.g. anthropic/claude-sonnet-4). Leave empty to see current.")
-        async def slash_model(interaction: discord.Interaction, name: str = ""):
-            await self._run_simple_slash(interaction, f"/model {name}".strip())
+        @discord.app_commands.describe(
+            name="Model name (e.g. claude-opus-4.6). Leave empty to see current.",
+            provider="Optional provider slug (e.g. devin-acp, openai-codex, openrouter).",
+        )
+        async def slash_model(
+            interaction: discord.Interaction,
+            name: str = "",
+            provider: str = "",
+        ):
+            command = f"/model {name}".strip()
+            if provider.strip():
+                command = f"{command} --provider {provider.strip()}"
+            await self._run_simple_slash(interaction, command)
 
         @tree.command(name="reasoning", description="Show or change reasoning effort")
         @discord.app_commands.describe(effort="Reasoning effort: none, minimal, low, medium, high, or xhigh.")

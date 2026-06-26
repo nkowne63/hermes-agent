@@ -234,11 +234,19 @@ def test_run_prompt_passes_devin_model_env_for_devin_acp(monkeypatch, tmp_path):
         acp_cwd=str(tmp_path),
     )
 
-    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
-        with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
-            client._run_prompt("hello", model="opus", timeout_seconds=1)
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+            with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
+                client._run_prompt("hello", model="opus", timeout_seconds=1)
 
     assert captured["kwargs"]["env"]["DEVIN_MODEL"] == "opus"
+    assert captured["cmd"][:3] == [
+        "devin",
+        "--agent-config",
+        captured["cmd"][2],
+    ]
+    assert captured["cmd"][3:] == ["acp"]
+    assert not Path(captured["cmd"][2]).exists()
 
 
 def test_run_prompt_does_not_pass_sentinel_model_as_devin_model(monkeypatch, tmp_path):
@@ -258,3 +266,73 @@ def test_run_prompt_does_not_pass_sentinel_model_as_devin_model(monkeypatch, tmp
             client._run_prompt("hello", model="devin-acp", timeout_seconds=1)
 
     assert "DEVIN_MODEL" not in captured["kwargs"]["env"]
+
+
+def test_run_prompt_uses_configured_devin_agent_config(monkeypatch, tmp_path):
+    configured = tmp_path / "devin-agent.yaml"
+    configured.write_text("allowed_tools: []\n")
+
+    captured = {}
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(
+        client._provider_adapter,
+        "_settings",
+        return_value={"agent_config": str(configured)},
+    ):
+        with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+            with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
+                client._run_prompt("hello", model="opus", timeout_seconds=1)
+
+    assert captured["cmd"] == ["devin", "--agent-config", str(configured), "acp"]
+
+
+def test_devin_tools_only_disables_fs_client_capabilities(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        assert client._provider_adapter.client_capabilities() == {}
+        assert client._provider_adapter.supports_client_method("fs/read_text_file") is False
+        assert client._provider_adapter.supports_client_method("session/request_permission") is True
+
+
+def test_devin_tools_only_rejects_fs_request(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+    process = _FakeProcess()
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        handled = client._handle_server_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "fs/read_text_file",
+                "params": {"path": str(tmp_path / "x.txt")},
+            },
+            process=process,
+            cwd=str(tmp_path),
+            text_parts=[],
+            reasoning_parts=[],
+        )
+
+    assert handled is True
+    payload = json.loads(process.stdin.getvalue())
+    assert payload["error"]["code"] == -32601
+    assert "disabled by Hermes configuration" in payload["error"]["message"]

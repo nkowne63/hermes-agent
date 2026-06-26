@@ -14,6 +14,7 @@ import queue
 import re
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -125,6 +126,25 @@ class ACPProviderAdapter:
     ) -> dict[str, str]:
         return env
 
+    def subprocess_args(
+        self,
+        args: list[str],
+        *,
+        model: str | None,
+    ) -> tuple[list[str], list[Path]]:
+        return list(args), []
+
+    def client_capabilities(self) -> dict[str, Any]:
+        return {
+            "fs": {
+                "readTextFile": True,
+                "writeTextFile": True,
+            }
+        }
+
+    def supports_client_method(self, method: str) -> bool:
+        return True
+
     def missing_command_error(self, command: str) -> str:
         return (
             f"Could not start {self.display_name} command '{command}'. "
@@ -179,6 +199,52 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
     marker_prefixes = ("acp://devin",)
     command_names = ("devin", "devin.exe")
 
+    def _settings(self) -> dict[str, Any]:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+        except Exception:
+            cfg = {}
+        acp_cfg = cfg.get("acp") if isinstance(cfg, dict) else {}
+        devin_cfg = acp_cfg.get("devin") if isinstance(acp_cfg, dict) else {}
+        legacy_cfg = cfg.get("devin_acp") if isinstance(cfg, dict) else {}
+        merged: dict[str, Any] = {}
+        if isinstance(legacy_cfg, dict):
+            merged.update(legacy_cfg)
+        if isinstance(devin_cfg, dict):
+            merged.update(devin_cfg)
+        return merged
+
+    def _hermes_tools_only(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_tools_only", settings.get("tools_only", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _agent_config_path(self) -> str:
+        settings = self._settings()
+        return str(settings.get("agent_config") or settings.get("agent_config_path") or "").strip()
+
+    def _allowed_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("allowed_tools")
+        if isinstance(raw, list):
+            tools = [str(item).strip() for item in raw if str(item).strip()]
+            if tools:
+                return tools
+        return ["mcp__hermes__*"]
+
+    def _deny_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("deny_tools")
+        if isinstance(raw, list):
+            return [str(item).strip() for item in raw if str(item).strip()]
+        return ["*"]
+
     def subprocess_env(
         self,
         env: dict[str, str],
@@ -189,6 +255,57 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         if model_value and model_value.lower() not in {"devin", "devin-acp"}:
             env["DEVIN_MODEL"] = model_value
         return env
+
+    def subprocess_args(
+        self,
+        args: list[str],
+        *,
+        model: str | None,
+    ) -> tuple[list[str], list[Path]]:
+        del model
+        resolved = list(args)
+        if not self._hermes_tools_only():
+            return resolved, []
+        if "--agent-config" in resolved:
+            return resolved, []
+
+        configured = self._agent_config_path()
+        if configured:
+            return ["--agent-config", configured, *resolved], []
+
+        allowed_tools = self._allowed_tools()
+        deny_tools = self._deny_tools()
+        lines = ["allowed_tools:"]
+        lines.extend(f"  - {json.dumps(tool)}" for tool in allowed_tools)
+        lines.append("permissions:")
+        lines.append("  allow:")
+        lines.extend(f"    - {json.dumps(tool)}" for tool in allowed_tools)
+        if deny_tools:
+            lines.append("  deny:")
+            lines.extend(f"    - {json.dumps(tool)}" for tool in deny_tools)
+
+        tmp = tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            prefix="hermes-devin-acp-",
+            suffix=".yaml",
+            delete=False,
+        )
+        with tmp:
+            tmp.write("\n".join(lines))
+            tmp.write("\n")
+        path = Path(tmp.name)
+        return ["--agent-config", str(path), *resolved], [path]
+
+    def client_capabilities(self) -> dict[str, Any]:
+        if self._hermes_tools_only():
+            return {}
+        return super().client_capabilities()
+
+    def supports_client_method(self, method: str) -> bool:
+        if self._hermes_tools_only() and method.startswith("fs/"):
+            return False
+        return True
 
     def missing_command_error(self, command: str) -> str:
         return (
@@ -552,9 +669,23 @@ class CopilotACPClient:
             _build_subprocess_env(),
             model=model,
         )
+        acp_args, cleanup_paths = self._provider_adapter.subprocess_args(
+            self._acp_args,
+            model=model,
+        )
+
+        def _cleanup_generated_files() -> None:
+            for path in cleanup_paths:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+
         try:
             proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
+                [self._acp_command] + acp_args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -564,12 +695,14 @@ class CopilotACPClient:
                 env=env,
             )
         except FileNotFoundError as exc:
+            _cleanup_generated_files()
             raise RuntimeError(
                 self._provider_adapter.missing_command_error(self._acp_command)
             ) from exc
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
+            _cleanup_generated_files()
             raise RuntimeError(
                 f"{self._provider_adapter.display_name} process did not expose stdin/stdout pipes."
             )
@@ -651,12 +784,7 @@ class CopilotACPClient:
                 "initialize",
                 {
                     "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": {
-                            "readTextFile": True,
-                            "writeTextFile": True,
-                        }
-                    },
+                    "clientCapabilities": self._provider_adapter.client_capabilities(),
                     "clientInfo": {
                         "name": "hermes-agent",
                         "title": "Hermes Agent",
@@ -696,6 +824,7 @@ class CopilotACPClient:
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
             self.close()
+            _cleanup_generated_files()
 
     def _handle_server_message(
         self,
@@ -730,7 +859,13 @@ class CopilotACPClient:
         message_id = msg.get("id")
         params = msg.get("params") or {}
 
-        if method == "session/request_permission":
+        if not self._provider_adapter.supports_client_method(method):
+            response = _jsonrpc_error(
+                message_id,
+                -32601,
+                f"{self._provider_adapter.display_name} client method '{method}' is disabled by Hermes configuration.",
+            )
+        elif method == "session/request_permission":
             response = _permission_denied(message_id)
         elif method == "fs/read_text_file":
             try:

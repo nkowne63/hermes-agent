@@ -2182,13 +2182,15 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
     if normalized in {"copilot", "copilot-acp", "devin-acp"}:
+        if normalized == "devin-acp":
+            return list(_PROVIDER_MODELS.get("devin-acp", []))
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
             if live:
                 return live
         except Exception:
             pass
-        if normalized in {"copilot-acp", "devin-acp"}:
+        if normalized == "copilot-acp":
             return list(_PROVIDER_MODELS.get("copilot", []))
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
@@ -3671,6 +3673,25 @@ def validate_requested_model(
         }
 
     # Providers with non-standard catalog validation — /v1/models probing is not the right path.
+    if normalized == "devin-acp":
+        catalog_models = provider_model_ids(normalized)
+        if requested_for_lookup in set(catalog_models):
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
+        return {
+            "accepted": True,
+            "persist": True,
+            "recognized": False,
+            "message": (
+                f"Note: Hermes cannot verify Devin CLI model `{requested}` locally. "
+                "The model name will be passed to Devin via DEVIN_MODEL."
+            ),
+        }
+
     if normalized in {"openai-codex", "xai-oauth"}:
         try:
             catalog_models = provider_model_ids(normalized)

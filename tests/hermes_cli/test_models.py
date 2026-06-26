@@ -968,4 +968,23 @@ class TestCodexSoftAcceptPlausibilityGate:
         from hermes_cli.models import validate_requested_model
         r = validate_requested_model("gpt-5.5", "openai-codex")
         assert r["accepted"] is True
+
+
+class TestDevinACPModelValidation:
+    def test_devin_acp_accepts_cli_model_name_without_local_catalog(self):
+        from hermes_cli.models import validate_requested_model
+
+        r = validate_requested_model("claude-opus-4.6", "devin-acp")
+
+        assert r["accepted"] is True
+        assert r["persist"] is True
+        assert r["recognized"] is False
+        assert "DEVIN_MODEL" in (r["message"] or "")
+
+    def test_devin_acp_sentinel_model_is_recognized(self):
+        from hermes_cli.models import validate_requested_model
+
+        r = validate_requested_model("devin-acp", "devin-acp")
+
+        assert r["accepted"] is True
         assert r["recognized"] is True

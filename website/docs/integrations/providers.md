@@ -208,6 +208,32 @@ model:
 | `HERMES_COPILOT_ACP_COMMAND` | Override the Copilot CLI binary path (default: `copilot`) |
 | `HERMES_COPILOT_ACP_ARGS` | Override ACP args (default: `--acp --stdio`) |
 
+**`devin-acp` — Devin ACP agent backend**. Spawns the local Devin CLI as a subprocess:
+
+```bash
+hermes chat --provider devin-acp --model claude-opus-4.6
+# Requires the Devin CLI in PATH and an existing `devin auth login` session
+```
+
+Hermes passes non-sentinel model names to Devin through `DEVIN_MODEL`, so `/model claude-opus-4.6 --provider devin-acp` works in the CLI and through gateway slash commands such as Discord `/model`.
+
+By default, Hermes launches Devin with a temporary `--agent-config` that denies Devin's own tools and allows only MCP-style `mcp__hermes__*` tools. Hermes still executes its own tool calls through the Hermes ACP bridge. You can tune that behavior in `config.yaml`:
+
+```yaml
+acp:
+  devin:
+    hermes_tools_only: true
+    allowed_tools: ["mcp__hermes__*"]
+    deny_tools: ["*"]
+    # Optional: use your own Devin agent config instead of Hermes' generated one.
+    # agent_config: "/path/to/devin-agent.yaml"
+```
+
+| Environment variable | Description |
+|---------------------|-------------|
+| `HERMES_DEVIN_ACP_COMMAND` | Override the Devin CLI binary path (default: `devin`) |
+| `HERMES_DEVIN_ACP_ARGS` | Override ACP args (default: `acp`) |
+
 ### First-Class API-Key Providers
 
 These providers have built-in support with dedicated provider IDs. Set the API key and use `--provider` to select:
