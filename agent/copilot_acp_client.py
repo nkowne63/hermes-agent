@@ -102,6 +102,23 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _is_devin_acp_command(command: str, base_url: str) -> bool:
+    marker = (base_url or "").strip().lower()
+    if marker.startswith("acp://devin"):
+        return True
+    command_name = Path(command or "").name.lower()
+    return command_name in {"devin", "devin.exe"}
+
+
+def _devin_model_env_value(model: str | None) -> str:
+    value = (model or "").strip()
+    if not value:
+        return ""
+    if value.lower() in {"devin", "devin-acp"}:
+        return ""
+    return value
+
+
 def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -402,6 +419,7 @@ class CopilotACPClient:
 
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
+            model=model,
             timeout_seconds=_effective_timeout,
         )
 
@@ -428,7 +446,17 @@ class CopilotACPClient:
             model=model or "copilot-acp",
         )
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        model: str | None = None,
+        timeout_seconds: float,
+    ) -> tuple[str, str]:
+        env = _build_subprocess_env()
+        devin_model = _devin_model_env_value(model)
+        if devin_model and _is_devin_acp_command(self._acp_command, self.base_url):
+            env["DEVIN_MODEL"] = devin_model
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -438,7 +466,7 @@ class CopilotACPClient:
                 text=True,
                 bufsize=1,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=env,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
