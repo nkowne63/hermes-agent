@@ -209,6 +209,19 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
     assert captured["kwargs"]["env"]["HOME"]
 
 
+def test_run_prompt_does_not_pass_devin_model_env_for_copilot_acp(monkeypatch, tmp_path):
+    monkeypatch.delenv("DEVIN_MODEL", raising=False)
+
+    captured = {}
+    client = _make_home_client(tmp_path)
+
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hello", model="opus", timeout_seconds=1)
+
+    assert "DEVIN_MODEL" not in captured["kwargs"]["env"]
+
+
 def test_run_prompt_passes_devin_model_env_for_devin_acp(monkeypatch, tmp_path):
     monkeypatch.delenv("DEVIN_MODEL", raising=False)
 
@@ -222,7 +235,7 @@ def test_run_prompt_passes_devin_model_env_for_devin_acp(monkeypatch, tmp_path):
     )
 
     with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
-        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+        with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
             client._run_prompt("hello", model="opus", timeout_seconds=1)
 
     assert captured["kwargs"]["env"]["DEVIN_MODEL"] == "opus"
@@ -241,7 +254,7 @@ def test_run_prompt_does_not_pass_sentinel_model_as_devin_model(monkeypatch, tmp
     )
 
     with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
-        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+        with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
             client._run_prompt("hello", model="devin-acp", timeout_seconds=1)
 
     assert "DEVIN_MODEL" not in captured["kwargs"]["env"]

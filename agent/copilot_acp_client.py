@@ -1,7 +1,7 @@
-"""OpenAI-compatible shim that forwards Hermes requests to `copilot --acp`.
+"""OpenAI-compatible shim that forwards Hermes requests to subprocess ACP CLIs.
 
-This adapter lets Hermes treat the GitHub Copilot ACP server as a chat-style
-backend. Each request starts a short-lived ACP session, sends the formatted
+This adapter lets Hermes treat subprocess ACP servers as chat-style
+backends. Each request starts a short-lived ACP session, sends the formatted
 conversation as a single prompt, collects text chunks, and converts the result
 back into the minimal shape Hermes expects from an OpenAI client.
 """
@@ -102,21 +102,112 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _is_devin_acp_command(command: str, base_url: str) -> bool:
-    marker = (base_url or "").strip().lower()
-    if marker.startswith("acp://devin"):
-        return True
-    command_name = Path(command or "").name.lower()
-    return command_name in {"devin", "devin.exe"}
+class ACPProviderAdapter:
+    """Provider-specific behavior for subprocess-backed ACP CLIs."""
+
+    display_name = "ACP"
+    default_model = "acp"
+    marker_prefixes: tuple[str, ...] = ()
+    command_names: tuple[str, ...] = ()
+
+    def matches(self, *, base_url: str, command: str) -> bool:
+        marker = (base_url or "").strip().lower()
+        if any(marker.startswith(prefix) for prefix in self.marker_prefixes):
+            return True
+        command_name = Path(command or "").name.lower()
+        return command_name in self.command_names
+
+    def subprocess_env(
+        self,
+        env: dict[str, str],
+        *,
+        model: str | None,
+    ) -> dict[str, str]:
+        return env
+
+    def missing_command_error(self, command: str) -> str:
+        return (
+            f"Could not start {self.display_name} command '{command}'. "
+            "Install the provider CLI or set the provider-specific command env vars."
+        )
+
+    def early_exit_error(self, stderr_text: str) -> RuntimeError:
+        return RuntimeError(f"{self.display_name} process exited early: {stderr_text}")
+
+    def timeout_error(self, method: str) -> TimeoutError:
+        return TimeoutError(f"Timed out waiting for {self.display_name} response to {method}.")
+
+    def method_error(self, method: str, error: Any) -> RuntimeError:
+        message = error.get("message") if isinstance(error, dict) else None
+        return RuntimeError(f"{self.display_name} {method} failed: {message or error}")
 
 
-def _devin_model_env_value(model: str | None) -> str:
-    value = (model or "").strip()
-    if not value:
-        return ""
-    if value.lower() in {"devin", "devin-acp"}:
-        return ""
-    return value
+class CopilotACPProviderAdapter(ACPProviderAdapter):
+    display_name = "Copilot ACP"
+    default_model = "copilot-acp"
+    marker_prefixes = ("acp://copilot",)
+    command_names = ("copilot", "copilot.exe")
+
+    def missing_command_error(self, command: str) -> str:
+        return (
+            f"Could not start Copilot ACP command '{command}'. "
+            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+        )
+
+    def early_exit_error(self, stderr_text: str) -> RuntimeError:
+        if _is_gh_copilot_deprecation_message(stderr_text):
+            return RuntimeError(
+                "Hermes ACP mode requires the NEW GitHub Copilot CLI "
+                "(github.com/github/copilot-cli), but the binary it just "
+                "spawned is the deprecated `gh copilot` extension.\n\n"
+                "Install the new CLI:\n"
+                "  npm install -g @github/copilot\n"
+                "  # then verify with: copilot --help\n\n"
+                "If `copilot` already resolves to the new CLI but you still see this,\n"
+                "point Hermes at it explicitly:\n"
+                "  export HERMES_COPILOT_ACP_COMMAND=/path/to/new/copilot\n\n"
+                "Alternative: use the `copilot` provider (no ACP, hits the Copilot API\n"
+                "directly with a Copilot subscription token) via `hermes setup`.\n\n"
+                f"Original error:\n{stderr_text}"
+            )
+        return super().early_exit_error(stderr_text)
+
+
+class DevinACPProviderAdapter(ACPProviderAdapter):
+    display_name = "Devin ACP"
+    default_model = "devin-acp"
+    marker_prefixes = ("acp://devin",)
+    command_names = ("devin", "devin.exe")
+
+    def subprocess_env(
+        self,
+        env: dict[str, str],
+        *,
+        model: str | None,
+    ) -> dict[str, str]:
+        model_value = (model or "").strip()
+        if model_value and model_value.lower() not in {"devin", "devin-acp"}:
+            env["DEVIN_MODEL"] = model_value
+        return env
+
+    def missing_command_error(self, command: str) -> str:
+        return (
+            f"Could not start Devin ACP command '{command}'. "
+            "Install Devin CLI or set HERMES_DEVIN_ACP_COMMAND/DEVIN_CLI_PATH."
+        )
+
+
+_ACP_PROVIDER_ADAPTERS: tuple[ACPProviderAdapter, ...] = (
+    DevinACPProviderAdapter(),
+    CopilotACPProviderAdapter(),
+)
+
+
+def _resolve_acp_provider_adapter(*, base_url: str, command: str) -> ACPProviderAdapter:
+    for adapter in _ACP_PROVIDER_ADAPTERS:
+        if adapter.matches(base_url=base_url, command=command):
+            return adapter
+    return CopilotACPProviderAdapter()
 
 
 def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
@@ -342,7 +433,7 @@ class _ACPChatNamespace:
 
 
 class CopilotACPClient:
-    """Minimal OpenAI-client-compatible facade for Copilot ACP."""
+    """Minimal OpenAI-client-compatible facade for subprocess ACP providers."""
 
     def __init__(
         self,
@@ -363,6 +454,10 @@ class CopilotACPClient:
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self._provider_adapter = _resolve_acp_provider_adapter(
+            base_url=self.base_url,
+            command=self._acp_command,
+        )
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -443,7 +538,7 @@ class CopilotACPClient:
         return SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or "copilot-acp",
+            model=model or self._provider_adapter.default_model,
         )
 
     def _run_prompt(
@@ -453,10 +548,10 @@ class CopilotACPClient:
         model: str | None = None,
         timeout_seconds: float,
     ) -> tuple[str, str]:
-        env = _build_subprocess_env()
-        devin_model = _devin_model_env_value(model)
-        if devin_model and _is_devin_acp_command(self._acp_command, self.base_url):
-            env["DEVIN_MODEL"] = devin_model
+        env = self._provider_adapter.subprocess_env(
+            _build_subprocess_env(),
+            model=model,
+        )
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -470,13 +565,14 @@ class CopilotACPClient:
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
-                f"Could not start Copilot ACP command '{self._acp_command}'. "
-                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+                self._provider_adapter.missing_command_error(self._acp_command)
             ) from exc
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
-            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
+            raise RuntimeError(
+                f"{self._provider_adapter.display_name} process did not expose stdin/stdout pipes."
+            )
 
         self.is_closed = False
         with self._active_process_lock:
@@ -542,30 +638,13 @@ class CopilotACPClient:
                     continue
                 if "error" in msg:
                     err = msg.get("error") or {}
-                    raise RuntimeError(
-                        f"Copilot ACP {method} failed: {err.get('message') or err}"
-                    )
+                    raise self._provider_adapter.method_error(method, err)
                 return msg.get("result")
 
             stderr_text = "\n".join(stderr_tail).strip()
             if proc.poll() is not None and stderr_text:
-                if _is_gh_copilot_deprecation_message(stderr_text):
-                    raise RuntimeError(
-                        "Hermes ACP mode requires the NEW GitHub Copilot CLI "
-                        "(github.com/github/copilot-cli), but the binary it just "
-                        "spawned is the deprecated `gh copilot` extension.\n\n"
-                        "Install the new CLI:\n"
-                        "  npm install -g @github/copilot\n"
-                        "  # then verify with: copilot --help\n\n"
-                        "If `copilot` already resolves to the new CLI but you still see this,\n"
-                        "point Hermes at it explicitly:\n"
-                        "  export HERMES_COPILOT_ACP_COMMAND=/path/to/new/copilot\n\n"
-                        "Alternative: use the `copilot` provider (no ACP, hits the Copilot API\n"
-                        "directly with a Copilot subscription token) via `hermes setup`.\n\n"
-                        f"Original error:\n{stderr_text}"
-                    )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
+                raise self._provider_adapter.early_exit_error(stderr_text)
+            raise self._provider_adapter.timeout_error(method)
 
         try:
             _request(
@@ -594,7 +673,9 @@ class CopilotACPClient:
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
             if not session_id:
-                raise RuntimeError("Copilot ACP did not return a sessionId.")
+                raise RuntimeError(
+                    f"{self._provider_adapter.display_name} did not return a sessionId."
+                )
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
