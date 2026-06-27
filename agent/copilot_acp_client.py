@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.file_safety import get_read_block_error, is_write_denied
+from agent.anthropic_adapter import normalize_model_name
 from agent.redact import redact_sensitive_text
 
 ACP_MARKER_BASE_URL = "acp://copilot"
@@ -591,13 +592,19 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
         settings = self._settings()
         return str(settings.get("tool_platform") or "discord").strip()
 
+    def _normalize_model_for_cli(self, model: str | None) -> str:
+        model_value = (model or "").strip()
+        if not model_value or model_value.lower() in {"claude", "claude-acp"}:
+            return model_value
+        return normalize_model_name(model_value)
+
     def subprocess_env(
         self,
         env: dict[str, str],
         *,
         model: str | None,
     ) -> dict[str, str]:
-        model_value = (model or "").strip()
+        model_value = self._normalize_model_for_cli(model)
         if model_value and model_value.lower() not in {"claude", "claude-acp"}:
             env["ANTHROPIC_MODEL"] = model_value
         return env
@@ -621,7 +628,7 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
         if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
             return params
 
-        model_value = (model or "").strip()
+        model_value = self._normalize_model_for_cli(model)
         options: dict[str, Any] = {
             "tools": [],
             "disallowedTools": list(self._DISALLOWED_BUILTIN_TOOLS),

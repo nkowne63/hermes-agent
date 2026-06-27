@@ -1055,6 +1055,19 @@ def restore_primary_runtime(agent) -> bool:
         from agent.chat_completion_helpers import rewrite_prompt_model_identity
         rewrite_prompt_model_identity(agent, rt["model"], rt["provider"])
 
+        _session_db = getattr(agent, "_session_db", None)
+        _session_id = getattr(agent, "session_id", None)
+        if _session_db is not None and _session_id:
+            cached_prompt = getattr(agent, "_cached_system_prompt", None)
+            if isinstance(cached_prompt, str) and cached_prompt:
+                try:
+                    _session_db.update_system_prompt(_session_id, cached_prompt)
+                except Exception:
+                    logger.warning(
+                        "Failed to persist restored primary system prompt",
+                        exc_info=True,
+                    )
+
         logger.info(
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,
@@ -1641,8 +1654,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             api_mode=agent.api_mode,
         )
 
-    # ── Invalidate cached system prompt so it rebuilds next turn ──
-    agent._cached_system_prompt = None
+    # The runtime rewrite above keeps the cached system prompt aligned
+    # with the selected runtime, so preserve it for the next turn.
 
     # ── Update _primary_runtime so the change persists across turns ──
     _cc = agent.context_compressor if hasattr(agent, "context_compressor") and agent.context_compressor else None
@@ -1696,6 +1709,25 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
     )
+
+    # Keep the cached system prompt aligned with the newly-selected runtime
+    # and persist that rewritten snapshot so the next turn can reuse it
+    # verbatim instead of rebuilding the whole prompt from scratch.
+    from agent.chat_completion_helpers import rewrite_prompt_model_identity
+    rewrite_prompt_model_identity(agent, agent.model, agent.provider)
+
+    _session_db = getattr(agent, "_session_db", None)
+    _session_id = getattr(agent, "session_id", None)
+    if _session_db is not None and _session_id:
+        cached_prompt = getattr(agent, "_cached_system_prompt", None)
+        if isinstance(cached_prompt, str) and cached_prompt:
+            try:
+                _session_db.update_system_prompt(_session_id, cached_prompt)
+            except Exception:
+                logger.warning(
+                    "Failed to persist rewritten system prompt after model switch",
+                    exc_info=True,
+                )
 
     # ── Persist billing route to session DB ──
     # The agent's _session_db / session_id may not be set in all contexts

@@ -460,7 +460,7 @@ def test_run_prompt_passes_claude_model_env_for_claude_acp(monkeypatch, tmp_path
         with pytest.raises(RuntimeError, match="Could not start Claude ACP command"):
             client._run_prompt("hello", model="claude-sonnet-4.5", timeout_seconds=1)
 
-    assert captured["kwargs"]["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4.5"
+    assert captured["kwargs"]["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4-5"
     assert captured["cmd"] == ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
 
 
@@ -497,8 +497,8 @@ def test_claude_session_params_inject_hermes_mcp_bridge(tmp_path):
     assert options["tools"] == []
     assert "hermes" in options["mcpServers"]
     assert "Bash" in options["disallowedTools"]
-    assert options["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4.5"
-    assert options["settings"]["availableModels"] == ["claude-sonnet-4.5"]
+    assert options["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4-5"
+    assert options["settings"]["availableModels"] == ["claude-sonnet-4-5"]
 
     hermes_server = options["mcpServers"]["hermes"]
     assert hermes_server["command"]
