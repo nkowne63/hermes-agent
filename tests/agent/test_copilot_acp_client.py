@@ -224,6 +224,7 @@ def test_run_prompt_does_not_pass_devin_model_env_for_copilot_acp(monkeypatch, t
 
 def test_run_prompt_passes_devin_model_env_for_devin_acp(monkeypatch, tmp_path):
     monkeypatch.delenv("DEVIN_MODEL", raising=False)
+    monkeypatch.delenv("DEVIN_REASONING_EFFORT", raising=False)
 
     captured = {}
     client = CopilotACPClient(
@@ -234,12 +235,82 @@ def test_run_prompt_passes_devin_model_env_for_devin_acp(monkeypatch, tmp_path):
         acp_cwd=str(tmp_path),
     )
 
-    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+    with _patch.object(client._provider_adapter, "_settings", return_value={"reasoning_effort": "low"}):
         with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
             with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
                 client._run_prompt("hello", model="opus", timeout_seconds=1)
 
     assert captured["kwargs"]["env"]["DEVIN_MODEL"] == "opus"
+    assert captured["kwargs"]["env"]["DEVIN_REASONING_EFFORT"] == "low"
+    assert captured["cmd"][:2] == ["devin", "--agent-config"]
+    assert captured["cmd"][3:] == ["acp"]
+    assert not Path(captured["cmd"][2]).exists()
+
+
+def test_devin_default_tools_only_attaches_hermes_mcp_and_restricts_native_tools(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        args, cleanup = client._provider_adapter.subprocess_args(["acp"], model="opus")
+        assert args[:2] == ["--agent-config", args[1]]
+        assert args[2:] == ["acp"]
+        assert cleanup and cleanup[0] == Path(args[1])
+        assert "mcp__hermes__*" in cleanup[0].read_text(encoding="utf-8")
+        assert client._provider_adapter.client_capabilities() == {}
+        assert client._provider_adapter.supports_client_method("fs/read_text_file") is False
+        for path in cleanup:
+            path.unlink(missing_ok=True)
+
+        params = client._provider_adapter.session_new_params(
+            {"cwd": str(tmp_path), "mcpServers": []},
+            model="opus",
+        )
+        servers = params["mcpServers"]
+        assert len(servers) == 1
+        assert servers[0]["name"] == "hermes"
+        assert servers[0]["command"]
+        assert "mcp_hermes_tools.py" in servers[0]["args"][0]
+        assert "--platform" in servers[0]["args"]
+        env = {item["name"]: item["value"] for item in servers[0]["env"]}
+        assert env["HERMES_MCP_TOOL_PLATFORM"] == "discord"
+
+
+def test_devin_mcp_bridge_can_be_disabled_to_keep_native_tools(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={"hermes_mcp_bridge": False}):
+        assert client._provider_adapter.subprocess_args(["acp"], model="opus") == (["acp"], [])
+        assert client._provider_adapter.client_capabilities()["fs"]["readTextFile"] is True
+        assert client._provider_adapter.supports_client_method("fs/read_text_file") is True
+
+
+def test_devin_explicit_deny_tools_generates_agent_config(tmp_path):
+    captured = {}
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={"deny_tools": ["*"]}):
+        with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+            with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
+                client._run_prompt("hello", model="opus", timeout_seconds=1)
+
     assert captured["cmd"][:3] == [
         "devin",
         "--agent-config",
@@ -293,7 +364,7 @@ def test_run_prompt_uses_configured_devin_agent_config(monkeypatch, tmp_path):
     assert captured["cmd"] == ["devin", "--agent-config", str(configured), "acp"]
 
 
-def test_devin_tools_only_disables_fs_client_capabilities(tmp_path):
+def test_devin_explicit_tools_only_disables_fs_client_capabilities(tmp_path):
     client = CopilotACPClient(
         api_key="devin-acp",
         base_url="acp://devin",
@@ -302,13 +373,13 @@ def test_devin_tools_only_disables_fs_client_capabilities(tmp_path):
         acp_cwd=str(tmp_path),
     )
 
-    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+    with _patch.object(client._provider_adapter, "_settings", return_value={"deny_tools": ["*"]}):
         assert client._provider_adapter.client_capabilities() == {}
         assert client._provider_adapter.supports_client_method("fs/read_text_file") is False
         assert client._provider_adapter.supports_client_method("session/request_permission") is True
 
 
-def test_devin_tools_only_rejects_fs_request(tmp_path):
+def test_devin_explicit_tools_only_rejects_fs_request(tmp_path):
     client = CopilotACPClient(
         api_key="devin-acp",
         base_url="acp://devin",
@@ -318,7 +389,7 @@ def test_devin_tools_only_rejects_fs_request(tmp_path):
     )
     process = _FakeProcess()
 
-    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+    with _patch.object(client._provider_adapter, "_settings", return_value={"deny_tools": ["*"]}):
         handled = client._handle_server_message(
             {
                 "jsonrpc": "2.0",

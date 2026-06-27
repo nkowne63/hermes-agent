@@ -1,5 +1,0 @@
-name: devin-acp-provider
-kind: model-provider
-version: 1.0.0
-description: Devin via ACP subprocess
-author: Nous Research

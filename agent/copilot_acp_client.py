@@ -17,6 +17,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import sys
+import uuid
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -276,11 +278,39 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         raw = settings.get("deny_tools")
         if isinstance(raw, list):
             return [str(item).strip() for item in raw if str(item).strip()]
-        return ["*"]
+        if self._use_hermes_mcp_bridge():
+            return ["*"]
+        # Without the Hermes MCP bridge, default-denying every native Devin tool
+        # would leave the ACP session with no usable tools.
+        return []
 
     def _tool_platform(self) -> str:
         settings = self._settings()
         return str(settings.get("tool_platform") or "discord").strip()
+
+    def _use_hermes_mcp_bridge(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_mcp_bridge", settings.get("mcp_bridge", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _restricts_native_tools(self) -> bool:
+        if not self._hermes_tools_only():
+            return False
+        if self._use_hermes_mcp_bridge():
+            return True
+        if self._agent_config_path():
+            return True
+        allowed_tools = self._allowed_tools()
+        deny_tools = self._deny_tools()
+        return bool(deny_tools) or allowed_tools != ["mcp__hermes__*"]
+
+    def _reasoning_effort(self) -> str:
+        settings = self._settings()
+        return str(settings.get("reasoning_effort") or settings.get("thinking_level") or "").strip()
 
     def subprocess_env(
         self,
@@ -291,6 +321,9 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         model_value = (model or "").strip()
         if model_value and model_value.lower() not in {"devin", "devin-acp"}:
             env["DEVIN_MODEL"] = model_value
+        reasoning_effort = self._reasoning_effort()
+        if reasoning_effort:
+            env["DEVIN_REASONING_EFFORT"] = reasoning_effort
         return env
 
     def subprocess_args(
@@ -310,6 +343,13 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         if configured:
             return ["--agent-config", configured, *resolved], []
 
+        # The default allow-list targets a future/optional Hermes MCP bridge.
+        # Without an explicit deny list, passing only this allow-list still
+        # hides Devin's native tools while exposing no Hermes MCP tools.  In
+        # that default state, leave Devin's tool configuration alone and rely on
+        # the prompt-level Hermes tool schemas instead.
+        if not self._restricts_native_tools():
+            return resolved, []
         allowed_tools = self._allowed_tools()
         deny_tools = self._deny_tools()
         lines = ["allowed_tools:"]
@@ -335,12 +375,12 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         return ["--agent-config", str(path), *resolved], [path]
 
     def client_capabilities(self) -> dict[str, Any]:
-        if self._hermes_tools_only():
+        if self._restricts_native_tools():
             return {}
         return super().client_capabilities()
 
     def supports_client_method(self, method: str) -> bool:
-        if self._hermes_tools_only() and method.startswith("fs/"):
+        if self._restricts_native_tools() and method.startswith("fs/"):
             return False
         return True
 
@@ -348,6 +388,60 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         if not self._hermes_tools_only():
             return tools
         return _platform_tool_definitions(self._tool_platform()) or tools
+
+    def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
+        del model
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return params
+
+        merged = dict(params)
+        cwd = str(merged.get("cwd") or os.getcwd())
+        session_id = f"devin-acp-{uuid.uuid4().hex}"
+        repo_root = Path(__file__).resolve().parent.parent
+        server_path = repo_root / "mcp_hermes_tools.py"
+
+        env_names = [
+            "HOME",
+            "HERMES_HOME",
+            "HERMES_REAL_HOME",
+            "PATH",
+            "PYTHONPATH",
+        ]
+        env = [
+            {"name": name, "value": value}
+            for name in env_names
+            if (value := os.environ.get(name))
+        ]
+        env.extend(
+            [
+                {"name": "HERMES_MCP_TOOL_PLATFORM", "value": self._tool_platform()},
+                {"name": "HERMES_MCP_SESSION_ID", "value": session_id},
+                {"name": "HERMES_MCP_TASK_ID", "value": session_id},
+                {"name": "HERMES_MCP_CWD", "value": cwd},
+            ]
+        )
+
+        hermes_server = {
+            "name": "hermes",
+            "command": sys.executable,
+            "args": [
+                str(server_path),
+                "--platform",
+                self._tool_platform(),
+                "--session-id",
+                session_id,
+                "--task-id",
+                session_id,
+                "--cwd",
+                cwd,
+            ],
+            "env": env,
+        }
+        existing = list(merged.get("mcpServers") or [])
+        if not any(isinstance(server, dict) and server.get("name") == "hermes" for server in existing):
+            existing.append(hermes_server)
+        merged["mcpServers"] = existing
+        return merged
 
     def missing_command_error(self, command: str) -> str:
         return (
