@@ -56,10 +56,18 @@ class FakeDMChannel:
 
 
 class FakeTextChannel:
-    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server"):
+    def __init__(
+        self,
+        channel_id: int = 1,
+        name: str = "general",
+        guild_id: int = 777,
+        guild_name: str = "Hermes Server",
+        category_id: int | None = None,
+    ):
         self.id = channel_id
         self.name = name
-        self.guild = SimpleNamespace(name=guild_name)
+        self.guild = SimpleNamespace(id=guild_id, name=guild_name)
+        self.category_id = category_id
         self.topic = None
 
 
@@ -97,6 +105,7 @@ def make_message(*, channel, content: str, mentions=None):
         created_at=datetime.now(timezone.utc),
         channel=channel,
         author=author,
+        guild=getattr(channel, "guild", None),
     )
 
 
@@ -245,6 +254,62 @@ async def test_normal_channel_still_auto_threads(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_category_default_disables_mention_requirement_and_keeps_thread_response(adapter, monkeypatch):
+    """category_defaults should let child channels start threads without a mention."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    adapter.config.extra["category_defaults"] = {
+        "1501180412385558690": {
+            "require_mention": False,
+            "thread_response": True,
+        }
+    }
+    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999))
+
+    message = make_message(
+        channel=FakeTextChannel(
+            channel_id=1501181227359539401,
+            category_id=1501180412385558690,
+        ),
+        content="hello",
+    )
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    adapter._auto_create_thread.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+
+
+@pytest.mark.asyncio
+async def test_channel_default_overrides_category_default_for_mention_requirement(adapter, monkeypatch):
+    """An exact channel rule should beat the category default."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    adapter.config.extra["category_defaults"] = {
+        "1501180412385558690": {"require_mention": False}
+    }
+    adapter.config.extra["channel_defaults"] = {
+        "1501181227359539401": {"require_mention": True}
+    }
+
+    message = make_message(
+        channel=FakeTextChannel(
+            channel_id=1501181227359539401,
+            category_id=1501180412385558690,
+        ),
+        content="hello",
+    )
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_no_thread_channels_csv_parsing(adapter, monkeypatch):
     """Multiple no_thread channel IDs parsed from CSV."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
@@ -279,34 +344,6 @@ async def test_no_thread_with_auto_thread_disabled_is_noop(adapter, monkeypatch)
 
     adapter._auto_create_thread.assert_not_awaited()
     adapter.handle_message.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_thread_response_overrides_reply_suppression(adapter, monkeypatch):
-    """thread_response should still auto-thread reply messages when mentioned."""
-    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
-    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
-    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
-    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
-    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
-
-    monkeypatch.setattr(discord_platform.discord, "MessageType", SimpleNamespace(reply="reply"), raising=False)
-    monkeypatch.setattr(adapter, "_discord_thread_response_for", lambda channel, channel_ids: True)
-    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999, name="auto-thread"))
-
-    bot_user = adapter._client.user
-    message = make_message(
-        channel=FakeTextChannel(channel_id=800),
-        content=f"<@{bot_user.id}> reply mention",
-        mentions=[bot_user],
-    )
-    message.type = "reply"
-    await adapter._handle_message(message)
-
-    adapter._auto_create_thread.assert_awaited_once()
-    adapter.handle_message.assert_awaited_once()
-    event = adapter.handle_message.await_args.args[0]
-    assert event.source.chat_type == "thread"
 
 
 # ── config.py bridging ───────────────────────────────────────────────

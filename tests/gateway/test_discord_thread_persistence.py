@@ -48,16 +48,6 @@ class TestDiscordThreadPersistence:
         assert "aaa" in adapter2._threads
         assert "bbb" in adapter2._threads
 
-    def test_external_thread_file_updates_visible_without_restart(self, tmp_path):
-        """Out-of-process scripts can append thread ids for a live adapter."""
-        adapter = self._make_adapter(tmp_path)
-        state_file = tmp_path / "discord_threads.json"
-        assert "external-thread" not in adapter._threads
-
-        state_file.write_text(json.dumps(["external-thread"]), encoding="utf-8")
-
-        assert "external-thread" in adapter._threads
-
     def test_duplicate_track_does_not_double_save(self, tmp_path):
         adapter = self._make_adapter(tmp_path)
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):

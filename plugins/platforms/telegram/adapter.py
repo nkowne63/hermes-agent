@@ -13,7 +13,6 @@ import inspect
 import json
 import logging
 import os
-import tempfile
 import html as _html
 import re
 from datetime import datetime, timezone
@@ -63,7 +62,7 @@ except ImportError:
 
 import sys
 from pathlib import Path as _Path
-sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -72,6 +71,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    classify_send_error,
     cache_image_from_bytes,
     cache_audio_from_bytes,
     cache_video_from_bytes,
@@ -80,14 +80,15 @@ from gateway.platforms.base import (
     SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
+    _TEXT_INJECT_EXTENSIONS,
     utf16_len,
 )
-from gateway.platforms.telegram_network import (
+from plugins.platforms.telegram.telegram_network import (
     TelegramFallbackTransport,
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
-from utils import atomic_replace
+from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -104,9 +105,6 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
-
-
-MAX_COMMANDS_PER_SCOPE = 30
 
 
 def check_telegram_requirements() -> bool:
@@ -194,6 +192,24 @@ def _strip_mdv2(text: str) -> str:
     # Remove MarkdownV2 spoiler markers (||text|| → text)
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)
     return cleaned
+
+
+_CHUNK_INDICATOR_ON_FENCE_RE = re.compile(
+    r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$'
+)
+
+
+def _separate_chunk_indicator_from_fence(text: str) -> str:
+    """Move ``(N/M)`` chunk markers off Telegram code-fence lines.
+
+    ``truncate_message()`` appends chunk indicators to the end of a chunk. When
+    the chunk had to close an in-progress fenced code block, that creates a
+    line like ````` \\(1/2\\)`` after MarkdownV2 escaping. Telegram does not
+    treat that as a clean closing fence, so it can reject MarkdownV2 and fall
+    back to plain text. Put the indicator on its own line immediately after the
+    closing fence.
+    """
+    return _CHUNK_INDICATOR_ON_FENCE_RE.sub(r'```\n\g<indicator>', text)
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +350,55 @@ def _wrap_markdown_tables(text: str) -> str:
     return '\n'.join(out)
 
 
+# ---------------------------------------------------------------------------
+# Rich-message newline normalization
+# ---------------------------------------------------------------------------
+
+# Matches a protected region whose internal newlines must stay bare in the
+# rich-message path: a fenced code block (```...```) OR a GFM pipe-table block
+# (a header row, a delimiter row of dashes/pipes, then any pipe data rows).
+# Telegram renders both natively, so injecting Markdown hard breaks inside them
+# would corrupt the code block / table.
+_RICH_PROTECTED_REGION_RE = re.compile(
+    r'(?:```[^\n]*\n[\s\S]*?```)'                       # fenced code block
+    r'|(?:^[^\n]*\|[^\n]*\n'                            # table header row (has a pipe)
+    r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'  # delimiter
+    r'(?:\n[^\n]*\|[^\n]*)*)',                          # data rows (newline-led, trailing \n left for prose)
+    re.MULTILINE,
+)
+
+
+def _rich_normalize_linebreaks(text: str) -> str:
+    """Convert single ``\\n`` to Markdown hard breaks for the rich-message path.
+
+    Standard Markdown treats a lone ``\\n`` as whitespace (soft break), so
+    Bot API 10.1 ``sendRichMessage`` collapses multi-line content — e.g.
+    slash-command lists joined with ``"\\n".join(lines)`` — into a single
+    paragraph.  Adding two trailing spaces before each single newline
+    forces a hard line break (``<br>``) in the rendered output.
+
+    Paragraph breaks (``\\n\\n``), fenced code blocks, and GFM pipe-table
+    blocks are left untouched: tables render natively in the rich path and a
+    hard break injected into a row separator would corrupt the table.
+    """
+    if not text or '\n' not in text:
+        return text
+
+    out: list[str] = []
+    # Split off protected regions (fenced code OR table blocks) and only inject
+    # hard breaks in the prose between them. Boundary newlines are handled by
+    # the original single-\n regex, which sees each prose run as a whole string.
+    pos = 0
+    for m in _RICH_PROTECTED_REGION_RE.finditer(text):
+        prose = text[pos:m.start()]
+        out.append(re.sub(r'(?<!\n)\n(?!\n)', '  \n', prose))
+        out.append(m.group(0))  # protected region kept verbatim
+        pos = m.end()
+    tail = text[pos:]
+    out.append(re.sub(r'(?<!\n)\n(?!\n)', '  \n', tail))
+    return ''.join(out)
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -348,6 +413,7 @@ class TelegramAdapter(BasePlatformAdapter):
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
+    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
     # UTF-8 characters. Content above this is sent via the legacy chunking path.
     RICH_MESSAGE_MAX_CHARS = 32768
@@ -419,8 +485,21 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
-        # Bot API 10.1 Rich Messages: send final replies via sendRichMessage
-        # with the raw agent markdown so tables/task lists/etc. render natively.
+        # Bot API 10.1 Rich Messages: render constructs the legacy MarkdownV2
+        # path degrades (tables → bullet lists, task lists, <details>, block
+        # math) via sendRichMessage / editMessageText's rich_message param using
+        # the raw agent markdown. Disabled by default so Telegram messages stay
+        # easy to copy as plain text; users can opt in for richer rendering on
+        # clients that accept but render rich messages poorly via
+        # platforms.telegram.extra.rich_messages: true.  Keep this opt-in:
+        # current Telegram clients can make rich messages difficult to copy
+        # as plain text, which is worse than degraded table/task-list rendering
+        # for command snippets and mobile handoffs.
+        self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
+        # Rich draft previews use a separate opt-in. Telegram macOS / Desktop
+        # can leave Bot API 10.1 rich draft frames visually overlaid until the
+        # chat is redrawn, while final rich messages remain useful.
+        self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
@@ -428,7 +507,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._rich_draft_disabled: bool = False
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
-        self._media_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8"))
+        self._media_batch_delay_seconds = env_float("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", 0.8)
         self._pending_photo_batches: Dict[str, MessageEvent] = {}
         self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
         self._media_group_events: Dict[str, MessageEvent] = {}
@@ -458,6 +537,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        self._polling_heartbeat_task: Optional[asyncio.Task] = None
         # After sustained reconnect storms the PTB httpx pool can return
         # SendResult(success=True) for sends that never actually transmit.
         # _handle_polling_network_error sets this; _verify_polling_after_reconnect
@@ -471,6 +551,23 @@ class TelegramAdapter(BasePlatformAdapter):
         self._forum_command_registered: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
         self._forum_lock = asyncio.Lock()
+        # Status indicator: when enabled, the bot's short description (the line
+        # shown under its name in the profile) is set to "Online" on connect and
+        # "Offline" on clean disconnect, so users can tell whether the gateway is
+        # up. Telegram bots have no real presence/online dot (that's a user-account
+        # feature), so the short description is the closest available surface.
+        # Off by default — this mutates the bot's GLOBAL profile, visible to all
+        # users. Opt in via gateway config: extra.status_indicator: true, or set
+        # custom strings via extra.status_online / extra.status_offline.
+        self._status_indicator_enabled: bool = bool(
+            self.config.extra.get("status_indicator", False)
+        )
+        self._status_online_text: str = str(
+            self.config.extra.get("status_online", "Online")
+        )
+        self._status_offline_text: str = str(
+            self.config.extra.get("status_offline", "Offline")
+        )
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
         # Precomputed chat_ids that have DM topics configured (for O(1) root-DM ignore check)
@@ -714,6 +811,47 @@ class TelegramAdapter(BasePlatformAdapter):
     def _is_thread_not_found_error(error: Exception) -> bool:
         return "thread not found" in str(error).lower()
 
+    def _prune_stale_dm_topic_binding(
+        self, chat_id: Any, thread_id: Any,
+    ) -> None:
+        """Drop the stale ``telegram_dm_topic_bindings`` row for a
+        topic Telegram has confirmed deleted.
+
+        Without this prune the recovery logic in
+        ``gateway.run._recover_telegram_topic_thread_id`` keeps
+        steering future inbound messages to the dead thread (the
+        bug behind #31501 — tool progress, approvals, replies all
+        end up in the wrong place even though the user has moved
+        on to a fresh topic).  Best-effort: we never raise from a
+        send-fallback path — a failed cleanup must not turn into a
+        failed user-facing send.
+        """
+        if chat_id is None or thread_id is None:
+            return
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return
+        db = getattr(store, "_db", None)
+        if db is None or not hasattr(db, "delete_telegram_topic_binding"):
+            return
+        try:
+            removed = db.delete_telegram_topic_binding(
+                chat_id=str(chat_id), thread_id=str(thread_id),
+            )
+        except Exception:
+            logger.debug(
+                "[%s] delete_telegram_topic_binding failed for "
+                "chat=%s thread=%s — skipping prune",
+                self.name, chat_id, thread_id, exc_info=True,
+            )
+            return
+        if removed:
+            logger.info(
+                "[%s] Pruned stale Telegram DM topic binding "
+                "chat=%s thread=%s (Bot API: thread not found)",
+                self.name, chat_id, thread_id,
+            )
+
     @staticmethod
     def _is_bad_request_error(error: Exception) -> bool:
         name = error.__class__.__name__.lower()
@@ -950,38 +1088,145 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return inspect.iscoroutinefunction(getattr(self._bot, "do_api_request", None))
 
+    _RICH_DETAILS_RE = re.compile(r"<details\b[^>]*>.*?</details>", re.IGNORECASE | re.DOTALL)
+    _RICH_MATH_IN_DETAILS_RE = re.compile(
+        r"(\$\$.*?\$\$|"
+        r"\\\[.*?\\\]|"
+        r"\\\(.*?\\\)|"
+        r"\\(?:sum|frac|alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|"
+        r"int|prod|sqrt|lim|infty|begin\{(?:equation|align|matrix|cases)\}))",
+        re.IGNORECASE | re.DOTALL,
+    )
+    _RICH_CJK_RE = re.compile(
+        "["
+        "\u3040-\u30ff"  # Hiragana, Katakana
+        "\u3400-\u4dbf"  # CJK Extension A
+        "\u4e00-\u9fff"  # CJK Unified Ideographs
+        "\uac00-\ud7af"  # Hangul syllables
+        "\uf900-\ufaff"  # CJK Compatibility Ideographs
+        "\U00020000-\U000323af"  # CJK extensions and compatibility supplement
+        "]"
+    )
+
+    def _has_telegram_desktop_details_math_crash_shape(self, content: str) -> bool:
+        """Return True for rich-message details+math content that crashes TDesktop.
+
+        Telegram Desktop 6.9.1 can crash while rendering Bot API 10.1 rich
+        messages containing math inside a collapsible details block
+        (telegramdesktop/tdesktop#30808). The Bot API accepts the payload, so
+        Hermes must skip rich delivery up front and use the legacy MarkdownV2
+        path until affected Desktop clients age out.
+        """
+        if not content:
+            return False
+        for details_block in self._RICH_DETAILS_RE.findall(content):
+            if self._RICH_MATH_IN_DETAILS_RE.search(details_block):
+                return True
+        return False
+
+    def _has_telegram_desktop_cjk_rich_garble_shape(self, content: str) -> bool:
+        """Return True for CJK content that current TDesktop rich drafts garble.
+
+        Telegram Mac/Desktop Bot API 10.1 rich-message rendering currently
+        leaves overlapping draft/overlay glyph artifacts for CJK text (#47653).
+        The legacy MarkdownV2 path renders the same text cleanly, so skip rich
+        delivery up front until affected clients age out.
+        """
+        return bool(content and self._RICH_CJK_RE.search(content))
+
+    def _needs_rich_rendering(self, content: str) -> bool:
+        """Return True for markdown constructs that the legacy path degrades.
+
+        Keep ordinary replies on the pre-rich MarkdownV2 path so Telegram
+        clients render a consistent font weight/spacing. The rich endpoint is
+        reserved for constructs where raw markdown materially improves output:
+        pipe tables (MarkdownV2 has no table syntax and rewrites them into
+        bullet lists), GFM task lists, collapsible ``<details>`` blocks, and
+        block math.  Adapted from #45995 (@YonganZhang).
+        """
+        if not content:
+            return False
+        if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
+            return True
+        if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
+            return True
+        if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
+            return True
+        if "$$" in content:
+            return True
+        return False
+
+    def _content_is_pipe_table_primary(self, content: str) -> bool:
+        """True when pipe tables are the only rich construct in *content*.
+
+        Tables are auto-routed to ``sendRichMessage`` even when the full
+        ``rich_messages`` opt-in is off — MarkdownV2 has no table syntax and
+        the legacy path rewrites them into bullet lists, which reads like a
+        regression when users enable Telegram Topics and expect native tables.
+        Task lists, ``<details>``, and block math still require the full opt-in.
+        """
+        if not content or not any(
+            _TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()
+        ):
+            return False
+        if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
+            return False
+        if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
+            return False
+        if "$$" in content:
+            return False
+        return True
+
+    def _rich_delivery_enabled(self, content: str) -> bool:
+        """Whether rich delivery is allowed for this payload."""
+        return bool(
+            getattr(self, "_rich_messages_enabled", True)
+            or self._content_is_pipe_table_primary(content)
+        )
+
+    def _rich_eligible(self, content: str) -> bool:
+        """Capability/content eligibility for rich, ignoring ``expect_edits``.
+
+        Shared core of :meth:`_should_attempt_rich` minus the per-call
+        ``expect_edits`` metadata gate.  The rich EDIT-finalize path
+        (:meth:`_try_edit_rich`) needs this: a streamed preview is sent with
+        ``expect_edits=True`` to stay on the editable path mid-stream, but the
+        FINAL edit should still upgrade to rich when the content warrants it.
+        """
+        return bool(
+            self._rich_delivery_enabled(content)
+            and not getattr(self, "_rich_send_disabled", False)
+            and content
+            and content.strip()
+            and self._needs_rich_rendering(content)
+            and not self._has_telegram_desktop_details_math_crash_shape(content)
+            and not self._has_telegram_desktop_cjk_rich_garble_shape(content)
+            and self._content_fits_rich_limits(content)
+            and self._bot_supports_rich()
+        )
+
     def _should_attempt_rich(
         self, content: str, metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
         return bool(
-            not getattr(self, "_rich_send_disabled", False)
-            and not (metadata or {}).get("expect_edits")
-            and content
-            and content.strip()
-            and self._content_fits_rich_limits(content)
-            and self._bot_supports_rich()
+            not (metadata or {}).get("expect_edits")
+            and self._rich_eligible(content)
         )
 
     def prefers_fresh_final_streaming(
         self, content: str, metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
-        """Finalize rich-eligible streamed replies with a fresh sendRichMessage
-        instead of Hermes' current MarkdownV2 edit path.
+        """Whether to replace a streamed preview with a fresh rich final.
 
-        The final edit path has not yet been upgraded to Bot API 10.1's
-        ``rich_message`` edit parameter, so finalizing through edit would lose
-        rich constructs such as tables/task lists.  When the completed content
-        is rich-eligible, re-send it via ``sendRichMessage`` and delete the
-        preview (see ``gateway.stream_consumer._try_fresh_final``).
-
-        ``metadata`` is intentionally ignored: the preview was sent with
-        ``expect_edits=True`` (to stay on the editable path mid-stream), but the
-        FINAL answer is a brand-new message that should render rich.  Gating
-        otherwise matches :meth:`_should_attempt_rich`: rich not latched off,
-        content present and within the rich character limit, and the bot exposes
-        an async ``do_api_request``.
+        Disabled for Telegram. The fresh-final path briefly shows two copies of
+        the final answer, then deletes the streaming preview after the rich send
+        succeeds — it looks like duplicate delivery at the end of every streamed
+        turn (the reason #46206 reverted it).  Rich finalize is instead handled
+        by editing the existing preview in place via Bot API 10.1's
+        ``editMessageText`` ``rich_message`` parameter (see
+        :meth:`_try_edit_rich`), so no fresh re-send / delete is needed.
         """
-        return self._should_attempt_rich(content)
+        return False
 
     def streaming_overflow_limit(self) -> Optional[int]:
         """Allow the stream consumer to accumulate up to the rich-message cap
@@ -995,7 +1240,8 @@ class TelegramAdapter(BasePlatformAdapter):
         streams split exactly as before.
         """
         if (
-            not getattr(self, "_rich_send_disabled", False)
+            getattr(self, "_rich_messages_enabled", True)
+            and not getattr(self, "_rich_send_disabled", False)
             and self._bot_supports_rich()
         ):
             return self.RICH_MESSAGE_MAX_CHARS
@@ -1008,8 +1254,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         Never pass ``format_message(content)`` here — that converts to
         MarkdownV2 and would escape/destroy rich syntax like table pipes.
+
+        Single newlines are normalized to Markdown hard breaks so that
+        multi-line content (slash-command lists, etc.) renders correctly
+        in the rich-message path.  See ``_rich_normalize_linebreaks``.
         """
-        payload: Dict[str, Any] = {"markdown": content}
+        payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(content)}
         if skip_entity_detection:
             payload["skip_entity_detection"] = True
         return payload
@@ -1081,10 +1331,6 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             should_thread = self._should_thread_reply(reply_to_source, 0)
         reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
-        if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
-            # Refusing to send outside the requested DM topic — defer to the
-            # legacy path, which returns the canonical fail-loud SendResult.
-            return None
         thread_kwargs = self._thread_kwargs_for_send(
             chat_id,
             thread_id,
@@ -1092,6 +1338,13 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_message_id=reply_to_id,
             reply_to_mode=self._reply_to_mode,
         )
+        if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
+            # Refusing to send outside the requested DM topic — defer to the
+            # legacy path, which returns the canonical fail-loud SendResult.
+            # Exception: synthetic/resumed topic sends that route via
+            # ``direct_messages_topic_id`` do not need a reply anchor.
+            if not thread_kwargs.get("direct_messages_topic_id"):
+                return None
         return reply_to_id, thread_kwargs
 
     async def _try_send_rich(
@@ -1160,6 +1413,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 _TimedOut = None
             is_timeout = (_TimedOut and isinstance(exc, _TimedOut)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(exc)
+            # Extract server-requested retry_after for flood control so the
+            # base retry layer honors Telegram's backoff instead of its own
+            # short exponential schedule.
+            _retry_after = getattr(exc, "retry_after", None)
+            if _retry_after is None:
+                import re as _re
+                _m = _re.search(r"retry\s+(?:in\s+)?(\d+)", err_str, _re.IGNORECASE)
+                if _m:
+                    _retry_after = float(_m.group(1))
             logger.warning(
                 "[%s] sendRichMessage transient failure (no legacy resend): %s",
                 self.name, exc,
@@ -1168,6 +1430,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 success=False,
                 error=str(exc),
                 retryable=(is_connect_timeout or not is_timeout),
+                retry_after=_retry_after,
             )
 
         message_id = None
@@ -1177,17 +1440,113 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id = (msg.get("result") or {}).get("message_id")
         else:
             message_id = getattr(msg, "message_id", None)
+        if message_id is not None:
+            # Telegram won't echo rich content in reply_to_message, so remember
+            # what we sent — replies to this message resolve via this index.
+            try:
+                from gateway import rich_sent_store
+                rich_sent_store.record(str(chat_id), str(message_id), content)
+            except Exception:
+                pass
         return SendResult(
             success=True,
             message_id=str(message_id) if message_id is not None else None,
         )
 
+    async def _try_edit_rich(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Edit an existing message in place as a rich message (Bot API 10.1).
+
+        Uses ``editMessageText`` with the ``rich_message`` parameter so a
+        streamed preview can finalize as rich (tables/task lists/details/math)
+        WITHOUT a fresh send + delete — no duplicate preview.  Mirrors
+        :meth:`_try_send_rich`'s error contract:
+
+        - success → ``SendResult(success=True, message_id=...)``
+        - permanent / capability error → ``None`` (caller falls back to the
+          legacy MarkdownV2 edit; capability errors latch rich off)
+        - transient / unknown → ``SendResult(success=False)`` with retry
+          semantics (the message may already be edited; do NOT legacy-resend)
+        """
+        payload: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "rich_message": self._rich_message_payload(content),
+        }
+        thread_id = self._metadata_thread_id(metadata)
+        thread_kwargs = self._thread_kwargs_for_send(
+            chat_id,
+            thread_id,
+            metadata,
+            reply_to_message_id=None,
+            reply_to_mode=self._reply_to_mode,
+        )
+        payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
+        if getattr(self, "_disable_link_previews", False):
+            payload["link_preview_options"] = {"is_disabled": True}
+        try:
+            # Raw Bot API result; do not request return_type=Message (PTB does
+            # not fully model the 10.1 response shape yet — a post-edit parse
+            # error must not be mistaken for a failed edit).
+            await self._bot.do_api_request("editMessageText", api_kwargs=payload)
+        except Exception as exc:
+            if self._is_rich_fallback_error(exc):
+                if self._is_rich_capability_error(exc):
+                    self._rich_send_disabled = True
+                # "Message is not modified" — content identical to the current
+                # rich message; treat as a successful no-op so the caller does
+                # not fall through to a redundant legacy edit.
+                if "not modified" in str(exc).lower():
+                    return SendResult(success=True, message_id=message_id)
+                logger.debug(
+                    "[%s] rich editMessageText rejected (%s) — falling back to MarkdownV2 edit",
+                    self.name, exc,
+                )
+                return None
+            if "not modified" in str(exc).lower():
+                return SendResult(success=True, message_id=message_id)
+            err_str = str(exc).lower()
+            try:
+                from telegram.error import TimedOut as _TimedOut
+            except (ImportError, AttributeError):
+                _TimedOut = None
+            is_timeout = (_TimedOut and isinstance(exc, _TimedOut)) or "timed out" in err_str
+            is_connect_timeout = self._looks_like_connect_timeout(exc)
+            logger.warning(
+                "[%s] rich editMessageText transient failure (no legacy resend): %s",
+                self.name, exc,
+            )
+            return SendResult(
+                success=False,
+                error=str(exc),
+                retryable=(is_connect_timeout or not is_timeout),
+            )
+        # Telegram won't echo rich content for messages that predate the bot's
+        # first rich send, so mirror the fresh-send index here too: a streamed
+        # final finalized via editMessageText is otherwise never recorded, and
+        # replies to it would have no native echo to recover from.
+        try:
+            from gateway import rich_sent_store
+            rich_sent_store.record(str(chat_id), str(message_id), content)
+        except Exception:
+            pass
+        return SendResult(success=True, message_id=message_id)
+
     def _should_attempt_rich_draft(self, content: str) -> bool:
         return bool(
-            not getattr(self, "_rich_send_disabled", False)
+            getattr(self, "_rich_messages_enabled", True)
+            and getattr(self, "_rich_drafts_enabled", False)
+            and not getattr(self, "_rich_send_disabled", False)
             and not getattr(self, "_rich_draft_disabled", False)
             and content
             and content.strip()
+            and not self._has_telegram_desktop_details_math_crash_shape(content)
+            and not self._has_telegram_desktop_cjk_rich_garble_shape(content)
             and self._content_fits_rich_limits(content)
             and self._bot_supports_rich()
         )
@@ -1355,6 +1714,63 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
+
+    async def _polling_heartbeat_loop(self) -> None:
+        """Detect dead Telegram TCP sockets (CLOSE-WAIT) by periodic probing.
+
+        PTB's long-poll task blocks on epoll waiting for Telegram to push an
+        update.  When the underlying TCP connection enters CLOSE-WAIT (the remote
+        sent a FIN but the httpx pool has not yet noticed), epoll still reports
+        the socket as readable and no exception is raised — so PTB's
+        ``error_callback`` never fires and the gateway silently stops receiving
+        messages.
+
+        This loop probes ``get_me()`` every ``HEARTBEAT_INTERVAL`` seconds on the
+        *general* request path (not the getUpdates pool), so a healthy long-poll
+        waiting for the 30-second Telegram window is never interrupted.  On any
+        connect-level failure the loop hands off to
+        ``_handle_polling_network_error`` — the same path triggered by PTB's own
+        ``error_callback`` — which drains the dead pool and restarts polling.
+
+        Unlike ``_verify_polling_after_reconnect`` (a one-shot probe scheduled
+        only after an explicit reconnect), this loop runs for the full lifetime
+        of the polling connection, so it catches a socket that wedges during
+        steady-state operation without any prior error event.
+        """
+        HEARTBEAT_INTERVAL = 90   # seconds between probes
+        PROBE_TIMEOUT = 15        # seconds before declaring the path dead
+
+        while True:
+            try:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                if self.has_fatal_error:
+                    return
+                bot = self._app.bot if self._app else None
+                if bot is None:
+                    continue
+                # A real PTB Bot always exposes get_me(); if it's absent the
+                # app isn't a live polling client (e.g. torn down or a test
+                # double), so there is nothing to probe — exit rather than spin.
+                if not callable(getattr(bot, "get_me", None)):
+                    return
+                await asyncio.wait_for(bot.get_me(), PROBE_TIMEOUT)
+            except asyncio.CancelledError:
+                return
+            except (asyncio.TimeoutError, OSError) as probe_err:
+                logger.warning(
+                    "[%s] Polling heartbeat probe failed (%s); triggering reconnect",
+                    self.name, probe_err,
+                )
+                if self._polling_error_task and not self._polling_error_task.done():
+                    continue   # reconnect already in progress
+                loop = asyncio.get_running_loop()
+                self._polling_error_task = loop.create_task(
+                    self._handle_polling_network_error(probe_err)
+                )
+            except Exception:
+                # Non-connectivity errors (e.g. TelegramError 401) are not
+                # CLOSE-WAIT symptoms — let PTB's own handlers surface them.
+                pass
 
     async def _verify_polling_after_reconnect(self) -> None:
         """Heartbeat probe scheduled after a successful reconnect.
@@ -1717,23 +2133,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 changed = True
 
             if changed:
-                fd, tmp_path = tempfile.mkstemp(
-                    dir=str(config_path.parent),
-                    suffix=".tmp",
-                    prefix=".config_",
+                from utils import atomic_yaml_write
+
+                atomic_yaml_write(
+                    config_path,
+                    config,
+                    default_flow_style=False,
+                    sort_keys=False,
                 )
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        _yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    atomic_replace(tmp_path, config_path)
-                except BaseException:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                    raise
                 logger.info(
                     "[%s] Persisted thread_id=%s for topic '%s' in config.yaml",
                     self.name, thread_id, topic_name,
@@ -1825,13 +2232,21 @@ class TelegramAdapter(BasePlatformAdapter):
                             self.name, topic_name, seed_err,
                         )
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
         By default, uses long polling (outbound connection to Telegram).
         If ``TELEGRAM_WEBHOOK_URL`` is set, starts an HTTP webhook server
         instead.  Webhook mode is useful for cloud deployments (Fly.io,
         Railway) where inbound HTTP can wake a suspended machine.
+
+        ``is_reconnect`` distinguishes a cold first boot (False — drop any
+        stale Bot API queue) from a watcher reconnect after a prolonged
+        outage (True — preserve the updates Telegram queued while the bot
+        was offline, otherwise every message sent during the outage is
+        silently lost). The in-process network-error ladder and the
+        409-conflict handler already pass ``drop_pending_updates=False``
+        for the same reason; bootstrap follows suit on the reconnect path.
 
         Env vars for webhook mode::
 
@@ -1898,6 +2313,43 @@ class TelegramAdapter(BasePlatformAdapter):
                 "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
             }
 
+            # CLOSE_WAIT fd leak (#31599, same class as #18451): PTB's
+            # HTTPXRequest builds the underlying httpx.AsyncClient with
+            # `limits = httpx.Limits(max_connections=connection_pool_size)`
+            # and *no* keepalive tuning, so httpx's default
+            # keepalive_expiry=5.0 applies. Behind an HTTP proxy (Cloudflare
+            # Warp etc.) a peer-initiated FIN can sit in CLOSE_WAIT longer
+            # than that, leaking fds in the general request pool (_request[1])
+            # which _drain_polling_connections never resets. Wire the shared
+            # platform_httpx_limits() helper into the httpx client so idle
+            # keepalive sockets drain aggressively, while preserving PTB's
+            # max_connections (= connection_pool_size). httpx_kwargs is spread
+            # last into PTB's client kwargs, so `limits` here wins.
+            from gateway.platforms._http_client_limits import platform_httpx_limits
+
+            _base_limits = platform_httpx_limits()
+            if _base_limits is not None:
+                import httpx as _httpx
+
+                _pool_limits = _httpx.Limits(
+                    max_connections=request_kwargs["connection_pool_size"],
+                    max_keepalive_connections=_base_limits.max_keepalive_connections,
+                    keepalive_expiry=_base_limits.keepalive_expiry,
+                )
+            else:  # pragma: no cover — httpx always present alongside PTB
+                _pool_limits = None
+
+            def _with_limits(httpx_kwargs: Optional[dict] = None) -> dict:
+                """Merge tuned keepalive limits into httpx client kwargs.
+
+                A caller-supplied ``limits`` (none today) is left untouched;
+                otherwise the CLOSE_WAIT-safe limits are injected.
+                """
+                kwargs = dict(httpx_kwargs or {})
+                if _pool_limits is not None and "limits" not in kwargs:
+                    kwargs["limits"] = _pool_limits
+                return kwargs
+
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in {"1", "true", "yes", "on"})
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
@@ -1920,21 +2372,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 # polling reconnect + bot API bootstrap/delete_webhook calls.
                 request = HTTPXRequest(
                     **request_kwargs,
-                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
+                    httpx_kwargs=_with_limits(
+                        {"transport": TelegramFallbackTransport(fallback_ips)}
+                    ),
                 )
                 get_updates_request = HTTPXRequest(
                     **request_kwargs,
-                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
+                    httpx_kwargs=_with_limits(
+                        {"transport": TelegramFallbackTransport(fallback_ips)}
+                    ),
                 )
             elif proxy_url:
                 logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
-                request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
-                get_updates_request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
+                request = HTTPXRequest(
+                    **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
+                )
+                get_updates_request = HTTPXRequest(
+                    **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
+                )
             else:
                 if disable_fallback:
                     logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
-                request = HTTPXRequest(**request_kwargs)
-                get_updates_request = HTTPXRequest(**request_kwargs)
+                request = HTTPXRequest(**request_kwargs, httpx_kwargs=_with_limits())
+                get_updates_request = HTTPXRequest(
+                    **request_kwargs, httpx_kwargs=_with_limits()
+                )
 
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
@@ -1997,7 +2459,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # inject forged updates as if from Telegram. Refuse to
                 # start rather than silently run in fail-open mode.
                 # See GHSA-3vpc-7q5r-276h.
-                webhook_port = int(os.getenv("TELEGRAM_WEBHOOK_PORT", "8443"))
+                webhook_port = env_int("TELEGRAM_WEBHOOK_PORT", 8443)
                 webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
                 if not webhook_secret:
                     raise RuntimeError(
@@ -2022,7 +2484,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     webhook_url=webhook_url,
                     secret_token=webhook_secret,
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
+                    # Webhooks are push-based — Telegram does not hold a
+                    # server-side getUpdates queue, so this flag is a no-op
+                    # in practice. Mirror the polling path's reconnect
+                    # semantics for consistency.
+                    drop_pending_updates=not is_reconnect,
                 )
                 self._webhook_mode = True
                 logger.info(
@@ -2055,7 +2521,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 await self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
+                    # On a cold first boot drop the stale Bot API queue; on a
+                    # watcher reconnect after an outage preserve it so messages
+                    # sent while the bot was offline are delivered (#46621).
+                    drop_pending_updates=not is_reconnect,
                     error_callback=_polling_error_callback,
                 )
             
@@ -2069,11 +2538,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommandScopeAllGroupChats,
                     BotCommandScopeDefault,
                 )
-                from hermes_cli.commands import telegram_menu_commands
+                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
                 # Telegram allows up to 100 commands but has an undocumented
-                # payload size limit (~4KB total).  Limit to 30 core commands
-                # to stay well under the threshold while covering all categories.
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                # payload size limit (~4KB total).  Hermes defaults to 60 to
+                # keep built-ins plus common skill commands visible while
+                # staying under the threshold; users can tune the cap via
+                # platforms.telegram.extra.command_menu.
+                max_commands = telegram_menu_max_commands()
+                menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
@@ -2092,7 +2564,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if hidden_count:
                     logger.info(
                         "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
-                        self.name, len(menu_commands), hidden_count, 30,
+                        self.name, len(menu_commands), hidden_count, max_commands,
                     )
             except Exception as e:
                 logger.warning(
@@ -2105,6 +2577,23 @@ class TelegramAdapter(BasePlatformAdapter):
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
+
+            # Start the persistent heartbeat loop in polling mode. Webhook mode
+            # receives updates via incoming pushes — there is no long-poll
+            # socket to wedge in CLOSE-WAIT, so the loop is not needed there.
+            if not self._webhook_mode:
+                if self._polling_heartbeat_task and not self._polling_heartbeat_task.done():
+                    self._polling_heartbeat_task.cancel()
+                self._polling_heartbeat_task = asyncio.ensure_future(
+                    self._polling_heartbeat_loop()
+                )
+
+            # Surface the gateway as "Online" in the bot's short description
+            # (opt-in via extra.status_indicator). Non-fatal.
+            try:
+                await self._set_status_indicator(online=True)
+            except Exception:
+                pass
 
             # Set up DM topics (Bot API 9.4 — Private Chat Topics)
             # Runs after connection is established so the bot can call createForumTopic.
@@ -2126,8 +2615,57 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to connect to Telegram: %s", self.name, e, exc_info=True)
             return False
 
+    async def _set_status_indicator(self, online: bool) -> None:
+        """Set the bot's short description to the online/offline status text.
+
+        The short description is the line shown under the bot's name in its
+        profile. It is the closest Bot API surface to a presence indicator —
+        bots have no real online/offline dot (that's a user-account feature).
+
+        No-op unless ``extra.status_indicator`` is enabled. Best-effort: any
+        failure is logged at debug and swallowed so it never blocks connect or
+        disconnect. The default (no language_code) description applies to every
+        user who doesn't have a language-specific one set.
+        """
+        if not getattr(self, "_status_indicator_enabled", False):
+            return
+        bot = self._bot
+        if bot is None:
+            return
+        text = self._status_online_text if online else self._status_offline_text
+        # Telegram caps short_description at 120 chars.
+        text = text[:120]
+        try:
+            await bot.set_my_short_description(short_description=text)
+            logger.info("[%s] Set bot status indicator to %r", self.name, text)
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to set bot status indicator to %r: %s",
+                self.name, text, e,
+            )
+
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        # Cancel the heartbeat before tearing down the app so the probe task
+        # cannot fire get_me() into a half-shutdown bot client.
+        if self._polling_heartbeat_task and not self._polling_heartbeat_task.done():
+            self._polling_heartbeat_task.cancel()
+            try:
+                await self._polling_heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        self._polling_heartbeat_task = None
+
+        # Mark the bot "Offline" in its short description while the bot's HTTP
+        # client is still alive (before app shutdown closes it). Opt-in via
+        # extra.status_indicator. Non-fatal. This is the clean-shutdown path;
+        # a hard crash leaves the last-known status, which is the expected
+        # limitation of a profile-text indicator.
+        try:
+            await self._set_status_indicator(online=False)
+        except Exception:
+            pass
+
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -2208,11 +2746,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
-                        # Re-trigger typing like the legacy success path does.
-                        try:
-                            await self.send_typing(chat_id, metadata=metadata)
-                        except Exception:
-                            pass  # Typing failures are non-fatal
+                        # Re-trigger typing like the legacy success path does,
+                        # but ONLY for intermediate sends. On the final reply
+                        # (metadata["notify"]) the gateway has already torn down
+                        # the typing refresh loop; re-arming Telegram's ~5s timer
+                        # here would leave the "...typing" bubble lingering after
+                        # the answer (no Bot API call cancels it). See #48678.
+                        if not (metadata or {}).get("notify"):
+                            try:
+                                await self.send_typing(chat_id, metadata=metadata)
+                            except Exception:
+                                pass  # Typing failures are non-fatal
                     return rich_result
 
             # Format and split message if needed
@@ -2225,7 +2769,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
                 # chunk and fall back to plain text.
                 chunks = [
-                    re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+                    _separate_chunk_indicator_from_fence(
+                        re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+                    )
                     for chunk in chunks
                 ]
             
@@ -2351,10 +2897,16 @@ class TelegramAdapter(BasePlatformAdapter):
                                     continue
                                 # Second failure: the thread is genuinely gone.
                                 # Retry without ``message_thread_id`` so the
-                                # message still reaches the chat.
+                                # message still reaches the chat, and prune
+                                # the stale binding so future inbound
+                                # messages aren't redirected back to it
+                                # (#31501).
                                 logger.warning(
                                     "[%s] Thread %s not found, retrying without message_thread_id",
                                     self.name, effective_thread_id,
+                                )
+                                self._prune_stale_dm_topic_binding(
+                                    chat_id, effective_thread_id,
                                 )
                                 used_thread_fallback = True
                                 effective_thread_id = None
@@ -2435,10 +2987,16 @@ class TelegramAdapter(BasePlatformAdapter):
             # so without this the "...typing" bubble disappears mid-response
             # (especially noticeable when the agent sends intermediate progress
             # messages like "Checking:" before running tools).
-            try:
-                await self.send_typing(chat_id, metadata=metadata)
-            except Exception:
-                pass  # Typing failures are non-fatal
+            # Skip this on the FINAL reply (metadata["notify"]): the gateway has
+            # already cancelled the typing refresh loop by the time the final
+            # send returns, so re-arming Telegram's ~5s timer here would leave
+            # the indicator lingering after the answer with nothing to cancel
+            # it (Telegram exposes no stop-typing API). See #48678.
+            if not (metadata or {}).get("notify"):
+                try:
+                    await self.send_typing(chat_id, metadata=metadata)
+                except Exception:
+                    pass  # Typing failures are non-fatal
 
             return SendResult(
                 success=True,
@@ -2453,6 +3011,7 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
             err_str = str(e).lower()
+            error_kind = classify_send_error(e)
             # Message too long — content exceeded 4096 chars. Return failure so
             # stream consumer enters fallback mode and sends the remainder.
             if "message_too_long" in err_str or "too long" in err_str:
@@ -2460,7 +3019,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] send() content too long, falling back to new-message continuation",
                     self.name,
                 )
-                return SendResult(success=False, error="message_too_long")
+                return SendResult(success=False, error="message_too_long", error_kind="too_long")
             # TimedOut usually means the request may have reached Telegram —
             # mark as non-retryable so _send_with_retry() doesn't re-send.
             # Exceptions: a wrapped ConnectTimeout (no connection established)
@@ -2470,7 +3029,12 @@ class TelegramAdapter(BasePlatformAdapter):
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(e)
             is_pool_timeout = self._looks_like_pool_timeout(e)
-            return SendResult(success=False, error=str(e), retryable=(is_connect_timeout or is_pool_timeout or not is_timeout))
+            return SendResult(
+                success=False,
+                error=str(e),
+                retryable=(is_connect_timeout or is_pool_timeout or not is_timeout),
+                error_kind=error_kind,
+            )
 
     async def send_or_update_status(
         self,
@@ -2528,12 +3092,36 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
-        # Pre-flight: if content already exceeds the limit, split-and-deliver
-        # without round-tripping a doomed edit.
-        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
-            return await self._edit_overflow_split(
-                chat_id, message_id, content, finalize=finalize, metadata=metadata,
+        # Rich finalize (Bot API 10.1): when the completed content has
+        # constructs the legacy MarkdownV2 edit degrades (tables → bullet
+        # lists, task lists, <details>, block math) and rich is available,
+        # edit the preview IN PLACE via editMessageText's rich_message param.
+        # No fresh send + delete → no duplicate preview (the problem #46206
+        # reverted the fresh-final path for).  Attempted before the 4,096
+        # overflow pre-flight because the rich text cap is 32,768 — a rich
+        # table that exceeds the MarkdownV2 limit must not be split into legacy
+        # chunks.  Falls back to the legacy edit path (overflow split included)
+        # on capability/permanent rejection.
+        if finalize and self._rich_eligible(content):
+            rich_result = await self._try_edit_rich(
+                chat_id, message_id, content, metadata=metadata,
             )
+            if rich_result is not None:
+                return rich_result
+
+        # Pre-flight: if content already exceeds the limit, split-and-deliver
+        # without round-tripping a doomed edit.  During streaming
+        # (finalize=False) we truncate instead of splitting — splitting creates
+        # continuation messages whose IDs become the new edit target, and on
+        # the next token chunk the full accumulated text is re-edited into the
+        # continuation, triggering another split → infinite duplication loop
+        # (#48648).  The full content is delivered when finalize=True.
+        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+            if finalize:
+                return await self._edit_overflow_split(
+                    chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                )
+            content = self._truncate_stream_overflow_preview(content)
 
         try:
             if not finalize:
@@ -2582,9 +3170,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] edit_message overflow (%d UTF-16 > %d), splitting",
                     self.name, utf16_len(content), self.MAX_MESSAGE_LENGTH,
                 )
-                return await self._edit_overflow_split(
-                    chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                if finalize:
+                    return await self._edit_overflow_split(
+                        chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                    )
+                # Mid-stream: truncate and retry instead of splitting (#48648).
+                truncated = self._truncate_stream_overflow_preview(content)
+                await self._bot.edit_message_text(
+                    chat_id=int(chat_id),
+                    message_id=int(message_id),
+                    text=truncated,
                 )
+                return SendResult(success=True, message_id=message_id)
             # Flood control / RetryAfter — short waits are retried inline,
             # long waits return a failure immediately so streaming can fall back
             # to a normal final send instead of leaving a truncated partial.
@@ -2647,6 +3244,21 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(e))
 
+    def _truncate_stream_overflow_preview(self, content: str) -> str:
+        """Return a one-message preview for oversized streaming edits.
+
+        Streaming edits must keep targeting the original message. Splitting a
+        mid-stream preview creates continuation messages and moves the active
+        message id, so the next accumulated-token edit repeats the overflow
+        cycle (#48648). Final edits still use ``_edit_overflow_split`` to
+        deliver the complete response.
+        """
+        return self.truncate_message(
+            content,
+            self.MAX_MESSAGE_LENGTH,
+            len_fn=utf16_len,
+        )[0]
+
     async def _edit_overflow_split(
         self,
         chat_id: str,
@@ -2684,7 +3296,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if finalize:
                 # Use format_message + parse_mode for the final chunk;
                 # mirror edit_message's main happy-path.
-                formatted = self.format_message(first_chunk)
+                formatted = _separate_chunk_indicator_from_fence(
+                    self.format_message(first_chunk)
+                )
                 try:
                     await self._bot.edit_message_text(
                         chat_id=int(chat_id),
@@ -2745,7 +3359,9 @@ class TelegramAdapter(BasePlatformAdapter):
             for use_markdown in (True, False) if finalize else (False,):
                 try:
                     if use_markdown:
-                        text = self.format_message(chunk)
+                        text = _separate_chunk_indicator_from_fence(
+                            self.format_message(chunk)
+                        )
                     else:
                         # Plain attempt: on finalize the MarkdownV2 attempt
                         # failed, so degrade to clean stripped text, never
@@ -3004,6 +3620,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Thread %s not found for control message, retrying without message_thread_id",
                     self.name,
                     message_thread_id,
+                )
+                # Same prune as the streaming send path — the
+                # control-message retry tells us the topic is gone,
+                # so the binding row in state.db must go too
+                # (#31501).
+                self._prune_stale_dm_topic_binding(
+                    kwargs.get("chat_id"), message_thread_id,
                 )
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("message_thread_id", None)
@@ -3264,7 +3887,6 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
-        current_account: str = "",
     ) -> SendResult:
         """Send an interactive inline-keyboard model picker.
 
@@ -3285,13 +3907,11 @@ class TelegramAdapter(BasePlatformAdapter):
             keyboard = self._build_provider_keyboard(providers)
 
             provider_label = get_label(current_provider)
-            account_line = f"{current_account}\n" if current_account else ""
             text = self.format_message(
                 (
                     f"⚙ *Model Configuration*\n\n"
                     f"Current model: `{current_model or 'unknown'}`\n"
-                    f"Provider: {provider_label}\n"
-                    f"{account_line}\n"
+                    f"Provider: {provider_label}\n\n"
                     f"Select a provider:"
                 )
             )
@@ -5515,8 +6135,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         if cached is None:
+            # Only reachable for images that fail validation now — any other
+            # file type is always cached (authorization is the gate, not the
+            # extension).
             event.text = self._append_observed_note(
-                event.text, "[Observed Telegram attachment: unsupported type, not cached.]"
+                event.text, "[Observed Telegram attachment could not be read, not cached.]"
             )
             return
 
@@ -5528,6 +6151,52 @@ class TelegramAdapter(BasePlatformAdapter):
             event.message_type = MessageType.VIDEO
         event.text = self._append_observed_note(event.text, cached.context_note())
         logger.info("[Telegram] Cached observed group %s at %s", cached.kind, cached.path)
+
+    async def _cache_replied_media(self, msg: Any, event: MessageEvent) -> None:
+        """Cache media from the message this turn replies to, if any."""
+        from gateway.platforms.base import cache_media_bytes
+
+        reply_msg = getattr(msg, "reply_to_message", None)
+        if reply_msg is None:
+            return
+        source, filename, mime, kind = self._observed_media_source(reply_msg)
+        if source is None:
+            return
+
+        max_bytes = getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)
+        file_size = getattr(source, "file_size", None)
+        try:
+            size = int(file_size or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if not (0 < size <= max_bytes):
+            return
+
+        try:
+            file_obj = await source.get_file()
+            data = bytes(await file_obj.download_as_bytearray())
+            if not filename:
+                filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
+            cached = cache_media_bytes(data, filename=filename, mime_type=mime, default_kind=kind)
+        except Exception as exc:
+            logger.warning("[Telegram] Failed to cache replied-to media: %s", exc, exc_info=True)
+            return
+
+        if cached is None:
+            return
+
+        event.media_urls.append(cached.path)
+        event.media_types.append(cached.media_type)
+        if len(event.media_urls) == 1:
+            if cached.kind == "image":
+                event.message_type = MessageType.PHOTO
+            elif cached.kind == "video":
+                event.message_type = MessageType.VIDEO
+        event.text = self._append_observed_note(
+            event.text,
+            f"[Replied-to {cached.kind} '{cached.display_name}' saved at: {cached.path}]",
+        )
+        logger.info("[Telegram] Cached replied-to %s at %s", cached.kind, cached.path)
 
     def _observed_media_source(self, msg: Message):
         """Return (telegram_file_source, filename, mime, default_kind) or Nones."""
@@ -5681,8 +6350,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 if chat_id in self._forum_command_registered:
                     return
                 from telegram import BotCommand, BotCommandScopeChat
-                from hermes_cli.commands import telegram_menu_commands
-                menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
+                menu_commands, _ = telegram_menu_commands(max_commands=telegram_menu_max_commands())
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
@@ -5718,6 +6387,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 
@@ -5732,6 +6402,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
 
@@ -6133,33 +6804,30 @@ class TelegramAdapter(BasePlatformAdapter):
                 # ext-in-SUPPORTED_IMAGE_DOCUMENT_TYPES branch would be dead
                 # code — the extension sets are identical.
 
-                # Check if supported
-                if ext not in SUPPORTED_DOCUMENT_TYPES:
-                    supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
-                    event.text = (
-                        f"Unsupported document type '{ext or 'unknown'}'. "
-                        f"Supported types: {supported_list}"
-                    )
-                    logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
-                    await self.handle_message(event)
-                    return
-
-                # Download and cache
+                # Download and cache. Any file type is accepted — authorization
+                # to message the agent is the gate, not the file extension.
+                # Known types keep their precise MIME; unknown types are tagged
+                # application/octet-stream so the agent reaches for terminal tools.
                 file_obj = await doc.get_file()
                 doc_bytes = await file_obj.download_as_bytearray()
                 raw_bytes = bytes(doc_bytes)
-                cached_path = cache_document_from_bytes(raw_bytes, original_filename or f"document{ext}")
-                mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
+                cached_path = cache_document_from_bytes(raw_bytes, original_filename or f"document{ext or '.bin'}")
+                mime_type = SUPPORTED_DOCUMENT_TYPES.get(ext) or doc.mime_type or "application/octet-stream"
                 event.media_urls = [cached_path]
                 event.media_types = [mime_type]
-                logger.info("[Telegram] Cached user document at %s", cached_path)
+                logger.info("[Telegram] Cached user document at %s (%s)", cached_path, mime_type)
 
-                # For text files, inject content into event.text (capped at 100 KB)
+                # For text-readable files, inject content into event.text (capped
+                # at 100 KB). Gate on a text-like extension/MIME — NOT a blind
+                # UTF-8 decode, since binary formats (PDF/zip/docx) can have
+                # decodable ASCII headers. Binary files are surfaced as a cached
+                # path only (run.py emits a path-pointing context note).
                 MAX_TEXT_INJECT_BYTES = 100 * 1024
-                if ext in {".md", ".txt"} and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                _is_text = ext in _TEXT_INJECT_EXTENSIONS or (doc_mime or "").startswith("text/")
+                if _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                     try:
                         text_content = raw_bytes.decode("utf-8")
-                        display_name = original_filename or f"document{ext}"
+                        display_name = original_filename or f"document{ext or '.txt'}"
                         display_name = re.sub(r'[^\w.\- ]', '_', display_name)
                         injection = f"[Content of {display_name}]:\n{text_content}"
                         if event.text:
@@ -6167,10 +6835,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         else:
                             event.text = injection
                     except UnicodeDecodeError:
-                        logger.warning(
-                            "[Telegram] Could not decode text file as UTF-8, skipping content injection",
-                            exc_info=True,
-                        )
+                        # Binary file — agent has the cached path and can use
+                        # terminal/read_file against it. No inline injection.
+                        pass
 
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache document: %s", e, exc_info=True)
@@ -6384,6 +7051,77 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, cache_key, thread_id,
             )
 
+    @classmethod
+    def _flatten_rich_inline_text(cls, value: Any) -> str:
+        """Best-effort plaintext flattener for Bot API rich-message inline nodes."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(cls._flatten_rich_inline_text(item) for item in value)
+        if isinstance(value, dict):
+            text = value.get("text")
+            if text is not None:
+                return cls._flatten_rich_inline_text(text)
+            children = value.get("children")
+            if children is not None:
+                return cls._flatten_rich_inline_text(children)
+        return ""
+
+    @classmethod
+    def _flatten_rich_blocks(cls, blocks: Any) -> str:
+        """Best-effort plaintext flattener for Bot API rich-message blocks."""
+        if not isinstance(blocks, list):
+            return ""
+
+        lines: List[str] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+
+            block_type = block.get("type")
+            if block_type == "list":
+                for item in block.get("items", []):
+                    if not isinstance(item, dict):
+                        continue
+                    item_text = cls._flatten_rich_blocks(item.get("blocks"))
+                    if not item_text:
+                        continue
+                    label = item.get("label")
+                    item_lines = item_text.splitlines()
+                    if not item_lines:
+                        continue
+                    first_line = item_lines[0]
+                    if label:
+                        first_line = f"{label} {first_line}".strip()
+                    lines.append(first_line)
+                    lines.extend(item_lines[1:])
+                continue
+
+            text = cls._flatten_rich_inline_text(block.get("text"))
+            if text:
+                lines.extend(text.splitlines())
+
+        return "\n".join(line.rstrip() for line in lines if line)
+
+    @classmethod
+    def _extract_rich_reply_text(cls, reply_to_message: Any) -> Optional[str]:
+        """Return plaintext echoed by Telegram's rich_message reply payload."""
+        try:
+            api_kwargs = getattr(reply_to_message, "api_kwargs", None)
+            getter = getattr(api_kwargs, "get", None)
+            if not callable(getter):
+                return None
+            rich_message = getter("rich_message")
+            rich_getter = getattr(rich_message, "get", None)
+            if not callable(rich_getter):
+                return None
+            text = cls._flatten_rich_blocks(rich_getter("blocks")).strip()
+            return text or None
+        except Exception:
+            return None
+
     def _build_message_event(
         self,
         message: Message,
@@ -6509,6 +7247,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     or message.reply_to_message.caption
                     or None
                 )
+                if not reply_to_text:
+                    # Prefer Telegram's native rich-message echo when present;
+                    # keep the local send-time index only as a fallback for
+                    # older/unrecoverable reply payloads.
+                    reply_to_text = self._extract_rich_reply_text(message.reply_to_message)
+                if not reply_to_text:
+                    try:
+                        from gateway import rich_sent_store
+                        reply_to_text = rich_sent_store.lookup(
+                            str(chat.id), reply_to_id
+                        )
+                    except Exception:
+                        reply_to_text = None
 
         # Per-channel/topic ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt
@@ -6611,3 +7362,232 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id,
                 "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
             )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Plugin migration glue (#41112 / #3823)
+#
+# Added when the Telegram adapter (+ its telegram_network satellite) moved from
+# gateway/platforms/ into this bundled plugin. Mirrors the Discord (#24356) /
+# Slack migrations: a register(ctx) entry point plus hook implementations that
+# replace the per-platform core touchpoints (the Platform.TELEGRAM branch in
+# gateway/run.py, the telegram_cfg YAML→env/extra block in gateway/config.py,
+# the _setup_telegram wizard + _PLATFORMS["telegram"] static dict in
+# hermes_cli/{setup,gateway}.py, and the _send_telegram dispatch in
+# tools/send_message_tool.py).  Telegram uses the generic token connected
+# check, so no is_connected override is needed.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _resolve_notifications_mode() -> str:
+    """Resolve the Telegram notification mode (all/important) from env or
+    config.yaml display.platforms.telegram.notifications, defaulting to
+    'important'.  Mirrors the post-construction logic that used to live in
+    gateway/run.py::_create_adapter()."""
+    mode = os.getenv("HERMES_TELEGRAM_NOTIFICATIONS", "")
+    if not mode:
+        try:
+            from gateway.config import load_gateway_config
+            from gateway.run import cfg_get
+            _gw_cfg = load_gateway_config()
+            _raw = cfg_get(_gw_cfg, "display", "platforms", "telegram", "notifications")
+            if _raw not in {None, ""}:
+                mode = str(_raw).strip().lower()
+        except Exception:
+            pass
+    mode = mode or "important"
+    if mode not in {"all", "important"}:
+        logger.warning(
+            "Unknown telegram notifications mode '%s', defaulting to 'important' "
+            "(valid: all, important)", mode,
+        )
+        mode = "important"
+    return mode
+
+
+def _build_adapter(config):
+    """Factory wrapper that constructs TelegramAdapter and applies the
+    notification mode (preserving the gateway/run.py post-construction step)."""
+    adapter = TelegramAdapter(config)
+    try:
+        adapter._notifications_mode = _resolve_notifications_mode()
+    except Exception:
+        adapter._notifications_mode = "important"
+    return adapter
+
+
+def _is_connected(config) -> bool:
+    """Telegram is connected when a bot token is configured.
+
+    check_telegram_requirements() only verifies the python-telegram-bot SDK is
+    importable, NOT that a token is set — so without this is_connected the
+    registry-driven plugin-enable pass in gateway/config.py would enable
+    Telegram on any machine that merely has the SDK installed. Gate on the
+    token (env or PlatformConfig.token), matching the generic token check
+    Telegram had as a built-in.
+    """
+    token = getattr(config, "token", None)
+    if not token:
+        import hermes_cli.gateway as gateway_mod
+        token = gateway_mod.get_env_value("TELEGRAM_BOT_TOKEN") or ""
+    return bool(str(token).strip())
+
+
+async def _standalone_send(
+    pconfig,
+    chat_id,
+    message,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+):
+    """Out-of-process Telegram delivery. Delegates to the standalone
+    ``_send_telegram`` REST sender in tools/send_message_tool.py (which already
+    handles chunking-agnostic single sends, threads, media, retries, and
+    parse-mode fallback). Implements the standalone_sender_fn contract so
+    deliver=telegram cron jobs succeed when cron runs separately from the
+    gateway."""
+    token = getattr(pconfig, "token", None) or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    disable_link_previews = bool(
+        getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")
+    )
+    from tools.send_message_tool import _send_telegram
+    return await _send_telegram(
+        token,
+        chat_id,
+        message,
+        media_files=media_files,
+        thread_id=thread_id,
+        disable_link_previews=disable_link_previews,
+        force_document=force_document,
+    )
+
+
+def interactive_setup() -> None:
+    """Configure Telegram bot credentials and allowlist.
+
+    Delegates to the existing CLI setup helpers (managed-bot QR onboarding,
+    token validation, allowlist capture) via lazy import so the full wizard
+    behavior is preserved without duplicating ~150 lines. Replaces the
+    _PLATFORMS["telegram"] static dict dispatch in hermes_cli/gateway.py.
+    """
+    from hermes_cli import setup as _setup_mod
+    _setup_mod._setup_telegram()
+
+
+def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
+    """Translate config.yaml telegram: keys into TELEGRAM_* env vars and
+    PlatformConfig.extra entries.
+
+    Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
+    telegram_cfg block from gateway/config.py::load_gateway_config(). Env vars
+    take precedence over YAML. Returns a dict of extras to merge into
+    PlatformConfig.extra (disable_topic_auto_rename + runtime flags), or None.
+    """
+    import json as _json
+    extras: dict = {}
+
+    if "disable_topic_auto_rename" in telegram_cfg:
+        extras.setdefault("disable_topic_auto_rename", telegram_cfg["disable_topic_auto_rename"])
+
+    _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
+    if _effective_rm is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
+        os.environ["TELEGRAM_REQUIRE_MENTION"] = str(_effective_rm).lower()
+    if "mention_patterns" in telegram_cfg and not os.getenv("TELEGRAM_MENTION_PATTERNS"):
+        os.environ["TELEGRAM_MENTION_PATTERNS"] = _json.dumps(telegram_cfg["mention_patterns"])
+    if "exclusive_bot_mentions" in telegram_cfg and not os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS"):
+        os.environ["TELEGRAM_EXCLUSIVE_BOT_MENTIONS"] = str(telegram_cfg["exclusive_bot_mentions"]).lower()
+    if "guest_mode" in telegram_cfg and not os.getenv("TELEGRAM_GUEST_MODE"):
+        os.environ["TELEGRAM_GUEST_MODE"] = str(telegram_cfg["guest_mode"]).lower()
+    if "observe_unmentioned_group_messages" in telegram_cfg and not os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"):
+        os.environ["TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] = str(telegram_cfg["observe_unmentioned_group_messages"]).lower()
+    frc = telegram_cfg.get("free_response_chats")
+    if frc is not None and not os.getenv("TELEGRAM_FREE_RESPONSE_CHATS"):
+        if isinstance(frc, list):
+            frc = ",".join(str(v) for v in frc)
+        os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+    ac = telegram_cfg.get("allowed_chats")
+    if ac is not None and not os.getenv("TELEGRAM_ALLOWED_CHATS"):
+        if isinstance(ac, list):
+            ac = ",".join(str(v) for v in ac)
+        os.environ["TELEGRAM_ALLOWED_CHATS"] = str(ac)
+    allowed_topics = telegram_cfg.get("allowed_topics")
+    if allowed_topics is not None and not os.getenv("TELEGRAM_ALLOWED_TOPICS"):
+        if isinstance(allowed_topics, list):
+            allowed_topics = ",".join(str(v) for v in allowed_topics)
+        os.environ["TELEGRAM_ALLOWED_TOPICS"] = str(allowed_topics)
+    ignored_threads = telegram_cfg.get("ignored_threads")
+    if ignored_threads is not None and not os.getenv("TELEGRAM_IGNORED_THREADS"):
+        if isinstance(ignored_threads, list):
+            ignored_threads = ",".join(str(v) for v in ignored_threads)
+        os.environ["TELEGRAM_IGNORED_THREADS"] = str(ignored_threads)
+    if "reactions" in telegram_cfg and not os.getenv("TELEGRAM_REACTIONS"):
+        os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
+    if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
+        os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
+    _telegram_extra = telegram_cfg.get("extra") if isinstance(telegram_cfg.get("extra"), dict) else {}
+    _telegram_rtm = (
+        telegram_cfg["reply_to_mode"] if "reply_to_mode" in telegram_cfg
+        else _telegram_extra.get("reply_to_mode")
+    )
+    if _telegram_rtm is not None and not os.getenv("TELEGRAM_REPLY_TO_MODE"):
+        _rtm_str = "off" if _telegram_rtm is False else str(_telegram_rtm).lower()
+        os.environ["TELEGRAM_REPLY_TO_MODE"] = _rtm_str
+    allowed_users = telegram_cfg.get("allow_from")
+    if allowed_users is not None and not os.getenv("TELEGRAM_ALLOWED_USERS"):
+        if isinstance(allowed_users, list):
+            allowed_users = ",".join(str(v) for v in allowed_users)
+        os.environ["TELEGRAM_ALLOWED_USERS"] = str(allowed_users)
+    group_allowed_users = telegram_cfg.get("group_allow_from")
+    if group_allowed_users is not None and not os.getenv("TELEGRAM_GROUP_ALLOWED_USERS"):
+        if isinstance(group_allowed_users, list):
+            group_allowed_users = ",".join(str(v) for v in group_allowed_users)
+        os.environ["TELEGRAM_GROUP_ALLOWED_USERS"] = str(group_allowed_users)
+    group_allowed_chats = telegram_cfg.get("group_allowed_chats")
+    if group_allowed_chats is not None and not os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS"):
+        if isinstance(group_allowed_chats, list):
+            group_allowed_chats = ",".join(str(v) for v in group_allowed_chats)
+        os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
+    for _key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages"):
+        if _key in telegram_cfg:
+            extras.setdefault(_key, telegram_cfg[_key])
+    # Pass through telegram-specific extra keys (e.g. base_url proxy override),
+    # but EXCLUDE the generic shared-config keys that _merge_platform_map in
+    # gateway/config.py already merges with correct top-level-over-nested
+    # precedence. The apply_yaml_config_fn dispatch merges our return via
+    # dict.update() (clobber), so re-emitting those generic keys here would
+    # undo that precedence (top-level losing to a nested-fallback block).
+    _GENERIC_MERGE_KEYS = {
+        "reply_prefix", "reply_in_thread", "reply_to_mode",
+        "unauthorized_dm_behavior", "notice_delivery", "require_mention",
+        "channel_skill_bindings", "channel_prompts", "gateway_restart_notification",
+        "allow_from", "allow_admin_from", "dm_policy", "group_policy",
+    }
+    for _k, _v in _telegram_extra.items():
+        if _k not in _GENERIC_MERGE_KEYS:
+            extras.setdefault(_k, _v)
+
+    return extras or None
+
+
+def register(ctx) -> None:
+    """Plugin entry point — called by the Hermes plugin system."""
+    ctx.register_platform(
+        name="telegram",
+        label="Telegram",
+        adapter_factory=_build_adapter,
+        check_fn=check_telegram_requirements,
+        is_connected=_is_connected,
+        required_env=["TELEGRAM_BOT_TOKEN"],
+        install_hint="pip install 'hermes-agent[telegram]'",
+        setup_fn=interactive_setup,
+        apply_yaml_config_fn=_apply_yaml_config,
+        allowed_users_env="TELEGRAM_ALLOWED_USERS",
+        allow_all_env="TELEGRAM_ALLOW_ALL_USERS",
+        cron_deliver_env_var="TELEGRAM_HOME_CHANNEL",
+        standalone_sender_fn=_standalone_send,
+        max_message_length=4096,
+        emoji="✈️",
+        allow_update_command=True,
+    )

@@ -34,7 +34,7 @@ except ImportError:
 import sys
 from pathlib import Path as _Path
 
-sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -46,6 +46,7 @@ from gateway.platforms.base import (
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_VIDEO_TYPES,
+    _TEXT_INJECT_EXTENSIONS,
     is_host_excluded_by_no_proxy,
     resolve_proxy_url,
     safe_url_for_log,
@@ -302,6 +303,100 @@ def _resolve_slack_proxy_url() -> Optional[str]:
     return proxy_url
 
 
+# Map Slack audio mimetypes to the file extension that matches the actual
+# container bytes.  Critically, Slack's in-app "record a clip" voice messages
+# arrive as MP4/AAC containers (``audio/mp4``, filename ``audio_message*.mp4``),
+# NOT Ogg — so the extension we cache them under must be one a downstream STT
+# backend (OpenAI Whisper / gpt-4o-transcribe) will accept for that container.
+# OpenAI sniffs the container from the FILENAME extension, so a wrong extension
+# (e.g. caching MP4 bytes as ``.ogg``) makes transcription fail outright.
+# Mirrors the proven map in gateway/platforms/bluebubbles.py.
+_SLACK_AUDIO_MIME_TO_EXT = {
+    "audio/ogg": ".ogg",
+    "audio/opus": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/aac": ".m4a",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+}
+
+# Extensions OpenAI/Whisper-family STT backends accept (kept in sync with
+# tools/transcription_tools.SUPPORTED_FORMATS).
+_SLACK_STT_SUPPORTED_EXTS = frozenset(
+    {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
+)
+
+# Cached-extension → reported ``audio/*`` mimetype. Used when re-routing a
+# ``video/mp4``-mislabeled voice clip onto the audio path so the reported
+# media_type stays coherent with the bytes we actually cached (the gateway's
+# STT gate keys on the ``audio/`` prefix + the cached filename extension, but a
+# matching mimetype avoids surprising any consumer that inspects it). Anything
+# unmapped falls back to ``audio/mp4`` — Slack voice clips are MP4/AAC.
+_SLACK_EXT_TO_AUDIO_MIME = {
+    ".mp4": "audio/mp4",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".mpeg": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+    ".ogg": "audio/ogg",
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+}
+
+
+def _resolve_slack_audio_ext(file_obj: Dict[str, Any], mimetype: str) -> str:
+    """Pick the cache extension that matches an inbound Slack audio file's bytes.
+
+    Resolution order (mirrors the video branch + bluebubbles.py):
+
+    1. The real extension from the uploaded filename, when it's a format a
+       Whisper-family STT backend accepts (so ``audio_message.mp4`` →
+       ``.mp4``, ``clip.m4a`` → ``.m4a``).
+    2. A mimetype → extension lookup (so ``audio/mp4`` → ``.m4a``).
+    3. ``.m4a`` as a last resort — never ``.ogg``, which was the original bug:
+       MP4/AAC voice messages cached as ``.ogg`` are rejected by OpenAI because
+       the bytes don't match the container the extension claims.
+    """
+    name = (file_obj.get("name") or "").strip()
+    _, name_ext = os.path.splitext(name)
+    name_ext = name_ext.lower()
+    if name_ext in _SLACK_STT_SUPPORTED_EXTS:
+        return name_ext
+
+    mime_key = (mimetype or "").split(";", 1)[0].strip().lower()
+    if mime_key in _SLACK_AUDIO_MIME_TO_EXT:
+        return _SLACK_AUDIO_MIME_TO_EXT[mime_key]
+
+    return ".m4a"
+
+
+def _is_slack_voice_clip(file_obj: Dict[str, Any]) -> bool:
+    """Return True when a Slack file is an audio-only voice clip.
+
+    Slack's in-app voice recordings are audio-only MP4 containers, but Slack
+    sometimes reports them with a ``video/mp4`` mimetype, which would otherwise
+    route them to video understanding instead of speech-to-text. Detect them by
+    Slack's stable markers — the ``slack_audio`` subtype and the
+    ``audio_message*`` filename pattern — so genuine videos are left untouched.
+    """
+    subtype = (file_obj.get("subtype") or "").strip().lower()
+    if subtype == "slack_audio":
+        # slack_audio is always audio-only. (slack_video clips carry a real
+        # video track, so they are deliberately NOT matched here.)
+        return True
+    name = (file_obj.get("name") or "").strip().lower()
+    return name.startswith("audio_message")
+
+
 class SlackAdapter(BasePlatformAdapter):
     """
     Slack bot adapter using Socket Mode.
@@ -320,6 +415,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
+    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Slack blocks typed native slash commands inside threads ("/approve is
     # not supported in threads. Sorry!").  The adapter rewrites a leading
     # "!" to "/" for known commands (see _handle_slack_message), so "!" is
@@ -733,7 +829,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Non-fatal — the user saw the initial ack already.
         return SendResult(success=True, message_id=None)
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Slack via Socket Mode."""
         if not SLACK_AVAILABLE:
             logger.error(
@@ -2483,7 +2579,10 @@ class SlackAdapter(BasePlatformAdapter):
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
-        is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
+        is_mentioned = bool(
+            (bot_uid and f"<@{bot_uid}>" in routing_text)
+            or self._slack_message_matches_mention_patterns(routing_text)
+        )
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -2632,9 +2731,7 @@ class SlackAdapter(BasePlatformAdapter):
                         )
             elif mimetype.startswith("audio/") and url:
                 try:
-                    ext = "." + mimetype.split("/")[-1].split(";")[0]
-                    if ext not in {".ogg", ".mp3", ".wav", ".webm", ".m4a"}:
-                        ext = ".ogg"
+                    ext = _resolve_slack_audio_ext(f, mimetype)
                     cached = await self._download_slack_file(
                         url, ext, audio=True, team_id=team_id
                     )
@@ -2648,6 +2745,41 @@ class SlackAdapter(BasePlatformAdapter):
                     else:
                         logger.warning(
                             "[Slack] Failed to cache audio from %s: %s",
+                            url,
+                            e,
+                            exc_info=True,
+                        )
+            elif mimetype.startswith("video/") and url and _is_slack_voice_clip(f):
+                # Slack in-app voice clips are audio-only MP4 containers that
+                # Slack sometimes mislabels with a ``video/mp4`` mimetype.
+                # Cache them as audio and report an ``audio/*`` type so the
+                # gateway routes them to speech-to-text instead of video
+                # understanding. Without this, voice messages recorded in Slack
+                # never get transcribed.
+                try:
+                    ext = _resolve_slack_audio_ext(f, mimetype)
+                    cached = await self._download_slack_file(
+                        url, ext, audio=True, team_id=team_id
+                    )
+                    media_urls.append(cached)
+                    # Report a coherent audio mimetype matching the cached
+                    # extension so downstream STT routing recognizes it.
+                    media_types.append(
+                        _SLACK_EXT_TO_AUDIO_MIME.get(ext, "audio/mp4")
+                    )
+                    logger.debug(
+                        "[Slack] Cached voice clip (mislabeled %s) as audio: %s",
+                        mimetype,
+                        cached,
+                    )
+                except Exception as e:  # pragma: no cover - defensive logging
+                    detail = self._describe_slack_download_failure(e, file_obj=f)
+                    if detail:
+                        attachment_notices.append(detail)
+                        logger.warning("[Slack] %s", detail)
+                    else:
+                        logger.warning(
+                            "[Slack] Failed to cache voice clip from %s: %s",
                             url,
                             e,
                             exc_info=True,
@@ -2698,8 +2830,12 @@ class SlackAdapter(BasePlatformAdapter):
                         }
                         ext = mime_to_ext.get(mimetype, "")
 
-                    if ext not in SUPPORTED_DOCUMENT_TYPES:
-                        continue  # Skip unsupported file types silently
+                    # Any file type is accepted — authorization to message the
+                    # agent is the gate, not the file extension. Known types keep
+                    # their precise MIME; unknown types fall back to the source
+                    # mimetype or octet-stream so the agent reaches for terminal
+                    # tools.
+                    in_allowlist = ext in SUPPORTED_DOCUMENT_TYPES
 
                     # Check file size (Slack limit: 20 MB for bots)
                     file_size = f.get("size", 0)
@@ -2715,36 +2851,28 @@ class SlackAdapter(BasePlatformAdapter):
                         url, team_id=team_id
                     )
                     cached_path = cache_document_from_bytes(
-                        raw_bytes, original_filename or f"document{ext}"
+                        raw_bytes, original_filename or f"document{ext or '.bin'}"
                     )
-                    doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
+                    if in_allowlist:
+                        doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
+                    else:
+                        doc_mime = mimetype or "application/octet-stream"
                     media_urls.append(cached_path)
                     media_types.append(doc_mime)
-                    logger.debug("[Slack] Cached user document: %s", cached_path)
+                    logger.debug("[Slack] Cached user document: %s (%s)", cached_path, doc_mime)
 
                     # Inject small text-ish files directly into the prompt so
-                    # snippets like JSON/YAML/configs are actually visible to the agent.
+                    # snippets like JSON/YAML/configs are actually visible to the
+                    # agent. Gate on a text-like extension/MIME — NOT a blind
+                    # UTF-8 decode, since binary formats (PDF/zip/docx) can have
+                    # decodable ASCII headers. Binary files are surfaced as a
+                    # cached path only (run.py emits a path-pointing note).
                     MAX_TEXT_INJECT_BYTES = 100 * 1024
-                    TEXT_INJECT_EXTENSIONS = {
-                        ".md",
-                        ".txt",
-                        ".csv",
-                        ".log",
-                        ".json",
-                        ".xml",
-                        ".yaml",
-                        ".yml",
-                        ".toml",
-                        ".ini",
-                        ".cfg",
-                    }
-                    if (
-                        ext in TEXT_INJECT_EXTENSIONS
-                        and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES
-                    ):
+                    _is_text = ext in _TEXT_INJECT_EXTENSIONS or (mimetype or "").startswith("text/")
+                    if _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                         try:
                             text_content = raw_bytes.decode("utf-8")
-                            display_name = original_filename or f"document{ext}"
+                            display_name = original_filename or f"document{ext or '.txt'}"
                             display_name = re.sub(r"[^\w.\- ]", "_", display_name)
                             injection = f"[Content of {display_name}]:\n{text_content}"
                             if text:
@@ -3813,3 +3941,353 @@ class SlackAdapter(BasePlatformAdapter):
         if isinstance(raw, str) and raw.strip():
             return {part.strip() for part in raw.split(",") if part.strip()}
         return set()
+
+    def _slack_mention_patterns(self) -> List["re.Pattern"]:
+        """Compile optional regex wake-word patterns for channel triggers.
+
+        Parity with the other adapters (Telegram, DingTalk, Mattermost,
+        WhatsApp, BlueBubbles, Photon): when ``require_mention`` is on, a
+        channel message matching one of these patterns triggers the bot even
+        without a literal ``<@BOTUID>`` mention. Reads ``slack.mention_patterns``
+        (a list or single string) or ``SLACK_MENTION_PATTERNS`` (a JSON list, or
+        newline/comma-separated values). Compiled patterns are cached on the
+        instance. Previously this documented field was silently dropped.
+        """
+        cached = getattr(self, "_compiled_mention_patterns", None)
+        if cached is not None:
+            return cached
+
+        patterns = self.config.extra.get("mention_patterns") if self.config.extra else None
+        if patterns is None:
+            raw = os.getenv("SLACK_MENTION_PATTERNS", "").strip()
+            if raw:
+                try:
+                    import json as _json
+                    patterns = _json.loads(raw)
+                except Exception:
+                    patterns = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+
+        if isinstance(patterns, str):
+            patterns = [patterns]
+
+        compiled: List["re.Pattern"] = []
+        if isinstance(patterns, list):
+            for pat in patterns:
+                if not isinstance(pat, str) or not pat.strip():
+                    continue
+                try:
+                    compiled.append(re.compile(pat, re.IGNORECASE))
+                except re.error as exc:
+                    logger.warning("[Slack] Invalid mention pattern %r: %s", pat, exc)
+        elif patterns is not None:
+            logger.warning(
+                "[Slack] mention_patterns must be a list or string; got %s",
+                type(patterns).__name__,
+            )
+
+        if compiled:
+            logger.info("[Slack] Loaded %d mention pattern(s)", len(compiled))
+        self._compiled_mention_patterns = compiled
+        return compiled
+
+    def _slack_message_matches_mention_patterns(self, text: str) -> bool:
+        """Return True when ``text`` matches a configured wake-word pattern."""
+        if not text:
+            return False
+        return any(pattern.search(text) for pattern in self._slack_mention_patterns())
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Plugin migration glue (#41112 / #3823)
+#
+# Everything below this line was added when the Slack adapter moved from
+# ``gateway/platforms/slack.py`` into this bundled plugin. It mirrors the
+# Discord migration (PR #24356) exactly: a ``register(ctx)`` entry point plus
+# the hook implementations (``_standalone_send``, ``interactive_setup``,
+# ``_apply_yaml_config``, ``_is_connected``, ``_build_adapter``) that replace
+# the per-platform core touchpoints (the ``Platform.SLACK`` elif in
+# ``gateway/run.py``, the ``slack_cfg`` YAML→env block in ``gateway/config.py``,
+# the ``_setup_slack`` wizard + ``_PLATFORMS["slack"]`` static dict in
+# ``hermes_cli/{setup,gateway}.py``, and the ``_send_slack`` dispatch in
+# ``tools/send_message_tool.py``).
+# ──────────────────────────────────────────────────────────────────────────
+
+
+async def _standalone_send(
+    pconfig,
+    chat_id,
+    message,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+):
+    """Out-of-process Slack delivery via the Web API ``chat.postMessage``.
+
+    Implements the ``standalone_sender_fn`` contract so ``deliver=slack`` cron
+    jobs succeed when the cron process is not co-located with the gateway (the
+    in-process adapter weakref is ``None`` in that case). Replaces the legacy
+    ``_send_slack`` helper that used to live in ``tools/send_message_tool.py``.
+
+    mrkdwn formatting is applied exactly as the legacy core path did — via a
+    throwaway ``SlackAdapter`` instance's ``format_message`` — so cron-delivered
+    Slack messages render identically to gateway-delivered ones.
+    """
+    token = getattr(pconfig, "token", None) or os.getenv("SLACK_BOT_TOKEN", "")
+    if not token:
+        return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
+
+    formatted = message
+    if message:
+        try:
+            _fmt_adapter = SlackAdapter.__new__(SlackAdapter)
+            formatted = _fmt_adapter.format_message(message)
+        except Exception:
+            logger.debug(
+                "Failed to apply Slack mrkdwn formatting in _standalone_send",
+                exc_info=True,
+            )
+
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+
+        _proxy = resolve_proxy_url()
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        url = "https://slack.com/api/chat.postMessage"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30), **_sess_kw
+        ) as session:
+            payload = {"channel": chat_id, "text": formatted, "mrkdwn": True}
+            if thread_id:
+                payload["thread_ts"] = thread_id
+            async with session.post(
+                url, headers=headers, json=payload, **_req_kw
+            ) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    return {
+                        "success": True,
+                        "platform": "slack",
+                        "chat_id": chat_id,
+                        "message_id": data.get("ts"),
+                    }
+                return {"error": f"Slack API error: {data.get('error', 'unknown')}"}
+    except Exception as e:
+        return {"error": f"Slack send failed: {e}"}
+
+
+def interactive_setup() -> None:
+    """Guide the user through Slack bot setup.
+
+    Mirrors Discord's ``interactive_setup`` shape: lazy-imports CLI helpers so
+    the plugin's import surface stays small, generates and writes the Slack app
+    manifest, prompts for the bot + app tokens, captures an allowlist, and
+    offers to set a home channel. Replaces ``hermes_cli/setup.py::_setup_slack``.
+    """
+    from pathlib import Path
+    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.cli_output import (
+        prompt,
+        prompt_yes_no,
+        print_header,
+        print_info,
+        print_success,
+        print_warning,
+    )
+
+    def _write_slack_manifest_and_instruct() -> None:
+        """Generate the Slack manifest, write it under HERMES_HOME, and print
+        paste-into-Slack instructions. Failures are non-fatal."""
+        try:
+            from hermes_cli.slack_cli import _build_full_manifest
+            from hermes_constants import get_hermes_home
+            import json as _json
+
+            manifest = _build_full_manifest(
+                bot_name="Hermes",
+                bot_description="Your Hermes agent on Slack",
+            )
+            target = Path(get_hermes_home()) / "slack-manifest.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                _json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            print_success(f"Slack app manifest written to: {target}")
+            print_info(
+                "   Paste it into https://api.slack.com/apps → your app → Features "
+                "→ App Manifest → Edit, then Save.  Slack will prompt to "
+                "reinstall if scopes or slash commands changed."
+            )
+            print_info(
+                "   Re-run `hermes slack manifest --write` anytime to refresh after "
+                "Hermes adds new commands."
+            )
+        except Exception as e:
+            print_warning(f"Could not write Slack manifest: {e}")
+
+    print_header("Slack")
+    existing = get_env_value("SLACK_BOT_TOKEN")
+    if existing:
+        print_info("Slack: already configured")
+        if not prompt_yes_no("Reconfigure Slack?", False):
+            # Even without reconfiguring, offer to refresh the manifest so
+            # new commands (e.g. /btw, /stop, ...) get registered in Slack.
+            if prompt_yes_no(
+                "Regenerate the Slack app manifest with the latest command "
+                "list? (recommended after `hermes update`)",
+                True,
+            ):
+                _write_slack_manifest_and_instruct()
+            return
+
+    print_info("Steps to create a Slack app:")
+    print_info("   1. Go to https://api.slack.com/apps → Create New App")
+    print_info("      Pick 'From an app manifest' — we'll generate one for you below.")
+    print_info("   2. Enable Socket Mode: Settings → Socket Mode → Enable")
+    print_info("      • Create an App-Level Token with 'connections:write' scope")
+    print_info("   3. Install to Workspace: Settings → Install App")
+    print_info("   4. After installing, invite the bot to channels: /invite @YourBot")
+    print()
+    print_info("   Full guide: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack/")
+    print()
+
+    # Generate and write manifest up-front so the user can paste it into
+    # the "Create from manifest" flow instead of clicking through scopes /
+    # events / slash commands one at a time.
+    _write_slack_manifest_and_instruct()
+
+    print()
+    bot_token = prompt("Slack Bot Token (xoxb-...)", password=True)
+    if not bot_token:
+        return
+    save_env_value("SLACK_BOT_TOKEN", bot_token)
+    app_token = prompt("Slack App Token (xapp-...)", password=True)
+    if app_token:
+        save_env_value("SLACK_APP_TOKEN", app_token)
+    print_success("Slack tokens saved")
+
+    print()
+    print_info("🔒 Security: Restrict who can use your bot")
+    print_info("   To find a Member ID: click a user's name → View full profile → ⋮ → Copy member ID")
+    print()
+    allowed_users = prompt(
+        "Allowed user IDs (comma-separated, leave empty to deny everyone except paired users)"
+    )
+    if allowed_users:
+        save_env_value("SLACK_ALLOWED_USERS", allowed_users.replace(" ", ""))
+        print_success("Slack allowlist configured")
+    else:
+        print_warning("⚠️  No Slack allowlist set - unpaired users will be denied by default.")
+        print_info("   Set SLACK_ALLOW_ALL_USERS=true or GATEWAY_ALLOW_ALL_USERS=true only if you intentionally want open workspace access.")
+
+    print()
+    print_info("📬 Home Channel: where Hermes delivers cron job results,")
+    print_info("   cross-platform messages, and notifications.")
+    print_info("   To get a channel ID: open the channel in Slack, then right-click")
+    print_info("   the channel name → Copy link — the ID starts with C (e.g. C01ABC2DE3F).")
+    print_info("   You can also set this later by typing /set-home in a Slack channel.")
+    home_channel = prompt("Home channel ID (leave empty to set later with /set-home)")
+    if home_channel:
+        save_env_value("SLACK_HOME_CHANNEL", home_channel.strip())
+
+
+def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
+    """Translate ``config.yaml`` ``slack:`` keys into ``SLACK_*`` env vars.
+
+    Implements the ``apply_yaml_config_fn`` contract (#24849). Mirrors the
+    legacy ``slack_cfg`` block that used to live in
+    ``gateway/config.py::load_gateway_config()`` before this migration.
+
+    The SlackAdapter reads its runtime configuration via ``os.getenv()``
+    throughout the connect / handle code paths, so rather than rewrite those
+    call sites to read from ``PlatformConfig.extra``, this hook keeps the
+    existing env-driven model and owns the YAML→env translation here, next to
+    the adapter that consumes it. Env vars take precedence over YAML — every
+    assignment is guarded by ``not os.getenv(...)`` so explicit env vars
+    survive a config.yaml update. Returns ``None`` because no extras are
+    seeded into ``PlatformConfig.extra`` directly (everything flows through env).
+    """
+    if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
+        os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
+    if "strict_mention" in slack_cfg and not os.getenv("SLACK_STRICT_MENTION"):
+        os.environ["SLACK_STRICT_MENTION"] = str(slack_cfg["strict_mention"]).lower()
+    if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
+        os.environ["SLACK_ALLOW_BOTS"] = str(slack_cfg["allow_bots"]).lower()
+    frc = slack_cfg.get("free_response_channels")
+    if frc is not None and not os.getenv("SLACK_FREE_RESPONSE_CHANNELS"):
+        if isinstance(frc, list):
+            frc = ",".join(str(v) for v in frc)
+        os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
+    if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
+        os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
+    ac = slack_cfg.get("allowed_channels")
+    if ac is not None and not os.getenv("SLACK_ALLOWED_CHANNELS"):
+        if isinstance(ac, list):
+            ac = ",".join(str(v) for v in ac)
+        os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
+    return None  # all settings flow through env; nothing to merge into extras
+
+
+def _is_connected(config) -> bool:
+    """Slack is considered connected when SLACK_BOT_TOKEN is set.
+
+    Looks up via ``hermes_cli.gateway.get_env_value`` at call time (not via the
+    plugin's own bound import) so tests that patch ``gateway_mod.get_env_value``
+    can suppress ambient ``SLACK_BOT_TOKEN`` env vars. Matches what the legacy
+    ``Platform.SLACK`` connected-check did before this migration.
+    """
+    import hermes_cli.gateway as gateway_mod
+
+    return bool((gateway_mod.get_env_value("SLACK_BOT_TOKEN") or "").strip())
+
+
+def _build_adapter(config):
+    """Factory wrapper that constructs SlackAdapter from a PlatformConfig."""
+    return SlackAdapter(config)
+
+
+def register(ctx) -> None:
+    """Plugin entry point — called by the Hermes plugin system."""
+    ctx.register_platform(
+        name="slack",
+        label="Slack",
+        adapter_factory=_build_adapter,
+        check_fn=check_slack_requirements,
+        is_connected=_is_connected,
+        required_env=["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"],
+        install_hint="pip install 'hermes-agent[slack]'",
+        # Interactive setup wizard — replaces hermes_cli/setup.py::_setup_slack
+        # and the static _PLATFORMS["slack"] dict in hermes_cli/gateway.py.
+        setup_fn=interactive_setup,
+        # YAML→env config bridge — owns the translation of config.yaml slack:
+        # keys (require_mention, strict_mention, allow_bots,
+        # free_response_channels, reactions, allowed_channels) into SLACK_*
+        # env vars that the adapter reads via os.getenv(). Replaces the
+        # hardcoded block in gateway/config.py. Hook contract: #24849.
+        apply_yaml_config_fn=_apply_yaml_config,
+        # Auth env vars for _is_user_authorized() integration
+        allowed_users_env="SLACK_ALLOWED_USERS",
+        allow_all_env="SLACK_ALLOW_ALL_USERS",
+        # Cron home-channel delivery
+        cron_deliver_env_var="SLACK_HOME_CHANNEL",
+        # Out-of-process cron delivery via the Slack Web API. Without this hook,
+        # deliver=slack cron jobs fail with "No live adapter" when cron runs
+        # separately from the gateway. Replaces the _send_slack helper.
+        standalone_sender_fn=_standalone_send,
+        # Slack API allows 40,000 chars; leave margin (matches the legacy
+        # SlackAdapter.MAX_MESSAGE_LENGTH).
+        max_message_length=39000,
+        # Display
+        emoji="💼",
+        allow_update_command=True,
+    )
