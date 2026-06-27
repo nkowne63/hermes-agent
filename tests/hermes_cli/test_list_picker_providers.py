@@ -259,3 +259,37 @@ def test_current_custom_endpoint_passthrough_marks_current_row(monkeypatch):
     assert row["slug"] == "custom:ollama"
     assert row["is_current"] is True
     assert row["models"] == ["glm-5.1", "qwen3"]
+
+
+def test_external_process_providers_use_auth_status_for_picker(monkeypatch):
+    """ACP process providers should appear in interactive pickers without API keys."""
+    from hermes_cli.providers import HERMES_OVERLAYS
+
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {})
+    monkeypatch.setattr(
+        "hermes_cli.providers.HERMES_OVERLAYS",
+        {k: HERMES_OVERLAYS[k] for k in ("devin-acp", "claude-acp")},
+    )
+    monkeypatch.setattr("hermes_cli.models.get_curated_nous_model_ids", lambda: [])
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_provider_model_ids",
+        lambda provider, *a, **kw: {
+            "devin-acp": ["glm-5.2", "devin-acp"],
+            "claude-acp": ["claude-sonnet-4.5", "claude-acp"],
+        }.get(provider, []),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"configured": provider in {"devin-acp", "claude-acp"}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_openrouter_models",
+        lambda *a, **kw: pytest.fail("openrouter should not be listed"),
+    )
+
+    result = model_switch.list_picker_providers(max_models=50)
+
+    by_slug = {p["slug"]: p for p in result}
+    assert by_slug["devin-acp"]["models"] == ["glm-5.2", "devin-acp"]
+    assert by_slug["claude-acp"]["models"] == ["claude-sonnet-4.5", "claude-acp"]
