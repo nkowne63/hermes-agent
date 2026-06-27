@@ -336,6 +336,11 @@ class PlatformConfig:
     # noise; keep True for back-channels where the operator wants them.
     gateway_restart_notification: bool = True
 
+    # Whether the gateway should send a brief notification to the platform's
+    # configured home channel when provider resolution falls back to a backup
+    # provider after an auth/runtime failure.
+    gateway_fallback_notification: bool = False
+
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -345,6 +350,7 @@ class PlatformConfig:
             "extra": self.extra,
             "reply_to_mode": self.reply_to_mode,
             "gateway_restart_notification": self.gateway_restart_notification,
+            "gateway_fallback_notification": self.gateway_fallback_notification,
         }
         if self.token:
             result["token"] = self.token
@@ -368,6 +374,10 @@ class PlatformConfig:
         if _grn is None:
             _grn = data.get("extra", {}).get("gateway_restart_notification")
 
+        _gfn = data.get("gateway_fallback_notification")
+        if _gfn is None:
+            _gfn = data.get("extra", {}).get("gateway_fallback_notification")
+
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
             token=data.get("token"),
@@ -375,6 +385,7 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
+            gateway_fallback_notification=_coerce_bool(_gfn, False),
             extra=data.get("extra", {}),
         )
 
@@ -1029,6 +1040,8 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
+                if "gateway_fallback_notification" in platform_cfg:
+                    bridged["gateway_fallback_notification"] = platform_cfg["gateway_fallback_notification"]
                 enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue

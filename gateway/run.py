@@ -1766,6 +1766,8 @@ def _resolve_runtime_agent_kwargs() -> dict:
     )
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
+    model_cfg: dict[str, Any] | dict = {}
+    primary_provider = ""
     try:
         runtime = resolve_runtime_provider()
     except AuthError as auth_exc:
@@ -1779,6 +1781,26 @@ def _resolve_runtime_agent_kwargs() -> dict:
             logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
         fb_config = _try_resolve_fallback_provider()
         if fb_config is not None:
+            try:
+                model_cfg = _get_model_config()
+                if isinstance(model_cfg, dict):
+                    primary_provider = str(model_cfg.get("provider") or "").strip()
+                fallback_provider = str(fb_config.get("provider") or "").strip()
+                fallback_model = str(fb_config.get("model") or "").strip()
+                logger.warning(
+                    "Provider fallback selected: %s -> %s model=%s",
+                    primary_provider or "(unknown)",
+                    fallback_provider or "(unknown)",
+                    fallback_model or "(default)",
+                )
+            except Exception:
+                logger.warning("Provider fallback selected, but could not format route summary")
+            fb_config["_fallback_notice"] = {
+                "from_provider": primary_provider or "",
+                "to_provider": fb_config.get("provider") or "",
+                "from_model": model_cfg.get("default") if isinstance(model_cfg, dict) else "",
+                "to_model": fb_config.get("model") or "",
+            }
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
@@ -3389,6 +3411,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
         user_config: Optional[dict] = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session, honoring session-scoped /model overrides.
@@ -3444,6 +3467,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime_model,
             )
             model = runtime_model
+        elif self._session_db is not None and not override:
+            persisted_route = self._load_persisted_session_runtime(
+                session_id=session_id,
+                session_key=resolved_session_key,
+            )
+            if persisted_route:
+                persisted_model = persisted_route.get("model")
+                if persisted_model:
+                    model = persisted_model
+                persisted_provider = str(persisted_route.get("provider") or "").strip()
+                if persisted_provider:
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                        persisted_runtime = resolve_runtime_provider(
+                            requested=persisted_provider,
+                            explicit_base_url=(persisted_route.get("base_url") or None),
+                        )
+                        runtime_kwargs.update(
+                            {
+                                "api_key": persisted_runtime.get("api_key"),
+                                "base_url": persisted_runtime.get("base_url"),
+                                "provider": persisted_runtime.get("provider"),
+                                "api_mode": persisted_runtime.get("api_mode"),
+                                "command": persisted_runtime.get("command"),
+                                "args": list(persisted_runtime.get("args") or []),
+                                "credential_pool": persisted_runtime.get("credential_pool"),
+                            }
+                        )
+                    except Exception:
+                        runtime_kwargs.update(
+                            {
+                                "provider": persisted_provider or runtime_kwargs.get("provider"),
+                                "base_url": persisted_route.get("base_url") or runtime_kwargs.get("base_url"),
+                                "api_mode": persisted_route.get("api_mode") or runtime_kwargs.get("api_mode"),
+                            }
+                        )
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -3492,6 +3552,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _last_good["*"] = model
 
         return model, runtime_kwargs
+
+    def _load_persisted_session_runtime(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+    ) -> dict:
+        """Load a session's persisted model/provider route from SQLite.
+
+        This is the durable counterpart to the in-memory ``_session_model_overrides``
+        map.  It lets a restarted gateway or a cache miss reconstruct the
+        last explicit session model/provider selection instead of falling back
+        to the global config provider.
+        """
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return {}
+        resolved_session_id = session_id
+        if not resolved_session_id and session_key and getattr(self, "session_store", None):
+            try:
+                entry = self.session_store._entries.get(session_key)
+            except Exception:
+                entry = None
+            resolved_session_id = getattr(entry, "session_id", None)
+        if not resolved_session_id:
+            return {}
+        try:
+            row = session_db.get_session(resolved_session_id)
+        except Exception:
+            return {}
+        if not row:
+            return {}
+        runtime = {}
+        model = row.get("model")
+        if model:
+            runtime["model"] = model
+        provider = row.get("billing_provider")
+        if provider is not None:
+            runtime["provider"] = provider
+        base_url = row.get("billing_base_url")
+        if base_url is not None:
+            runtime["base_url"] = base_url
+        api_mode = row.get("billing_mode")
+        if api_mode is not None:
+            runtime["api_mode"] = api_mode
+        return runtime
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
@@ -9569,7 +9675,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = self._format_session_info()
+                            session_info = self._format_session_info(
+                                source=source,
+                                session_id=session_entry.session_id,
+                            )
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -9704,6 +9813,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
                         source=source,
                         session_key=session_key,
+                        session_id=session_id,
                         user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                     )
                     _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
@@ -9810,6 +9920,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
                             source=source,
                             session_key=session_key,
+                            session_id=session_id,
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
                         if _hyg_runtime.get("api_key"):
@@ -10761,7 +10872,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -10842,6 +10959,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             api_key = runtime.get("api_key")
         except Exception:
             pass
+
+        persisted_route = self._load_persisted_session_runtime(
+            session_id=session_id,
+            session_key=session_key or (
+                self._session_key_for_source(source) if source is not None else None
+            ),
+        )
+        if persisted_route:
+            model = persisted_route.get("model") or model
+            provider = persisted_route.get("provider") or provider
+            base_url = persisted_route.get("base_url") or base_url
 
         context_length = get_model_context_length(
             model,
@@ -11774,13 +11902,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        session_key = self._session_key_for_source(source)
+        session_entry = None
+        if getattr(self, "session_store", None) is not None:
+            try:
+                session_entry = self.session_store.get_or_create_session(source)
+            except Exception:
+                session_entry = None
 
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
+                session_key=session_key,
+                session_id=getattr(session_entry, "session_id", None),
                 user_config=user_config,
             )
+            fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
+            if fallback_notice:
+                await self._send_provider_fallback_notification(
+                    source=source,
+                    from_provider=str(fallback_notice.get("from_provider") or ""),
+                    to_provider=str(fallback_notice.get("to_provider") or runtime_kwargs.get("provider") or ""),
+                    from_model=str(fallback_notice.get("from_model") or ""),
+                    to_model=str(fallback_notice.get("to_model") or model or ""),
+                )
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
@@ -13306,6 +13452,84 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         return delivered
+
+    async def _send_provider_fallback_notification(
+        self,
+        *,
+        source: SessionSource,
+        from_provider: str,
+        to_provider: str,
+        from_model: str = "",
+        to_model: str = "",
+    ) -> bool:
+        """Notify the platform home channel that runtime provider fallback happened."""
+        platform_cfg = self.config.platforms.get(source.platform) if getattr(self, "config", None) else None
+        if platform_cfg is None or not getattr(platform_cfg, "gateway_fallback_notification", False):
+            return False
+
+        home = self.config.get_home_channel(source.platform) if getattr(self, "config", None) else None
+        if not home or not home.chat_id:
+            logger.info(
+                "Provider fallback notification skipped for %s: no home channel configured",
+                source.platform.value if source.platform else "unknown",
+            )
+            return False
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return False
+
+        parts = [
+            "⚠️ Provider fallback",
+            f"{from_provider or '(unknown)'} -> {to_provider or '(unknown)'}",
+        ]
+        if from_model or to_model:
+            parts.append(f"model {from_model or '(unknown)'} -> {to_model or '(unknown)'}")
+        message = " | ".join(parts)
+
+        try:
+            metadata = self._thread_metadata_for_target(
+                source.platform,
+                home.chat_id,
+                home.thread_id,
+                adapter=adapter,
+            )
+            if metadata:
+                result = await adapter.send(
+                    str(home.chat_id),
+                    message,
+                    metadata=_non_conversational_metadata(metadata, platform=source.platform),
+                )
+            else:
+                _meta = _non_conversational_metadata(platform=source.platform)
+                if _meta:
+                    result = await adapter.send(str(home.chat_id), message, metadata=_meta)
+                else:
+                    result = await adapter.send(str(home.chat_id), message)
+            if result is not None and getattr(result, "success", True) is False:
+                logger.warning(
+                    "Provider fallback notification failed for %s:%s: %s",
+                    source.platform.value if source.platform else "unknown",
+                    home.chat_id,
+                    getattr(result, "error", "send returned success=False"),
+                )
+                return False
+            logger.info(
+                "Sent provider fallback notification to %s:%s (%s -> %s)",
+                source.platform.value if source.platform else "unknown",
+                home.chat_id,
+                from_provider or "(unknown)",
+                to_provider or "(unknown)",
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Provider fallback notification failed for %s:%s: %s",
+                source.platform.value if source.platform else "unknown",
+                home.chat_id,
+                exc,
+            )
+            return False
 
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
@@ -15887,8 +16111,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
+                    session_id=session_id,
                     user_config=user_config,
                 )
+                fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
+                if fallback_notice:
+                    safe_schedule_threadsafe(
+                        self._send_provider_fallback_notification(
+                            source=source,
+                            from_provider=str(fallback_notice.get("from_provider") or ""),
+                            to_provider=str(fallback_notice.get("to_provider") or runtime_kwargs.get("provider") or ""),
+                            from_model=str(fallback_notice.get("from_model") or ""),
+                            to_model=str(fallback_notice.get("to_model") or model or ""),
+                        ),
+                        _loop_for_step,
+                        logger=logger,
+                        log_message="provider fallback notification scheduling error",
+                    )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
                     model, runtime_kwargs.get("provider"), session_key or "",

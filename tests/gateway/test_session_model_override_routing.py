@@ -261,3 +261,64 @@ fallback_providers:
     assert runtime_kwargs["base_url"] == "https://fallback.example/v1"
     assert runtime_kwargs["model"] == "fallback-model"
 
+
+def test_persisted_session_route_beats_global_runtime(monkeypatch):
+    """A session's stored billing route should win over the global config.
+
+    This keeps session-scoped /model switches anchored to the selected provider
+    even after the gateway reconstructs a fresh agent.
+    """
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "api_key": "qwen-key",
+            "base_url": "https://portal.qwen.ai/v1",
+            "provider": "qwen-oauth",
+            "api_mode": "chat_completions",
+        },
+    )
+    import hermes_cli.runtime_provider as runtime_provider
+
+    seen = {}
+
+    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
+        seen["requested"] = requested
+        seen["explicit_base_url"] = explicit_base_url
+        seen["explicit_api_key"] = explicit_api_key
+        return {
+            "api_key": "acp-key",
+            "base_url": "acp://claude",
+            "provider": "claude-acp",
+            "api_mode": "codex_responses",
+            "command": "claude-agent-acp",
+            "args": ["-y", "@agentclientprotocol/claude-agent-acp"],
+            "credential_pool": None,
+        }
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", fake_resolve_runtime_provider)
+
+    runner = _make_runner()
+    runner._session_db = MagicMock()
+    runner._session_db.get_session.return_value = {
+        "model": "claude-sonnet-4.6",
+        "billing_provider": "claude-acp",
+        "billing_base_url": "acp://claude",
+        "billing_mode": "codex_responses",
+    }
+
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        session_key="agent:main:discord:dm:1",
+        session_id="sess-1",
+        user_config={"model": {"default": "qwen3:8b", "provider": "qwen-oauth"}},
+    )
+
+    assert model == "claude-sonnet-4.6"
+    assert runtime_kwargs["provider"] == "claude-acp"
+    assert runtime_kwargs["base_url"] == "acp://claude"
+    assert runtime_kwargs["api_mode"] == "codex_responses"
+    assert runtime_kwargs["command"] == "claude-agent-acp"
+    assert runtime_kwargs["args"] == ["-y", "@agentclientprotocol/claude-agent-acp"]
+    assert seen["requested"] == "claude-acp"
+    assert seen["explicit_base_url"] == "acp://claude"

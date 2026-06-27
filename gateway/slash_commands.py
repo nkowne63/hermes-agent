@@ -1310,6 +1310,12 @@ class GatewaySlashCommandsMixin:
                                 _sess_db.update_session_model(
                                     _sess_entry.session_id, result.new_model
                                 )
+                                _sess_db.update_session_billing_route(
+                                    _sess_entry.session_id,
+                                    provider=result.target_provider,
+                                    base_url=result.base_url or "",
+                                    billing_mode=result.api_mode,
+                                )
                             except Exception as exc:
                                 logger.debug(
                                     "Failed to persist model switch to DB: %s", exc
@@ -1535,6 +1541,12 @@ class GatewaySlashCommandsMixin:
                         _sess_entry.was_auto_reset = False
                     _sess_db.update_session_model(
                         _sess_entry.session_id, result.new_model
+                    )
+                    _sess_db.update_session_billing_route(
+                        _sess_entry.session_id,
+                        provider=result.target_provider,
+                        base_url=result.base_url or "",
+                        billing_mode=result.api_mode,
                     )
                 except Exception as exc:
                     logger.debug(
@@ -2788,6 +2800,7 @@ class GatewaySlashCommandsMixin:
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
+                session_id=session_entry.session_id,
             )
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")

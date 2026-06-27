@@ -42,6 +42,27 @@ class TestFormatSessionInfo:
             info = runner._format_session_info()
         assert "openrouter" in info
 
+    def test_persisted_session_route_beats_global_config(self, runner, tmp_path):
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            "model:\n  default: qwen3:8b\n  provider: qwen-oauth\n",
+            "qwen3:8b",
+            {"provider": "qwen-oauth", "base_url": "https://portal.qwen.ai/v1", "api_key": "q"},
+        )
+        with p1, p2, p3, patch.object(
+            runner,
+            "_load_persisted_session_runtime",
+            return_value={
+                "model": "claude-sonnet-4.6",
+                "provider": "claude-acp",
+                "base_url": "acp://claude",
+                "api_mode": "codex_responses",
+            },
+        ):
+            info = runner._format_session_info(session_id="sess-1")
+        assert "claude-sonnet-4.6" in info
+        assert "claude-acp" in info
+
     def test_config_context_length(self, runner, tmp_path):
         p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: test-model\n  context_length: 32768\n",
                                   "test-model",
