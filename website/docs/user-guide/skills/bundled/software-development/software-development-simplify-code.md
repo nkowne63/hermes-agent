@@ -108,9 +108,10 @@ Tell each reviewer to:
 - **Apply Chesterton's Fence:** before flagging anything for removal, run
   `git blame` on the line to understand why it exists. If you can't determine
   the original purpose, mark it `confidence: low` — don't guess.
-- Report findings as a structured list: `file:line → problem → suggested fix`.
-- Include both confidence and risk on each finding:
-  `confidence: high/medium/low | risk: SAFE/CAREFUL/RISKY`
+- Report findings as structured output with confidence and risk:
+  ```
+  file:line → problem → suggested fix | confidence: high/medium/low | risk: SAFE/CAREFUL/RISKY
+  ```
   - **SAFE** = proven not to affect behavior (unused imports, commented-out
     code, pass-through wrappers). Auto-apply these.
   - **CAREFUL** = improves without changing semantics (rename local variable,
@@ -118,7 +119,6 @@ Tell each reviewer to:
   - **RISKY** = may change behavior or breaks public contracts (N+1
     restructuring, public API rename, memory lifecycle change). Flag for
     human review — do NOT auto-apply.
-- Rank each finding high / medium / low confidence and skip nits/style-only churn.
 - Skip nits and style-only churn. Only flag things that materially improve
   the code.
 
@@ -176,7 +176,7 @@ Wait for all three to return (batch mode returns them together).
    the one that touches less code and note the alternative.
 4. **Apply in risk-tier order:**
    - **SAFE first** (auto-apply): unused imports, commented-out code,
-     pass-through wrappers, redundant type assertions. Use `patch` / `write_file`.
+     pass-through wrappers, redundant type assertions. Run tests after.
    - **CAREFUL next** (apply with verification, one file at a time): rename
      locals, flatten ternaries, extract helpers, consolidate dupes. Run tests
      after each file. Revert any that break.

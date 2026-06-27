@@ -208,54 +208,6 @@ model:
 | `HERMES_COPILOT_ACP_COMMAND` | Override the Copilot CLI binary path (default: `copilot`) |
 | `HERMES_COPILOT_ACP_ARGS` | Override ACP args (default: `--acp --stdio`) |
 
-**`devin-acp` — Devin ACP agent backend**. Spawns the local Devin CLI as a subprocess:
-
-```bash
-hermes chat --provider devin-acp --model claude-opus-4.6
-# Requires the Devin CLI in PATH and an existing `devin auth login` session
-```
-
-Hermes passes non-sentinel model names to Devin through `DEVIN_MODEL`, so `/model claude-opus-4.6 --provider devin-acp` works in the CLI and through gateway slash commands such as Discord `/model`.
-
-By default, Hermes launches Devin with a temporary `--agent-config` that denies Devin's own tools and exposes Hermes tool-call schemas from the configured platform toolset (`discord` by default). Hermes still executes those tool calls locally. You can tune that behavior in `config.yaml`:
-
-```yaml
-acp:
-  devin:
-    hermes_tools_only: true
-    tool_platform: discord
-    allowed_tools: ["mcp__hermes__*"]
-    deny_tools: ["*"]
-    # Optional: use your own Devin agent config instead of Hermes' generated one.
-    # agent_config: "/path/to/devin-agent.yaml"
-```
-
-| Environment variable | Description |
-|---------------------|-------------|
-| `HERMES_DEVIN_ACP_COMMAND` | Override the Devin CLI binary path (default: `devin`) |
-| `HERMES_DEVIN_ACP_ARGS` | Override ACP args (default: `acp`) |
-
-**`claude-acp` — Claude Agent ACP backend**. Spawns the ACP adapter for Claude Agent SDK instead of calling Anthropic OAuth credentials directly:
-
-```bash
-hermes chat --provider claude-acp --model claude-sonnet-4.5
-# Uses: npx -y @agentclientprotocol/claude-agent-acp
-```
-
-Hermes passes non-sentinel model names through `ANTHROPIC_MODEL`. In tools-only mode, Hermes disables Claude Code's native built-in tools/MCP servers and exposes Hermes tool-call schemas from the configured platform toolset (`discord` by default):
-
-```yaml
-acp:
-  claude:
-    hermes_tools_only: true
-    tool_platform: discord
-```
-
-| Environment variable | Description |
-|---------------------|-------------|
-| `HERMES_CLAUDE_ACP_COMMAND` | Override the launcher command (default: `npx`) |
-| `HERMES_CLAUDE_ACP_ARGS` | Override ACP args (default: `-y @agentclientprotocol/claude-agent-acp`) |
-
 ### First-Class API-Key Providers
 
 These providers have built-in support with dedicated provider IDs. Set the API key and use `--provider` to select:
