@@ -1083,15 +1083,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     if reason in {FailoverReason.rate_limit, FailoverReason.billing}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
         fallback_already_active = bool(getattr(agent, "_fallback_activated", False))
-        current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
             agent._rate_limited_until = time.monotonic() + 60
+    if current_provider in {"devin-acp", "claude-acp"}:
+        logger.info(
+            "Fallback suppressed for explicit ACP provider %s",
+            current_provider,
+        )
+        return False
     if agent._fallback_index >= len(agent._fallback_chain):
         return False
 
@@ -1106,7 +1112,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     # back to the same backend that just failed loops the failure. Compare
     # base_url too so two distinct custom_providers entries pointing at the
     # same shim/proxy URL also dedup. See issue #22548.
-    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     current_model = (getattr(agent, "model", "") or "").strip()
     current_base_url = str(getattr(agent, "base_url", "") or "").rstrip("/").lower()
     fb_base_url_for_dedup = (fb.get("base_url") or "").strip().rstrip("/").lower()

@@ -9,6 +9,7 @@ back into the minimal shape Hermes expects from an OpenAI client.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -27,6 +28,8 @@ from typing import Any
 from agent.file_safety import get_read_block_error, is_write_denied
 from agent.anthropic_adapter import normalize_model_name
 from agent.redact import redact_sensitive_text
+
+logger = logging.getLogger(__name__)
 
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
@@ -76,7 +79,6 @@ def _resolve_command(base_url: str | None = None) -> str:
         or os.getenv("COPILOT_CLI_PATH", "").strip()
         or "copilot"
     )
-
 
 def _resolve_args() -> list[str]:
     raw = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
@@ -446,7 +448,13 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
     def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         if not self._hermes_tools_only():
             return tools
-        return _platform_tool_definitions(self._tool_platform()) or tools
+        resolved_tools = _platform_tool_definitions(self._tool_platform()) or tools
+        logger.debug(
+            "Devin ACP prompt tools: platform=%s count=%d",
+            self._tool_platform(),
+            len(resolved_tools or []),
+        )
+        return resolved_tools
 
     def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
         del model
@@ -500,6 +508,12 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         if not any(isinstance(server, dict) and server.get("name") == "hermes" for server in existing):
             existing.append(hermes_server)
         merged["mcpServers"] = existing
+        logger.debug(
+            "Devin ACP session new params: platform=%s mcp_servers=%d cwd=%s",
+            self._tool_platform(),
+            len(existing),
+            cwd,
+        )
         return merged
 
     def missing_command_error(self, command: str) -> str:
@@ -622,7 +636,13 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
     def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         if not self._hermes_tools_only():
             return tools
-        return _platform_tool_definitions(self._tool_platform()) or tools
+        resolved_tools = _platform_tool_definitions(self._tool_platform()) or tools
+        logger.debug(
+            "Claude ACP prompt tools: platform=%s count=%d",
+            self._tool_platform(),
+            len(resolved_tools or []),
+        )
+        return resolved_tools
 
     def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
         if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
@@ -667,6 +687,12 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
         claude_code["options"] = merged_options
         meta["claudeCode"] = claude_code
         merged["_meta"] = meta
+        logger.debug(
+            "Claude ACP session new params: platform=%s mcp_servers=%d cwd=%s",
+            self._tool_platform(),
+            len(existing_servers),
+            str(merged.get("cwd") or os.getcwd()),
+        )
         return merged
 
     def missing_command_error(self, command: str) -> str:
