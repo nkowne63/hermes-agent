@@ -111,6 +111,7 @@ _MODEL_CACHE_TTL = 3600
 _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
+_ACP_PROCESS_PROVIDERS = frozenset({"devin-acp", "claude-acp"})
 
 
 def _get_model_metadata_cache_path() -> Path:
@@ -1667,6 +1668,21 @@ def get_model_context_length(
     # "model-name") so cache lookups and server queries use the bare ID that
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
     model = _strip_provider_prefix(model)
+
+    # ACP process providers are launched through external CLIs rather than an
+    # HTTP model endpoint. Their live context-length probing path can interfere
+    # with the very first request after a model switch, so resolve them from the
+    # static catalog only.
+    if provider in _ACP_PROCESS_PROVIDERS or _normalize_base_url(base_url).startswith("acp://"):
+        model_lower = model.lower()
+        for default_model, length in sorted(
+            DEFAULT_CONTEXT_LENGTHS.items(),
+            key=lambda x: len(x[0]),
+            reverse=True,
+        ):
+            if default_model in model_lower:
+                return length
+        return DEFAULT_FALLBACK_CONTEXT
 
     # 1. Check persistent cache (model+provider)
     # LM Studio is excluded — its loaded context length is transient (the

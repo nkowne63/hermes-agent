@@ -853,6 +853,34 @@ class TestGetModelContextLength:
 
     @patch("agent.model_metadata.fetch_model_metadata")
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    @patch("agent.model_metadata.requests.get")
+    def test_acp_process_providers_skip_live_context_probe(
+        self,
+        mock_requests_get,
+        mock_endpoint_fetch,
+        mock_fetch,
+    ):
+        """External-process ACP providers should use static context values.
+
+        Their CLI-backed model resolution does not need an HTTP probe and the
+        probe path can interfere with the first request after a model switch.
+        """
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+
+        result = get_model_context_length(
+            "swe-1.6-fast",
+            base_url="acp://devin",
+            api_key="devin-acp",
+            provider="devin-acp",
+        )
+
+        assert result == DEFAULT_FALLBACK_CONTEXT
+        mock_requests_get.assert_not_called()
+        mock_endpoint_fetch.assert_not_called()
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     def test_custom_endpoint_without_metadata_falls_back_to_catalog(self, mock_endpoint_fetch, mock_fetch):
         """Custom endpoint with no metadata should fall back to the hardcoded
         catalog (not 256K) when the model name matches a known entry.
