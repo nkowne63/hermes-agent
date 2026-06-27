@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import _resolve_command
 
 
 class _FakeProcess:
@@ -220,6 +221,40 @@ def test_run_prompt_does_not_pass_devin_model_env_for_copilot_acp(monkeypatch, t
             client._run_prompt("hello", model="opus", timeout_seconds=1)
 
     assert "DEVIN_MODEL" not in captured["kwargs"]["env"]
+
+
+def test_resolve_command_defaults_are_provider_specific(monkeypatch):
+    monkeypatch.delenv("HERMES_COPILOT_ACP_COMMAND", raising=False)
+    monkeypatch.delenv("COPILOT_CLI_PATH", raising=False)
+    monkeypatch.delenv("HERMES_DEVIN_ACP_COMMAND", raising=False)
+    monkeypatch.delenv("DEVIN_CLI_PATH", raising=False)
+    monkeypatch.delenv("HERMES_CLAUDE_ACP_COMMAND", raising=False)
+    monkeypatch.delenv("CLAUDE_AGENT_ACP_PATH", raising=False)
+
+    assert _resolve_command("acp://copilot") == "copilot"
+    assert _resolve_command("acp://devin") == "devin"
+    assert _resolve_command("acp://claude") == "npx"
+
+
+def test_run_prompt_uses_provider_specific_default_command_for_devin_acp(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_DEVIN_ACP_COMMAND", raising=False)
+    monkeypatch.delenv("DEVIN_CLI_PATH", raising=False)
+
+    captured = {}
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
+            client._run_prompt("hello", model="opus", timeout_seconds=1)
+
+    assert captured["cmd"][0] == "devin"
+    assert captured["cmd"][1] == "--agent-config"
+    assert captured["cmd"][-1] == "acp"
 
 
 def test_run_prompt_passes_devin_model_env_for_devin_acp(monkeypatch, tmp_path):

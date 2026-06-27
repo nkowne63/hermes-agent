@@ -56,7 +56,20 @@ def _is_gh_copilot_deprecation_message(stderr_text: str) -> bool:
     return any(marker in lower for marker in _DEPRECATION_MARKERS)
 
 
-def _resolve_command() -> str:
+def _resolve_command(base_url: str | None = None) -> str:
+    marker = (base_url or "").strip().lower()
+    if marker.startswith("acp://devin"):
+        return (
+            os.getenv("HERMES_DEVIN_ACP_COMMAND", "").strip()
+            or os.getenv("DEVIN_CLI_PATH", "").strip()
+            or "devin"
+        )
+    if marker.startswith("acp://claude"):
+        return (
+            os.getenv("HERMES_CLAUDE_ACP_COMMAND", "").strip()
+            or os.getenv("CLAUDE_AGENT_ACP_PATH", "").strip()
+            or "npx"
+        )
     return (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
@@ -912,7 +925,7 @@ class CopilotACPClient:
         self.api_key = api_key or "copilot-acp"
         self.base_url = base_url or ACP_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
-        self._acp_command = acp_command or command or _resolve_command()
+        self._acp_command = acp_command or command or _resolve_command(base_url)
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self._provider_adapter = _resolve_acp_provider_adapter(
