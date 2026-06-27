@@ -79,8 +79,10 @@ _DEFAULT_PROVIDER_MODELS = {
         "devin-acp",
     ],
     "claude-acp": [
-        "claude-sonnet-4.5",
-        "claude-acp",
+        "claude-sonnet-4.6",
+        "claude-opus-4.6",
+        "claude-opus-4.8",
+        "claude-haiku-4.5",
     ],
     "copilot": [
         "gpt-5.4",

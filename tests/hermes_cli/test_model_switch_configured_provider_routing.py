@@ -48,6 +48,7 @@ def _run_switch(
     validation=_ACCEPTED,
     current_model="old-model",
     current_base_url="",
+    explicit_provider="",
 ):
     """Drive ``switch_model`` with the resolution chain mocked out.
 
@@ -79,6 +80,7 @@ def _run_switch(
             current_base_url=current_base_url,
             user_providers=user_providers or {},
             custom_providers=custom_providers or [],
+            explicit_provider=explicit_provider,
         )
 
 
@@ -101,6 +103,20 @@ def test_typed_configured_model_routes_away_from_openai_codex():
     assert result.success is True, result.error_message
     assert result.target_provider == "local-ollama"
     assert result.new_model == "qwen3.5-4b"
+
+
+def test_explicit_acp_provider_wins_over_current_devin_session():
+    """A Claude ACP selection must not stay on Devin ACP just because Devin was current."""
+    result = _run_switch(
+        raw_input="claude-sonnet-4.6",
+        current_provider="devin-acp",
+        current_model="old-model",
+        explicit_provider="claude-acp",
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "claude-acp"
+    assert result.provider_label == "Claude ACP"
+    assert result.new_model == "claude-sonnet-4.6"
 
 
 def test_typed_configured_model_routes_to_custom_provider():

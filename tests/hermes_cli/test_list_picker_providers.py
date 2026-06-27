@@ -276,7 +276,7 @@ def test_external_process_providers_use_auth_status_for_picker(monkeypatch):
         "hermes_cli.models.cached_provider_model_ids",
         lambda provider, *a, **kw: {
             "devin-acp": ["glm-5.2", "devin-acp"],
-            "claude-acp": ["claude-sonnet-4.5", "claude-acp"],
+            "claude-acp": ["claude-sonnet-4.6", "claude-opus-4.6", "claude-opus-4.8", "claude-haiku-4.5"],
         }.get(provider, []),
     )
     monkeypatch.setattr(
@@ -292,4 +292,4 @@ def test_external_process_providers_use_auth_status_for_picker(monkeypatch):
 
     by_slug = {p["slug"]: p for p in result}
     assert by_slug["devin-acp"]["models"] == ["glm-5.2", "devin-acp"]
-    assert by_slug["claude-acp"]["models"] == ["claude-sonnet-4.5", "claude-acp"]
+    assert by_slug["claude-acp"]["models"] == ["claude-sonnet-4.6", "claude-opus-4.6", "claude-opus-4.8", "claude-haiku-4.5"]

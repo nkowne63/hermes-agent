@@ -145,6 +145,51 @@ def _platform_tool_definitions(platform: str) -> list[dict[str, Any]]:
         return []
 
 
+def _build_hermes_mcp_server(*, platform: str, session_prefix: str, cwd: str) -> dict[str, Any]:
+    """Build the injected Hermes MCP server entry for ACP subprocesses."""
+    session_id = f"{session_prefix}-{uuid.uuid4().hex}"
+    repo_root = Path(__file__).resolve().parent.parent
+    server_path = repo_root / "mcp_hermes_tools.py"
+
+    env_names = [
+        "HOME",
+        "HERMES_HOME",
+        "HERMES_REAL_HOME",
+        "PATH",
+        "PYTHONPATH",
+    ]
+    env = [
+        {"name": name, "value": value}
+        for name in env_names
+        if (value := os.environ.get(name))
+    ]
+    env.extend(
+        [
+            {"name": "HERMES_MCP_TOOL_PLATFORM", "value": platform},
+            {"name": "HERMES_MCP_SESSION_ID", "value": session_id},
+            {"name": "HERMES_MCP_TASK_ID", "value": session_id},
+            {"name": "HERMES_MCP_CWD", "value": cwd},
+        ]
+    )
+
+    return {
+        "name": "hermes",
+        "command": sys.executable,
+        "args": [
+            str(server_path),
+            "--platform",
+            platform,
+            "--session-id",
+            session_id,
+            "--task-id",
+            session_id,
+            "--cwd",
+            cwd,
+        ],
+        "env": env,
+    }
+
+
 class ACPProviderAdapter:
     """Provider-specific behavior for subprocess-backed ACP CLIs."""
 
@@ -478,6 +523,48 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
     def _settings(self) -> dict[str, Any]:
         return _load_acp_settings("claude", "claude_acp")
 
+    def _agent_config_path(self) -> str:
+        settings = self._settings()
+        return str(settings.get("agent_config") or settings.get("agent_config_path") or "").strip()
+
+    def _allowed_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("allowed_tools")
+        if isinstance(raw, list):
+            tools = [str(item).strip() for item in raw if str(item).strip()]
+            if tools:
+                return tools
+        return ["mcp__hermes__*"]
+
+    def _deny_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("deny_tools")
+        if isinstance(raw, list):
+            return [str(item).strip() for item in raw if str(item).strip()]
+        if self._use_hermes_mcp_bridge():
+            return ["*"]
+        return []
+
+    def _use_hermes_mcp_bridge(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_mcp_bridge", settings.get("mcp_bridge", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _restricts_native_tools(self) -> bool:
+        if not self._hermes_tools_only():
+            return False
+        if self._use_hermes_mcp_bridge():
+            return True
+        if self._agent_config_path():
+            return True
+        allowed_tools = self._allowed_tools()
+        deny_tools = self._deny_tools()
+        return bool(deny_tools) or allowed_tools != ["mcp__hermes__*"]
+
     def _hermes_tools_only(self) -> bool:
         settings = self._settings()
         raw = settings.get("hermes_tools_only", settings.get("tools_only", True))
@@ -503,12 +590,12 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
         return env
 
     def client_capabilities(self) -> dict[str, Any]:
-        if self._hermes_tools_only():
+        if self._restricts_native_tools():
             return {}
         return super().client_capabilities()
 
     def supports_client_method(self, method: str) -> bool:
-        if self._hermes_tools_only() and method.startswith("fs/"):
+        if self._restricts_native_tools() and method.startswith("fs/"):
             return False
         return True
 
@@ -518,7 +605,7 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
         return _platform_tool_definitions(self._tool_platform()) or tools
 
     def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
-        if not self._hermes_tools_only():
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
             return params
 
         model_value = (model or "").strip()
@@ -535,7 +622,29 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
         meta = dict(merged.get("_meta") or {})
         claude_code = dict(meta.get("claudeCode") or {})
         existing_options = dict(claude_code.get("options") or {})
-        claude_code["options"] = {**options, **existing_options}
+        existing_servers = existing_options.get("mcpServers") or {}
+        if isinstance(existing_servers, list):
+            existing_servers = {
+                str(server.get("name")): dict(server)
+                for server in existing_servers
+                if isinstance(server, dict) and str(server.get("name") or "").strip()
+            }
+        elif not isinstance(existing_servers, dict):
+            existing_servers = {}
+
+        hermes_server = _build_hermes_mcp_server(
+            platform=self._tool_platform(),
+            session_prefix="claude-acp",
+            cwd=str(merged.get("cwd") or os.getcwd()),
+        )
+        existing_servers = dict(existing_servers)
+        existing_servers.setdefault("hermes", hermes_server)
+        options["mcpServers"] = existing_servers
+
+        merged_options = dict(existing_options)
+        merged_options.update(options)
+        merged_options["mcpServers"] = existing_servers
+        claude_code["options"] = merged_options
         meta["claudeCode"] = claude_code
         merged["_meta"] = meta
         return merged

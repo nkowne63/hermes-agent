@@ -15,6 +15,7 @@ from hermes_cli.models import (
     normalize_provider,
     opencode_model_api_mode,
     parse_model_input,
+    cached_provider_model_ids,
     probe_api_models,
     provider_label,
     provider_model_ids,
@@ -126,6 +127,16 @@ class TestParseModelInput:
         assert provider == "custom"
         assert model == "name:"
 
+    def test_acp_slash_prefix_switches_provider(self):
+        provider, model = parse_model_input("claude-acp/claude-sonnet-4.6", "devin-acp")
+        assert provider == "claude-acp"
+        assert model == "claude-sonnet-4.6"
+
+    def test_acp_alias_slash_prefix_switches_provider(self):
+        provider, model = parse_model_input("claude-agent-acp/claude-sonnet-4.6", "devin-acp")
+        assert provider == "claude-acp"
+        assert model == "claude-sonnet-4.6"
+
 
 # -- curated_models_for_provider ---------------------------------------------
 
@@ -144,6 +155,21 @@ class TestCuratedModelsForProvider:
 
     def test_unknown_provider_returns_empty(self):
         assert curated_models_for_provider("totally-unknown") == []
+
+
+def test_cached_provider_model_ids_strips_acp_prefixes(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.models.provider_model_ids",
+        lambda provider, **kw: ["claude-acp/claude-sonnet-4.6", "claude-acp/claude-opus-4.6"],
+    )
+    monkeypatch.setattr("hermes_cli.models._credential_fingerprint", lambda provider: "fp")
+    monkeypatch.setattr("hermes_cli.models._load_provider_models_cache", lambda: {})
+    monkeypatch.setattr("hermes_cli.models._save_provider_models_cache", lambda _data: None)
+
+    assert cached_provider_model_ids("claude-acp", force_refresh=True) == [
+        "claude-sonnet-4.6",
+        "claude-opus-4.6",
+    ]
 
 
 # -- normalize_provider ------------------------------------------------------

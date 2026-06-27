@@ -444,7 +444,7 @@ def test_claude_tools_only_disables_fs_client_capabilities(tmp_path):
         assert client._provider_adapter.supports_client_method("session/request_permission") is True
 
 
-def test_claude_session_params_disable_native_tools(tmp_path):
+def test_claude_session_params_inject_hermes_mcp_bridge(tmp_path):
     client = CopilotACPClient(
         api_key="claude-acp",
         base_url="acp://claude",
@@ -460,10 +460,36 @@ def test_claude_session_params_disable_native_tools(tmp_path):
 
     options = params["_meta"]["claudeCode"]["options"]
     assert options["tools"] == []
-    assert options["mcpServers"] == {}
+    assert "hermes" in options["mcpServers"]
     assert "Bash" in options["disallowedTools"]
     assert options["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4.5"
     assert options["settings"]["availableModels"] == ["claude-sonnet-4.5"]
+
+    hermes_server = options["mcpServers"]["hermes"]
+    assert hermes_server["command"]
+    assert "mcp_hermes_tools.py" in hermes_server["args"][0]
+    env = {item["name"]: item["value"] for item in hermes_server["env"]}
+    assert env["HERMES_MCP_TOOL_PLATFORM"] == "discord"
+
+
+def test_claude_mcp_bridge_can_be_disabled_to_keep_native_tools(tmp_path):
+    client = CopilotACPClient(
+        api_key="claude-acp",
+        base_url="acp://claude",
+        acp_command="npx",
+        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={"hermes_mcp_bridge": False}):
+        params = client._provider_adapter.session_new_params(
+            {"cwd": str(tmp_path), "mcpServers": {}},
+            model="claude-sonnet-4.5",
+        )
+
+        assert params == {"cwd": str(tmp_path), "mcpServers": {}}
+        assert client._provider_adapter.client_capabilities()["fs"]["readTextFile"] is True
+        assert client._provider_adapter.supports_client_method("fs/read_text_file") is True
 
 
 def test_acp_tools_only_uses_discord_platform_tools(tmp_path):

@@ -253,8 +253,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "devin-acp",
     ],
     "claude-acp": [
-        "claude-sonnet-4.5",
-        "claude-acp",
+        "claude-sonnet-4.6",
+        "claude-opus-4.6",
+        "claude-opus-4.8",
+        "claude-haiku-4.5",
     ],
     "copilot": [
         "gpt-5.4",
@@ -1702,6 +1704,11 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
     provider from the input or *current_provider* if none was specified.
     """
     stripped = raw.strip()
+    if "/" in stripped:
+        provider_part, model_part = stripped.split("/", 1)
+        provider_norm = normalize_provider(provider_part)
+        if provider_norm in {"devin-acp", "claude-acp", "copilot-acp"} and model_part.strip():
+            return (provider_norm, model_part.strip())
     colon = stripped.find(":")
     if colon > 0:
         provider_part = stripped[:colon].strip().lower()
@@ -2274,16 +2281,16 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
     if normalized in {"devin-acp", "claude-acp"}:
-        return list(_PROVIDER_MODELS.get(normalized, []))
+        return _normalize_acp_model_ids(normalized, _PROVIDER_MODELS.get(normalized, []))
     if normalized in {"copilot", "copilot-acp"}:
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
             if live:
-                return live
+                return _normalize_acp_model_ids(normalized, live)
         except Exception:
             pass
         if normalized == "copilot-acp":
-            return list(_PROVIDER_MODELS.get("copilot", []))
+            return _normalize_acp_model_ids(normalized, _PROVIDER_MODELS.get("copilot", []))
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
         try:
@@ -2472,6 +2479,24 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     return curated_static
 
 
+def _normalize_acp_model_ids(provider: Optional[str], model_ids_list: list[str] | tuple[str, ...]) -> list[str]:
+    """Strip accidental ``provider/`` prefixes from ACP model candidates."""
+    normalized = normalize_provider(provider)
+    if normalized not in {"devin-acp", "claude-acp", "copilot-acp"}:
+        return list(model_ids_list)
+
+    prefix = f"{normalized}/"
+    result: list[str] = []
+    for raw in model_ids_list:
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):].strip()
+        result.append(value)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Generic disk cache for provider_model_ids() — keeps /model picker fast.
 # ---------------------------------------------------------------------------
@@ -2624,7 +2649,7 @@ def cached_provider_model_ids(
         and entry["models"]
         and (now - float(entry.get("at", 0))) < ttl_seconds
     ):
-        return list(entry["models"])
+        return _normalize_acp_model_ids(normalized, entry["models"])
 
     # Cache miss / stale / forced refresh — call the live path.
     live = provider_model_ids(normalized, force_refresh=force_refresh)
@@ -2635,7 +2660,7 @@ def cached_provider_model_ids(
             "models": list(live),
         }
         _save_provider_models_cache(cache)
-        return list(live)
+        return _normalize_acp_model_ids(normalized, live)
 
     # Live fetch returned nothing. If we have a stale entry with the
     # SAME fingerprint, prefer it over an empty result — stale data
@@ -2646,7 +2671,7 @@ def cached_provider_model_ids(
         and isinstance(entry.get("models"), list)
         and entry["models"]
     ):
-        return list(entry["models"])
+        return _normalize_acp_model_ids(normalized, entry["models"])
     return list(live or [])
 
 
