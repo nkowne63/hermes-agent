@@ -28,7 +28,18 @@ export interface DesktopThemeCommandOption {
  * means adding a branch to a switch ladder — you add a row here + a handler
  * keyed by the id.
  */
-export type DesktopActionId = 'branch' | 'handoff' | 'help' | 'new' | 'profile' | 'skin' | 'title' | 'yolo'
+export type DesktopActionId =
+  | 'branch'
+  | 'browser'
+  | 'handoff'
+  | 'hatch'
+  | 'help'
+  | 'new'
+  | 'pet'
+  | 'profile'
+  | 'skin'
+  | 'title'
+  | 'yolo'
 
 /** A command fulfilled by opening a desktop overlay picker. */
 export type DesktopPickerId = 'model' | 'session'
@@ -105,6 +116,12 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   { name: '/skin', description: 'Switch desktop theme or cycle to the next one', surface: action('skin'), args: true },
   { name: '/title', description: 'Rename the current session', surface: action('title') },
   { name: '/help', description: 'Show desktop slash commands', aliases: ['/commands'], surface: action('help') },
+  {
+    name: '/browser',
+    description: 'Manage browser CDP connection [connect|disconnect|status] (local gateway only)',
+    surface: action('browser'),
+    args: true
+  },
 
   // Overlay pickers
   { name: '/model', description: 'Switch the model for this session', surface: picker('model'), hidden: true },
@@ -128,6 +145,18 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   { name: '/debug', description: 'Create a debug report', surface: exec() },
   { name: '/goal', description: 'Manage the standing goal for this session', surface: exec() },
   { name: '/personality', description: 'Switch personality for this session', surface: exec(), args: true },
+  {
+    name: '/pet',
+    description: 'Toggle or adopt a petdex mascot (/pet, /pet list, /pet boba)',
+    surface: action('pet'),
+    args: true
+  },
+  {
+    name: '/hatch',
+    description: 'Generate a new pet (opens the pet generator)',
+    aliases: ['/generate-pet'],
+    surface: action('hatch')
+  },
   { name: '/queue', description: 'Queue a prompt for the next turn', aliases: ['/q'], surface: exec() },
   { name: '/retry', description: 'Retry the last user message', surface: exec() },
   { name: '/rollback', description: 'List or restore filesystem checkpoints', surface: exec() },
@@ -149,7 +178,6 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
 // per reason beats 40 identical object literals.
 const NO_DESKTOP_SURFACE: Record<DesktopUnavailableReason, readonly string[]> = {
   terminal: [
-    '/browser',
     '/busy',
     '/clear',
     '/compact',
@@ -160,7 +188,6 @@ const NO_DESKTOP_SURFACE: Record<DesktopUnavailableReason, readonly string[]> = 
     '/exit',
     '/footer',
     '/gateway',
-    '/gquota',
     '/history',
     '/image',
     '/indicator',
@@ -184,7 +211,7 @@ const NO_DESKTOP_SURFACE: Record<DesktopUnavailableReason, readonly string[]> = 
     '/verbose'
   ],
   messaging: ['/approve', '/deny'],
-  settings: ['/skills'],
+  settings: ['/skills', '/pets'],
   advanced: ['/curator', '/fast', '/insights', '/kanban', '/reasoning', '/voice']
 }
 
