@@ -35,7 +35,7 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 
 
 # Providers that support OAuth login in addition to API keys.
-_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "google-gemini-cli", "minimax-oauth"}
+_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth"}
 
 
 def _get_custom_provider_names() -> list:
@@ -310,10 +310,12 @@ def auth_add_command(args) -> None:
 
     if provider == "openai-codex":
         if bool(getattr(args, "from_codex_cli", False)):
-            tokens = auth_mod._import_codex_cli_tokens()
+            raw_codex_home = str(getattr(args, "codex_home", "") or "").strip()
+            codex_home = str(auth_mod._codex_cli_auth_path(raw_codex_home).parent)
+            tokens = auth_mod._import_codex_cli_tokens(codex_home=codex_home)
             if not tokens:
                 raise SystemExit(
-                    "No usable Codex CLI credentials found at ~/.codex/auth.json. "
+                    f"No usable Codex CLI credentials found at {codex_home}/auth.json. "
                     "Run `codex login` first, then retry."
                 )
             creds = {
@@ -328,12 +330,13 @@ def auth_add_command(args) -> None:
         else:
             creds = auth_mod._codex_device_code_login()
             source_label = "OAuth"
+            codex_home = ""
         label = (getattr(args, "label", None) or "").strip() or label_from_token(
             creds["tokens"]["access_token"],
             _oauth_default_label(provider, len(pool.entries()) + 1),
         )
         # Add a distinct, self-contained pool entry per account (matching the
-        # xai-oauth / google-gemini-cli / qwen-oauth patterns) instead of
+        # xai-oauth / qwen-oauth patterns) instead of
         # routing through the singleton ``_save_codex_tokens`` save path.
         # The singleton round-trip collapsed every added account into the
         # latest login: a second ``hermes auth add openai-codex`` overwrote
@@ -352,6 +355,7 @@ def auth_add_command(args) -> None:
             refresh_token=creds["tokens"].get("refresh_token"),
             base_url=creds.get("base_url"),
             last_refresh=creds.get("last_refresh"),
+            extra={"codex_home": codex_home} if codex_home else {},
         )
         first_credential = not pool.entries()
         pool.add_entry(entry)
@@ -381,28 +385,6 @@ def auth_add_command(args) -> None:
             creds["tokens"]["access_token"], _oauth_default_label(provider, 1)
         )
         print(f'Saved {provider} OAuth credentials: "{shown_label}"')
-        return
-
-    if provider == "google-gemini-cli":
-        from agent.google_oauth import run_gemini_oauth_login_pure
-
-        creds = run_gemini_oauth_login_pure()
-        auth_mod._mark_google_gemini_cli_active(creds)
-        label = (getattr(args, "label", None) or "").strip() or (
-            creds.get("email") or _oauth_default_label(provider, len(pool.entries()) + 1)
-        )
-        entry = PooledCredential(
-            provider=provider,
-            id=uuid.uuid4().hex[:6],
-            label=label,
-            auth_type=AUTH_TYPE_OAUTH,
-            priority=0,
-            source=f"{SOURCE_MANUAL}:google_pkce",
-            access_token=creds["access_token"],
-            refresh_token=creds.get("refresh_token"),
-        )
-        pool.add_entry(entry)
-        print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 
     if provider == "qwen-oauth":

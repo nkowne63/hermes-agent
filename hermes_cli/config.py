@@ -5794,6 +5794,33 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
+def write_platform_config_field(platform_key: str, field: str, value: Any, *, raw: bool = False) -> None:
+    """Persist a single ``platforms.<platform>.<field>`` value in config.yaml."""
+    if is_managed():
+        managed_error("set platform configuration")
+        return
+    if not platform_key or not field:
+        raise ValueError("platform_key and field are required")
+
+    stored_value = value
+    if not raw and isinstance(value, str):
+        lowered = value.lower()
+        if lowered in {"true", "yes", "on"}:
+            stored_value = True
+        elif lowered in {"false", "no", "off"}:
+            stored_value = False
+        elif value.isdigit():
+            stored_value = int(value)
+        elif value.replace(".", "", 1).isdigit():
+            stored_value = float(value)
+
+    user_config = read_raw_config()
+    _set_nested(user_config, f"platforms.{platform_key}.{field}", stored_value)
+
+    ensure_hermes_home()
+    atomic_yaml_write(get_config_path(), user_config, sort_keys=False)
+
+
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 

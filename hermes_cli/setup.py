@@ -65,7 +65,7 @@ def _supports_same_provider_pool_setup(provider: str) -> bool:
     pconfig = PROVIDER_REGISTRY.get(provider)
     if not pconfig:
         return False
-    return pconfig.auth_type in {"api_key", "oauth_device_code"}
+    return pconfig.auth_type in {"api_key", "oauth_device_code", "external_process"}
 
 
 # Default model lists per provider — used as fallback when the live
@@ -75,7 +75,12 @@ _DEFAULT_PROVIDER_MODELS = {
         "copilot-acp",
     ],
     "devin-acp": [
+        "swe-1.6",
         "devin-acp",
+    ],
+    "claude-acp": [
+        "claude-sonnet-4.5",
+        "claude-acp",
     ],
     "copilot": [
         "gpt-5.4",

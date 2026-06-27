@@ -38,6 +38,14 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         ),
     )
     auth_add.add_argument(
+        "--codex-home",
+        help=(
+            "For --from-codex-cli, read Codex CLI credentials from this CODEX_HOME "
+            "instead of ~/.codex. The path is stored so Hermes can resync rotated "
+            "tokens for this account."
+        ),
+    )
+    auth_add.add_argument(
         "--api-key", help="API key value (otherwise prompted securely)"
     )
     auth_add.add_argument("--portal-url", help="Nous portal base URL")
