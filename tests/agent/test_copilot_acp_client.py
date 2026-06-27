@@ -545,3 +545,52 @@ def test_acp_tools_only_uses_discord_platform_tools(tmp_path):
     with _patch.object(client._provider_adapter, "_settings", return_value={}):
         with _patch("agent.copilot_acp_client._platform_tool_definitions", return_value=discord_tools):
             assert client._provider_adapter.prompt_tools(original) == discord_tools
+
+
+def test_create_chat_completion_includes_tools_and_extracts_tool_calls(tmp_path):
+    client = CopilotACPClient(
+        api_key="claude-acp",
+        base_url="acp://claude",
+        acp_command="npx",
+        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_cwd=str(tmp_path),
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }
+    ]
+    captured = {}
+
+    def _fake_run_prompt(prompt_text, **kwargs):
+        captured["prompt"] = prompt_text
+        return (
+            '<tool_call>{"id":"1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"/tmp/x.txt\\"}"}}</tool_call>\n'
+            "Done.",
+            "reasoning text",
+        )
+
+    with _patch.object(client._provider_adapter, "prompt_tools", return_value=tools):
+        with _patch.object(client, "_run_prompt", side_effect=_fake_run_prompt):
+            response = client._create_chat_completion(
+                model="claude-sonnet-4.6",
+                messages=[{"role": "user", "content": "Inspect /tmp/x.txt"}],
+                tools=tools,
+            )
+
+    prompt_text = captured["prompt"]
+    assert "Available tools (OpenAI function schema)." in prompt_text
+    assert '"name": "read_file"' in prompt_text
+    assert response.choices[0].message.content == "Done."
+    assert response.choices[0].message.tool_calls
+    assert response.choices[0].finish_reason == "tool_calls"
+    assert response.choices[0].message.tool_calls[0].function.name == "read_file"

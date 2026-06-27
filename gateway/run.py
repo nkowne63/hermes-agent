@@ -11924,6 +11924,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
             if fallback_notice:
+                await self._send_provider_fallback_session_error(
+                    source=source,
+                    from_provider=str(fallback_notice.get("from_provider") or ""),
+                    to_provider=str(fallback_notice.get("to_provider") or runtime_kwargs.get("provider") or ""),
+                    from_model=str(fallback_notice.get("from_model") or ""),
+                    to_model=str(fallback_notice.get("to_model") or model or ""),
+                )
                 await self._send_provider_fallback_notification(
                     source=source,
                     from_provider=str(fallback_notice.get("from_provider") or ""),
@@ -13531,6 +13538,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Provider fallback notification failed for %s:%s: %s",
                 source.platform.value if source.platform else "unknown",
                 home.chat_id,
+                exc,
+            )
+            return False
+
+    async def _send_provider_fallback_session_error(
+        self,
+        *,
+        source: SessionSource,
+        from_provider: str,
+        to_provider: str,
+        from_model: str = "",
+        to_model: str = "",
+    ) -> bool:
+        """Emit a non-conversational fallback error into the active Discord session."""
+        if _gateway_platform_value(getattr(source, "platform", None)) != "discord":
+            return False
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return False
+
+        parts = [
+            "❌ Provider fallback in this session",
+            f"{from_provider or '(unknown)'} -> {to_provider or '(unknown)'}",
+        ]
+        if from_model or to_model:
+            parts.append(f"model {from_model or '(unknown)'} -> {to_model or '(unknown)'}")
+        message = " | ".join(parts)
+        reply_to = str(getattr(source, "message_id", "") or "").strip() or None
+
+        try:
+            metadata = self._thread_metadata_for_source(source, reply_to)
+            metadata = _non_conversational_metadata(metadata, platform=source.platform)
+            result = await adapter.send(
+                str(source.chat_id),
+                message,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            if result is not None and getattr(result, "success", True) is False:
+                logger.warning(
+                    "Provider fallback session error failed for %s:%s: %s",
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id,
+                    getattr(result, "error", "send returned success=False"),
+                )
+                return False
+            logger.info(
+                "Sent provider fallback session error to %s:%s (%s -> %s)",
+                source.platform.value if source.platform else "unknown",
+                source.chat_id,
+                from_provider or "(unknown)",
+                to_provider or "(unknown)",
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Provider fallback session error failed for %s:%s: %s",
+                source.platform.value if source.platform else "unknown",
+                source.chat_id,
                 exc,
             )
             return False
@@ -16120,6 +16187,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
                 if fallback_notice:
+                    safe_schedule_threadsafe(
+                        self._send_provider_fallback_session_error(
+                            source=source,
+                            from_provider=str(fallback_notice.get("from_provider") or ""),
+                            to_provider=str(fallback_notice.get("to_provider") or runtime_kwargs.get("provider") or ""),
+                            from_model=str(fallback_notice.get("from_model") or ""),
+                            to_model=str(fallback_notice.get("to_model") or model or ""),
+                        ),
+                        _loop_for_step,
+                        logger=logger,
+                        log_message="provider fallback session error scheduling error",
+                    )
                     safe_schedule_threadsafe(
                         self._send_provider_fallback_notification(
                             source=source,

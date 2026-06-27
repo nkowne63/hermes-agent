@@ -127,19 +127,6 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback() is True
             assert agent._try_activate_fallback() is False
 
-    @pytest.mark.parametrize("provider", ["devin-acp", "claude-acp"])
-    def test_explicit_acp_provider_suppresses_fallback(self, provider):
-        agent = _make_agent(fallback_model=[
-            {"provider": "openrouter", "model": "qwen/qwen3.6-35b-a3b"},
-        ])
-        agent.provider = provider
-        agent.model = "swe-1.6-fast" if provider == "devin-acp" else "claude-sonnet-4.6"
-        agent.base_url = "acp://devin" if provider == "devin-acp" else "acp://claude"
-
-        with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
-            assert agent._try_activate_fallback() is False
-        mock_resolve.assert_not_called()
-
     def test_skips_unconfigured_provider_to_next(self):
         """If resolve_provider_client returns None, skip to next in chain."""
         fbs = [

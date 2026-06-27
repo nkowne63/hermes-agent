@@ -1092,12 +1092,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
             agent._rate_limited_until = time.monotonic() + 60
-    if current_provider in {"devin-acp", "claude-acp"}:
-        logger.info(
-            "Fallback suppressed for explicit ACP provider %s",
-            current_provider,
-        )
-        return False
     if agent._fallback_index >= len(agent._fallback_chain):
         return False
 
