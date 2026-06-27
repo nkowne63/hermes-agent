@@ -1372,7 +1372,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
 
         client = CopilotACPClient(**client_kwargs)
         _ra().logger.info(
-            "ACP subprocess client created (%s, shared=%s) %s",
+            "ACP client created (%s, shared=%s) %s",
             reason,
             shared,
             agent._client_log_context(),

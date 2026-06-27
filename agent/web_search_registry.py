@@ -17,7 +17,7 @@ The active provider is chosen by configuration with this precedence:
 3. If exactly one capability-eligible provider is registered AND available,
    use it.
 4. Legacy preference order — ``firecrawl`` → ``parallel`` → ``tavily`` →
-   ``exa`` → ``native`` → ``searxng`` → ``brave-free`` → ``ddgs`` — filtered by
+   ``exa`` → ``searxng`` → ``brave-free`` → ``ddgs`` — filtered by
    availability. Matches the historic ``tools.web_tools._get_backend()``
    candidate order so installs that never set a config key keep landing
    on the same provider they did before the plugin migration.
@@ -117,14 +117,13 @@ def _read_config_key(*path: str) -> Optional[str]:
 # ``web.backend`` / ``web.<capability>_backend`` config key at all. Matches
 # the historic candidate order in :func:`tools.web_tools._get_backend`
 # (paid providers first so existing paid setups don't get downgraded to
-# a local/free tier on upgrade). Filtered by ``is_available()`` at walk time so
+# a free tier on upgrade). Filtered by ``is_available()`` at walk time so
 # we don't surface a provider the user has no credentials for.
 _LEGACY_PREFERENCE = (
     "firecrawl",
     "parallel",
     "tavily",
     "exa",
-    "native",
     "searxng",
     "brave-free",
     "ddgs",

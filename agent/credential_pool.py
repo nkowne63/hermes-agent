@@ -125,6 +125,7 @@ _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
     "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
+    "codex_home",
 })
 
 
@@ -651,7 +652,50 @@ class CredentialPool:
         device_code-sourced entries; env/API-key-sourced entries have no
         auth.json shadow to sync from.
         """
-        if self.provider != "openai-codex" or entry.source != "device_code":
+        if self.provider != "openai-codex":
+            return entry
+        codex_home = str(entry.extra.get("codex_home") or "").strip()
+        if codex_home:
+            try:
+                tokens = auth_mod._import_codex_cli_tokens(
+                    codex_home=codex_home,
+                    require_fresh=False,
+                )
+                if not isinstance(tokens, dict):
+                    return entry
+                store_access = str(tokens.get("access_token") or "").strip()
+                store_refresh = str(tokens.get("refresh_token") or "").strip()
+                entry_access = entry.access_token or ""
+                entry_refresh = entry.refresh_token or ""
+                if store_access and (
+                    store_access != entry_access
+                    or (store_refresh and store_refresh != entry_refresh)
+                ):
+                    logger.debug(
+                        "Pool entry %s: syncing Codex tokens from Codex CLI home %s",
+                        entry.id,
+                        codex_home,
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=store_access,
+                        refresh_token=store_refresh or entry.refresh_token,
+                        last_refresh=tokens.get("last_refresh") or entry.last_refresh,
+                        last_status=None,
+                        last_status_at=None,
+                        last_error_code=None,
+                        last_error_reason=None,
+                        last_error_message=None,
+                        last_error_reset_at=None,
+                    )
+                    self._replace_entry(entry, updated)
+                    self._persist()
+                    return updated
+            except Exception as exc:
+                logger.debug("Failed to sync Codex entry from Codex CLI home: %s", exc)
+            return entry
+
+        if entry.source != "device_code":
             return entry
         try:
             with _auth_store_lock():
@@ -993,6 +1037,12 @@ class CredentialPool:
                     refresh_token=refreshed["refresh_token"],
                     last_refresh=refreshed.get("last_refresh"),
                 )
+                codex_home = str(entry.extra.get("codex_home") or "").strip()
+                if codex_home:
+                    try:
+                        auth_mod._write_codex_cli_tokens(codex_home, refreshed)
+                    except Exception as wexc:
+                        logger.debug("Failed to write refreshed Codex tokens to Codex CLI home: %s", wexc)
             elif self.provider == "xai-oauth":
                 # Adopt fresher tokens from auth.json before spending the
                 # refresh_token — single-use tokens consumed by another
@@ -1347,8 +1397,13 @@ class CredentialPool:
             # frozen behind last_error_reset_at (can be hours in the
             # future for ChatGPT weekly windows).
             if (self.provider == "openai-codex"
-                    and entry.source == "device_code"
-                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
+                    and (
+                        entry.extra.get("codex_home")
+                        or (
+                            entry.source == "device_code"
+                            and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}
+                        )
+                    )):
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
