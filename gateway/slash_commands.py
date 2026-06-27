@@ -1135,6 +1135,7 @@ class GatewaySlashCommandsMixin:
             is_session,
         ) = parse_model_flags(raw_args)
         persist_global = resolve_persist_behavior(is_global_flag, is_session)
+        picker_persist_global = persist_global
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -1177,6 +1178,10 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = self._normalize_source_for_session_key(source)
         session_key = self._session_key_for_source(source)
+        if source.platform == Platform.DISCORD:
+            # Discord model-picker selections are session-scoped by design so
+            # a tap in one thread/channel does not rewrite the shared default.
+            picker_persist_global = False
         override = self._session_model_overrides.get(session_key, {})
         if override:
             current_model = override.get("model", current_model)
@@ -1334,7 +1339,7 @@ class GatewaySlashCommandsMixin:
                         # Persist to config (default) unless --session opted out,
                         # mirroring the text /model command path above so a picked
                         # model survives across sessions like a typed one (#49066).
-                        if persist_global:
+                        if picker_persist_global:
                             try:
                                 if config_path.exists():
                                     with open(config_path, encoding="utf-8") as f:
@@ -1394,7 +1399,7 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
-                        if persist_global:
+                        if picker_persist_global:
                             lines.append(t("gateway.model.saved_global"))
                         else:
                             lines.append(t("gateway.model.session_only_hint"))

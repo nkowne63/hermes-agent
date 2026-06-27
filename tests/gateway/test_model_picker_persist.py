@@ -7,10 +7,14 @@ it hard-coded ``is_global=False`` and never wrote ``config.yaml``, so *tapping* 
 model in the Telegram/Discord picker silently reverted on the next launch while
 *typing* the same model persisted — a contradiction the same PR introduced.
 
-After the fix (#49176), the picker callback honors the resolved
-``persist_global`` (defaults to ``True``, still respects ``--session``) and runs
-the same read-modify-write block the text path uses, so a tapped model survives
-across sessions like a typed one.
+After the fix (#49176), the Telegram picker callback honors the resolved
+``persist_global`` (defaults to ``True``, still respects ``--session``) and
+runs the same read-modify-write block the text path uses, so a tapped model
+survives across sessions like a typed one.
+
+Discord picker selections are intentionally session-scoped only: tapping a
+model there should update the active session without rewriting the shared
+default in ``config.yaml``.
 
 These tests drive the real ``_handle_model_command`` with a fake picker-capable
 adapter that captures the ``on_model_selected`` callback, then invoke that
@@ -55,11 +59,11 @@ def _make_runner(adapter):
     return runner
 
 
-def _make_event(text):
+def _make_event(text, *, platform=Platform.TELEGRAM):
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
+        source=SessionSource(platform=platform, chat_id="12345", chat_type="dm"),
     )
 
 
@@ -201,3 +205,21 @@ async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert written["model"]["default"] == "old-model"
     assert written["model"]["provider"] == "openai-codex"
+
+
+@pytest.mark.asyncio
+async def test_discord_picker_tap_is_session_only(tmp_path, monkeypatch):
+    """Discord picker taps must not rewrite the shared default model."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, {"default": "old-model", "provider": "openrouter"})
+    runner = _make_runner(adapter)
+    runner.adapters[Platform.DISCORD] = adapter
+
+    confirmation = await _drive_picker(runner, _make_event("/model", platform=Platform.DISCORD))
+
+    assert confirmation is not None
+    assert "gpt-5.5" in confirmation
+    assert runner._session_model_overrides, "discord picker should still update the session override"
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "old-model"
+    assert written["model"]["provider"] == "openrouter"
