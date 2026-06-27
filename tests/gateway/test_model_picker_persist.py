@@ -23,6 +23,7 @@ closure the PR changed, against a real temp ``HERMES_HOME``.
 """
 
 import types
+from pathlib import Path
 
 import yaml
 import pytest
@@ -205,6 +206,45 @@ async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert written["model"]["default"] == "old-model"
     assert written["model"]["provider"] == "openai-codex"
+
+
+@pytest.mark.asyncio
+async def test_picker_tap_session_override_keeps_acp_launch_args(tmp_path, monkeypatch):
+    """Session-only ACP model switches must preserve command/args for the next turn."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openrouter"}
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **kw: types.SimpleNamespace(
+            success=True,
+            new_model="swe-1.6-fast",
+            target_provider="devin-acp",
+            provider_changed=True,
+            api_key="devin-acp",
+            base_url="acp://devin",
+            api_mode="chat_completions",
+            provider_label="Devin ACP",
+            is_global=False,
+            warning_message="",
+            capabilities=None,
+            model_info=None,
+        ),
+    )
+
+    runner = _make_runner(adapter)
+
+    confirmation = await _drive_picker(runner, _make_event("/model --session"))
+
+    assert confirmation is not None
+    override = next(iter(runner._session_model_overrides.values()))
+    assert override["provider"] == "devin-acp"
+    assert Path(override["command"]).name == "devin"
+    assert override["args"] == ["acp"]
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "old-model"
+    assert written["model"]["provider"] == "openrouter"
 
 
 @pytest.mark.asyncio

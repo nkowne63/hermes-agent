@@ -126,6 +126,56 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
 
 
+def test_run_agent_prefers_session_override_for_acp_command_args(monkeypatch):
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    _CapturingAgent.last_init = None
+    runner = _make_runner()
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="discord",
+        chat_name="Discord",
+        chat_type="dm",
+        user_id="user-2",
+    )
+    session_key = "agent:main:discord:dm"
+    runner._session_model_overrides[session_key] = {
+        "model": "swe-1.6-fast",
+        "provider": "devin-acp",
+        "api_key": "devin-acp",
+        "base_url": "acp://devin",
+        "api_mode": "chat_completions",
+        "command": "devin",
+        "args": ["acp"],
+    }
+
+    result = asyncio.run(
+        runner._run_agent(
+            message="ping",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-2",
+            session_key=session_key,
+        )
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init is not None
+    assert _CapturingAgent.last_init["provider"] == "devin-acp"
+    assert _CapturingAgent.last_init["api_mode"] == "chat_completions"
+    assert _CapturingAgent.last_init["base_url"] == "acp://devin"
+    assert _CapturingAgent.last_init["api_key"] == "devin-acp"
+    assert _CapturingAgent.last_init["command"] == "devin"
+    assert _CapturingAgent.last_init["args"] == ["acp"]
+
+
 @pytest.mark.asyncio
 async def test_background_task_prefers_session_override_over_global_runtime(monkeypatch):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})

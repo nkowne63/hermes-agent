@@ -1299,6 +1299,19 @@ class GatewaySlashCommandsMixin:
                                     ),
                                 )
 
+                        resolved_runtime = {}
+                        try:
+                            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                            resolved_runtime = resolve_runtime_provider(
+                                requested=result.target_provider,
+                                explicit_api_key=result.api_key,
+                                explicit_base_url=result.base_url,
+                                target_model=result.new_model,
+                            )
+                        except Exception:
+                            resolved_runtime = {}
+
                         # Persist the new model to the session DB so the
                         # dashboard shows the updated model (#34850).
                         _sess_db = getattr(_self, "_session_db", None)
@@ -1336,6 +1349,10 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
+                        if "command" in resolved_runtime:
+                            _self._session_model_overrides[_session_key]["command"] = resolved_runtime.get("command")
+                        if "args" in resolved_runtime:
+                            _self._session_model_overrides[_session_key]["args"] = list(resolved_runtime.get("args") or [])
 
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
@@ -1528,6 +1545,19 @@ class GatewaySlashCommandsMixin:
                         ),
                     )
 
+            resolved_runtime = {}
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                resolved_runtime = resolve_runtime_provider(
+                    requested=result.target_provider,
+                    explicit_api_key=result.api_key,
+                    explicit_base_url=result.base_url,
+                    target_model=result.new_model,
+                )
+            except Exception:
+                resolved_runtime = {}
+
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
             _sess_db = getattr(self, "_session_db", None)
@@ -1571,6 +1601,10 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+            if "command" in resolved_runtime:
+                self._session_model_overrides[session_key]["command"] = resolved_runtime.get("command")
+            if "args" in resolved_runtime:
+                self._session_model_overrides[session_key]["args"] = list(resolved_runtime.get("args") or [])
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
