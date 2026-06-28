@@ -248,8 +248,26 @@ class ACPProviderAdapter:
     def supports_client_method(self, method: str) -> bool:
         return True
 
+    def exposes_reasoning(self) -> bool:
+        return True
+
     def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         return tools
+
+    def format_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+    ) -> str:
+        return _format_messages_as_prompt(
+            messages,
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
 
     def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
         del model
@@ -455,6 +473,56 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
             len(resolved_tools or []),
         )
         return resolved_tools
+
+    def exposes_reasoning(self) -> bool:
+        return False
+
+    def format_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+    ) -> str:
+        structured_messages: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "unknown").strip().lower()
+            entry: dict[str, Any] = {
+                "role": role,
+                "content": _render_message_content(message.get("content")),
+            }
+            if role == "tool":
+                tool_call_id = message.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id.strip():
+                    entry["tool_call_id"] = tool_call_id.strip()
+                tool_name = message.get("name")
+                if isinstance(tool_name, str) and tool_name.strip():
+                    entry["name"] = tool_name.strip()
+            structured_messages.append(entry)
+
+        payload: dict[str, Any] = {
+            "type": "hermes-conversation",
+            "model_hint": model,
+            "tool_choice": tool_choice,
+            "messages": structured_messages,
+        }
+        if isinstance(tools, list) and tools:
+            payload["tools"] = tools
+
+        return "\n".join(
+            [
+                "You are being used as the active ACP agent backend for Hermes.",
+                "Use the structured JSON conversation payload below as the source of truth.",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                "Continue from the latest user request.",
+                "Return only the final answer. Start directly with the answer.",
+                "Do not narrate tool use, planning, reasoning, or intermediate checks.",
+                "Do not echo tool transcripts verbatim.",
+            ]
+        )
 
     def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
         del model
@@ -815,6 +883,16 @@ def _format_messages_as_prompt(
     return "\n\n".join(section.strip() for section in sections if section and section.strip())
 
 
+def _strip_devin_artifacts(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+    cleaned = re.sub(r"\s*<ref_[^>]+/>\s*", " ", text)
+    cleaned = re.sub(r"\s*<ref_[^>]+>.*?</ref_[^>]+>\s*", " ", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _render_message_content(content: Any) -> str:
     if content is None:
         return ""
@@ -969,6 +1047,9 @@ class CopilotACPClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self._last_acp_session_updates: list[dict[str, Any]] = []
+        self._last_acp_tool_trace: list[dict[str, Any]] = []
+        self._last_acp_reasoning_trace: list[str] = []
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -998,7 +1079,7 @@ class CopilotACPClient:
         **_: Any,
     ) -> Any:
         effective_tools = self._provider_adapter.prompt_tools(tools)
-        prompt_text = _format_messages_as_prompt(
+        prompt_text = self._provider_adapter.format_prompt(
             messages or [],
             model=model,
             tools=effective_tools,
@@ -1034,12 +1115,21 @@ class CopilotACPClient:
             total_tokens=0,
             prompt_tokens_details=SimpleNamespace(cached_tokens=0),
         )
+        if self._provider_adapter.exposes_reasoning():
+            exposed_reasoning = reasoning_text or None
+        else:
+            exposed_reasoning = None
         assistant_message = SimpleNamespace(
-            content=cleaned_text,
+            content=_strip_devin_artifacts(cleaned_text),
             tool_calls=tool_calls,
-            reasoning=reasoning_text or None,
-            reasoning_content=reasoning_text or None,
+            reasoning=exposed_reasoning,
+            reasoning_content=exposed_reasoning,
             reasoning_details=None,
+            provider_data={
+                "acp_session_updates": self._last_acp_session_updates or None,
+                "acp_tool_trace": self._last_acp_tool_trace or None,
+                "acp_reasoning_trace": self._last_acp_reasoning_trace or None,
+            },
         )
         finish_reason = "tool_calls" if tool_calls else "stop"
         choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
@@ -1104,6 +1194,8 @@ class CopilotACPClient:
 
         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)
+        session_updates: list[dict[str, Any]] = []
+        tool_trace: list[dict[str, Any]] = []
 
         def _stdout_reader() -> None:
             if proc.stdout is None:
@@ -1155,6 +1247,8 @@ class CopilotACPClient:
                     cwd=self._acp_cwd,
                     text_parts=text_parts,
                     reasoning_parts=reasoning_parts,
+                    session_updates=session_updates,
+                    tool_trace=tool_trace,
                 ):
                     continue
 
@@ -1215,6 +1309,9 @@ class CopilotACPClient:
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
             )
+            self._last_acp_session_updates = session_updates
+            self._last_acp_tool_trace = tool_trace
+            self._last_acp_reasoning_trace = reasoning_parts
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
             self.close()
@@ -1228,6 +1325,8 @@ class CopilotACPClient:
         cwd: str,
         text_parts: list[str] | None,
         reasoning_parts: list[str] | None,
+        session_updates: list[dict[str, Any]] | None = None,
+        tool_trace: list[dict[str, Any]] | None = None,
     ) -> bool:
         method = msg.get("method")
         if not isinstance(method, str):
@@ -1241,6 +1340,39 @@ class CopilotACPClient:
             chunk_text = ""
             if isinstance(content, dict):
                 chunk_text = str(content.get("text") or "")
+            if session_updates is not None:
+                session_updates.append(
+                    {
+                        "session_id": params.get("sessionId"),
+                        "kind": kind,
+                        "update": update,
+                    }
+                )
+            if tool_trace is not None:
+                if kind == "tool_call":
+                    tool_trace.append(
+                        {
+                            "event": "tool_call",
+                            "session_id": params.get("sessionId"),
+                            "tool_call_id": update.get("toolCallId"),
+                            "title": update.get("title"),
+                            "tool_kind": update.get("kind"),
+                            "raw_input": update.get("rawInput"),
+                            "content": update.get("content"),
+                            "_meta": update.get("_meta"),
+                        }
+                    )
+                elif kind == "tool_call_update":
+                    tool_trace.append(
+                        {
+                            "event": "tool_call_update",
+                            "session_id": params.get("sessionId"),
+                            "tool_call_id": update.get("toolCallId"),
+                            "status": update.get("status"),
+                            "content": update.get("content"),
+                            "_meta": update.get("_meta"),
+                        }
+                    )
             if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
                 text_parts.append(chunk_text)
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:

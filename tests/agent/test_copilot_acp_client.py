@@ -594,3 +594,94 @@ def test_create_chat_completion_includes_tools_and_extracts_tool_calls(tmp_path)
     assert response.choices[0].message.tool_calls
     assert response.choices[0].finish_reason == "tool_calls"
     assert response.choices[0].message.tool_calls[0].function.name == "read_file"
+
+
+def test_devin_prompt_uses_structured_json_payload(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    captured = {}
+
+    def _fake_run_prompt(prompt_text, **kwargs):
+        captured["prompt"] = prompt_text
+        return ("Done. <ref_file file=\"/tmp/x.txt\" />", "reasoning text")
+
+    with _patch.object(client._provider_adapter, "prompt_tools", return_value=tools):
+        with _patch.object(client, "_run_prompt", side_effect=_fake_run_prompt):
+            response = client._create_chat_completion(
+                model="swe-1.6-fast",
+                messages=[
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Read /tmp/x.txt"},
+                ],
+                tools=tools,
+            )
+
+    prompt_text = captured["prompt"]
+    assert "\"type\": \"hermes-conversation\"" in prompt_text
+    assert "\"role\": \"system\"" in prompt_text
+    assert "\"role\": \"user\"" in prompt_text
+    assert "\"name\": \"read_file\"" in prompt_text
+    assert response.choices[0].message.content == "Done."
+    assert response.choices[0].message.reasoning is None
+    provider_data = response.choices[0].message.provider_data
+    assert provider_data["acp_session_updates"] is None
+    assert provider_data["acp_tool_trace"] is None
+
+
+def test_devin_session_update_tool_events_are_captured_structurally(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+    process = _FakeProcess()
+    session_updates = []
+    tool_trace = []
+
+    handled = client._handle_server_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool-1",
+                    "title": "Ran command",
+                    "kind": "execute",
+                    "rawInput": {"command": "echo hello"},
+                    "content": [{"type": "content", "content": {"type": "text", "text": "hello"}}],
+                    "_meta": {"cognition.ai/inferenceToolName": "exec"},
+                },
+            },
+        },
+        process=process,
+        cwd=str(tmp_path),
+        text_parts=[],
+        reasoning_parts=[],
+        session_updates=session_updates,
+        tool_trace=tool_trace,
+    )
+
+    assert handled is True
+    assert session_updates[0]["kind"] == "tool_call"
+    assert tool_trace[0]["event"] == "tool_call"
+    assert tool_trace[0]["tool_call_id"] == "tool-1"
+    assert tool_trace[0]["raw_input"] == {"command": "echo hello"}
