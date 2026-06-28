@@ -58,6 +58,9 @@ class TestToolKindMap:
     def test_tool_kind_skill_view(self):
         assert get_tool_kind("skill_view") == "read"
 
+    def test_tool_kind_mcp_prefixed_skill_view(self):
+        assert get_tool_kind("mcp__hermes__skill_view") == "read"
+
     def test_tool_kind_browser_navigate(self):
         assert get_tool_kind("browser_navigate") == "fetch"
 
@@ -118,6 +121,10 @@ class TestBuildToolTitle:
 
     def test_skill_view_title_includes_skill_name(self):
         title = build_tool_title("skill_view", {"name": "github-pitfalls"})
+        assert title == "skill view (github-pitfalls)"
+
+    def test_mcp_prefixed_skill_view_title_includes_skill_name(self):
+        title = build_tool_title("mcp__hermes__skill_view", {"name": "github-pitfalls"})
         assert title == "skill view (github-pitfalls)"
 
     def test_skill_view_title_includes_linked_file(self):
@@ -257,6 +264,12 @@ class TestBuildToolStart:
         assert "github-pitfalls" in result.content[0].content.text
         assert result.raw_input is None
 
+    def test_build_tool_start_for_mcp_prefixed_skill_view_is_human_readable(self):
+        result = build_tool_start("tc-skill", "mcp__hermes__skill_view", {"name": "github-pitfalls"})
+        assert result.title == "skill view (github-pitfalls)"
+        assert "github-pitfalls" in result.content[0].content.text
+        assert result.raw_input is None
+
     def test_build_tool_start_for_execute_code_shows_code_preview(self):
         result = build_tool_start("tc-code", "execute_code", {"code": "print('hello')"})
         assert result.kind == "execute"
@@ -326,6 +339,21 @@ class TestBuildToolComplete:
         result = build_tool_complete(
             "tc-skill",
             "skill_view",
+            '{"success":true,"name":"github-pitfalls","description":"GitHub gotchas","content":"# GitHub Pitfalls\\nUse gh carefully.","path":"github/github-pitfalls/SKILL.md"}',
+        )
+        text = result.content[0].content.text
+        assert "**Skill loaded**" in text
+        assert "`github-pitfalls`" in text
+        assert "GitHub gotchas" in text
+        assert "GitHub Pitfalls" in text
+        assert "Use gh carefully" not in text
+        assert "Full skill content is available to the agent" in text
+        assert result.raw_output is None
+
+    def test_build_tool_complete_for_mcp_prefixed_skill_view_summarizes_content_without_raw_json(self):
+        result = build_tool_complete(
+            "tc-skill",
+            "mcp__hermes__skill_view",
             '{"success":true,"name":"github-pitfalls","description":"GitHub gotchas","content":"# GitHub Pitfalls\\nUse gh carefully.","path":"github/github-pitfalls/SKILL.md"}',
         )
         text = result.content[0].content.text

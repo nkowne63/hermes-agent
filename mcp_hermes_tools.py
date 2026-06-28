@@ -88,20 +88,19 @@ def create_server(platform: str, task_id: str, session_id: str, cwd: str) -> Ser
         except Exception:
             pass
 
+    tools, enabled_toolsets, disabled_toolsets = _tool_definitions(platform)
+    enabled_tools = [
+        str((tool.get("function") or {}).get("name") or "")
+        for tool in tools
+        if isinstance(tool, dict)
+    ]
     @server.list_tools()
     async def _list_tools() -> list[types.Tool]:
-        tools, _, _ = _tool_definitions(platform)
         converted = [_mcp_tool_from_openai_schema(tool) for tool in tools]
         return [tool for tool in converted if tool is not None]
 
     @server.call_tool(validate_input=False)
     async def _call_tool(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
-        tools, enabled_toolsets, disabled_toolsets = _tool_definitions(platform)
-        enabled_tools = [
-            str((tool.get("function") or {}).get("name") or "")
-            for tool in tools
-            if isinstance(tool, dict)
-        ]
         if name not in enabled_tools:
             return types.CallToolResult(
                 isError=True,

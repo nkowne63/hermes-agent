@@ -28,6 +28,7 @@ from typing import Any
 from agent.file_safety import get_read_block_error, is_write_denied
 from agent.anthropic_adapter import normalize_model_name
 from agent.redact import redact_sensitive_text
+from acp_adapter.tools import normalize_hermes_tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -175,30 +176,29 @@ def _platform_tool_definitions(platform: str) -> list[dict[str, Any]]:
         return []
 
 
-def _hermes_mcp_tool_definitions() -> list[dict[str, Any]]:
-    """Return the tool schema surface exposed through the injected Hermes MCP server.
+def _hermes_mcp_tool_definitions(platform: str = "discord") -> list[dict[str, Any]]:
+    """Return the Hermes tool schema surface exposed through the injected MCP server.
 
-    ACP providers should see the same hermes-side tool surface that their
-    ``session/new`` payload injects. Returning the unprefixed platform tool
-    list here leaves native provider tools in play, which is exactly the
-    class of mix-up we want to avoid for Devin/Claude ACP.
+    ACP providers should see the same Hermes-side tool surface that the
+    target platform would normally expose, with MCP namespace prefixes
+    applied only at the wire boundary.
     """
     try:
-        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
         from model_tools import get_tool_definitions
     except Exception:
         return []
 
+    platform_defs = _platform_tool_definitions(platform)
     tool_defs = {
         td["function"]["name"]: td["function"]
-        for td in (get_tool_definitions(quiet_mode=True) or [])
+        for td in platform_defs
         if isinstance(td, dict)
         and td.get("type") == "function"
         and isinstance(td.get("function"), dict)
     }
 
     resolved: list[dict[str, Any]] = []
-    for name in EXPOSED_TOOLS:
+    for name in tool_defs:
         spec = tool_defs.get(name)
         if not spec:
             continue
@@ -316,6 +316,9 @@ class ACPProviderAdapter:
 
     def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         return tools
+
+    def initial_session_mode(self) -> str | None:
+        return None
 
     def format_prompt(
         self,
@@ -549,7 +552,7 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
     def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         if not self._hermes_tools_only():
             return tools
-        hermes_tools = _hermes_mcp_tool_definitions()
+        hermes_tools = _hermes_mcp_tool_definitions(self._tool_platform())
         resolved_tools = hermes_tools or tools
         logger.debug(
             "Devin ACP prompt tools: hermes_mcp=%d fallback=%d",
@@ -561,6 +564,11 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
                 "Devin ACP hermes MCP tool surface is empty; falling back to the provided tool list"
             )
         return resolved_tools
+
+    def initial_session_mode(self) -> str | None:
+        if self._hermes_tools_only() and self._use_hermes_mcp_bridge():
+            return "bypass"
+        return None
 
     def exposes_reasoning(self) -> bool:
         return False
@@ -806,7 +814,7 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
     def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         if not self._hermes_tools_only():
             return tools
-        hermes_tools = _hermes_mcp_tool_definitions()
+        hermes_tools = _hermes_mcp_tool_definitions(self._tool_platform())
         resolved_tools = hermes_tools or tools
         logger.debug(
             "Claude ACP prompt tools: hermes_mcp=%d fallback=%d",
@@ -818,6 +826,11 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
                 "Claude ACP hermes MCP tool surface is empty; falling back to the provided tool list"
             )
         return resolved_tools
+
+    def initial_session_mode(self) -> str | None:
+        if self._hermes_tools_only() and self._use_hermes_mcp_bridge():
+            return "bypass"
+        return None
 
     def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
         if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
@@ -924,7 +937,20 @@ def _build_devin_config_path(*, cwd: str, session_prefix: str) -> tuple[Path, li
         session_prefix=session_prefix,
         cwd=cwd,
     )
-    servers.setdefault("hermes", hermes_server)
+    hermes_server_config = {
+        key: value
+        for key, value in hermes_server.items()
+        if key != "name"
+    }
+    env_items = hermes_server_config.get("env")
+    if isinstance(env_items, list):
+        hermes_server_config["env"] = {
+            str(item.get("name")): item.get("value")
+            for item in env_items
+            if isinstance(item, dict)
+            and str(item.get("name") or "").strip()
+        }
+    servers.setdefault("hermes", hermes_server_config)
     merged["mcpServers"] = servers
 
     tmp = tempfile.NamedTemporaryFile(
@@ -1098,6 +1124,29 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
             )
         )
 
+    def _try_add_invoke(name: str, raw_args: str = "") -> None:
+        if not isinstance(name, str) or not name.strip():
+            return
+        args_text = raw_args.strip()
+        if not args_text:
+            fn_args = "{}"
+        else:
+            try:
+                json.loads(args_text)
+                fn_args = args_text
+            except Exception:
+                fn_args = json.dumps({"text": args_text}, ensure_ascii=False)
+        call_id = f"acp_call_{len(extracted)+1}"
+        extracted.append(
+            SimpleNamespace(
+                id=call_id,
+                call_id=call_id,
+                response_item_id=None,
+                type="function",
+                function=SimpleNamespace(name=name.strip(), arguments=fn_args),
+            )
+        )
+
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
         raw = m.group(1)
         _try_add_tool_call(raw)
@@ -1108,6 +1157,32 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
         for m in _TOOL_CALL_JSON_RE.finditer(text):
             raw = m.group(0)
             _try_add_tool_call(raw)
+            consumed_spans.append((m.start(), m.end()))
+
+    function_calls_pattern = re.compile(
+        r"<function_calls\b[^>]*>(.*?)</function_calls>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    invoke_pattern = re.compile(
+        r"<invoke\b([^>]*)>(.*?)</invoke>|<invoke\b([^>]*)/>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    for m in function_calls_pattern.finditer(text):
+        block = m.group(1) or ""
+        matched_invoke = False
+        for invoke in invoke_pattern.finditer(block):
+            attrs = invoke.group(1) or invoke.group(3) or ""
+            body = invoke.group(2) or ""
+            name_match = re.search(
+                r'name\s*=\s*["\']([^"\']+)["\']',
+                attrs,
+                flags=re.IGNORECASE,
+            )
+            if not name_match:
+                continue
+            _try_add_invoke(name_match.group(1), body)
+            matched_invoke = True
+        if matched_invoke:
             consumed_spans.append((m.start(), m.end()))
 
     if not consumed_spans:
@@ -1441,6 +1516,24 @@ class CopilotACPClient:
                     f"{self._provider_adapter.display_name} did not return a sessionId."
                 )
 
+            initial_mode = self._provider_adapter.initial_session_mode()
+            if initial_mode:
+                try:
+                    _request(
+                        "session/set_mode",
+                        {
+                            "sessionId": session_id,
+                            "modeId": initial_mode,
+                        },
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "%s session/set_mode(%s) failed; continuing anyway: %s",
+                        self._provider_adapter.display_name,
+                        initial_mode,
+                        exc,
+                    )
+
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             _request(
@@ -1621,14 +1714,14 @@ class CopilotACPClient:
             for key in ("cognition.ai/inferenceToolName", "inferenceToolName"):
                 value = meta.get(key)
                 if isinstance(value, str) and value.strip():
-                    return value.strip()
+                    return normalize_hermes_tool_name(value)
         for key in ("toolName", "tool_name", "name", "title"):
             value = update.get(key)
             if isinstance(value, str) and value.strip():
-                return value.strip()
+                return normalize_hermes_tool_name(value)
         kind = update.get("kind")
         if isinstance(kind, str) and kind.strip():
-            return kind.strip()
+            return normalize_hermes_tool_name(kind)
         return "acp_tool"
 
     @staticmethod

@@ -18,6 +18,14 @@ from acp.schema import (
 # Map hermes tool names -> ACP ToolKind
 # ---------------------------------------------------------------------------
 
+def normalize_hermes_tool_name(tool_name: str) -> str:
+    """Return the display/runtime Hermes tool name without MCP namespace noise."""
+    name = str(tool_name or "").strip()
+    while name.startswith("mcp__hermes__"):
+        name = name.removeprefix("mcp__hermes__")
+    return name
+
+
 TOOL_KIND_MAP: Dict[str, ToolKind] = {
     # File operations
     "read_file": "read",
@@ -80,6 +88,7 @@ _POLISHED_TOOLS = {
 
 def get_tool_kind(tool_name: str) -> ToolKind:
     """Return the ACP ToolKind for a hermes tool, defaulting to 'other'."""
+    tool_name = normalize_hermes_tool_name(tool_name)
     return TOOL_KIND_MAP.get(tool_name, "other")
 
 
@@ -90,6 +99,7 @@ def make_tool_call_id() -> str:
 
 def build_tool_title(tool_name: str, args: Dict[str, Any]) -> str:
     """Build a human-readable title for a tool call."""
+    tool_name = normalize_hermes_tool_name(tool_name)
     if tool_name == "terminal":
         cmd = args.get("command", "")
         if len(cmd) > 80:
@@ -873,6 +883,7 @@ def _build_polished_completion_content(
     result: Optional[str],
     function_args: Optional[Dict[str, Any]],
 ) -> Optional[List[Any]]:
+    tool_name = normalize_hermes_tool_name(tool_name)
     formatter = {
         "todo": lambda: _format_todo_result(result),
         "read_file": lambda: _format_read_file_result(result, function_args),
@@ -981,6 +992,7 @@ def _build_tool_complete_content(
     snapshot: Any = None,
 ) -> List[Any]:
     """Build structured ACP completion content, falling back to plain text."""
+    tool_name = normalize_hermes_tool_name(tool_name)
     display_result = result or ""
     if len(display_result) > 5000:
         display_result = display_result[:4900] + f"\n... ({len(result)} chars total, truncated)"
@@ -1022,6 +1034,7 @@ def build_tool_start(
     edit_diff: Any = None,
 ) -> ToolCallStart:
     """Create a ToolCallStart event for the given hermes tool invocation."""
+    tool_name = normalize_hermes_tool_name(tool_name)
     kind = get_tool_kind(tool_name)
     title = build_tool_title(tool_name, arguments)
     locations = extract_locations(arguments)
@@ -1254,6 +1267,7 @@ def build_tool_complete(
     snapshot: Any = None,
 ) -> ToolCallProgress:
     """Create a ToolCallUpdate (progress) event for a completed tool call."""
+    tool_name = normalize_hermes_tool_name(tool_name)
     kind = get_tool_kind(tool_name)
     if tool_name == "web_extract":
         error_text = _format_web_extract_result(result)

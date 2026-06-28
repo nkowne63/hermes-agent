@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import _extract_tool_calls_from_text
 from agent.copilot_acp_client import _resolve_command
 
 
@@ -677,6 +678,41 @@ def test_devin_prompt_uses_hermes_mcp_tools_only(tmp_path):
             assert client._provider_adapter.prompt_tools(original) == hermes_tools
 
 
+def test_devin_prompt_builds_mcp_tools_from_platform_tool_surface(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+    platform_tools = [
+        {"type": "function", "function": {"name": "read_file", "parameters": {}}},
+        {"type": "function", "function": {"name": "skills_list", "parameters": {}}},
+    ]
+
+    with _patch("agent.copilot_acp_client._platform_tool_definitions", return_value=platform_tools):
+        tools = client._provider_adapter.prompt_tools(None)
+
+    assert [tool["function"]["name"] for tool in tools] == [
+        "mcp__hermes__read_file",
+        "mcp__hermes__skills_list",
+    ]
+
+
+def test_devin_initial_session_mode_prefers_bypass_when_hermes_bridge_is_on(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        assert client._provider_adapter.initial_session_mode() == "bypass"
+
+
 def test_devin_session_update_tool_events_are_captured_structurally(tmp_path):
     client = CopilotACPClient(
         api_key="devin-acp",
@@ -768,6 +804,63 @@ def test_devin_session_update_tool_events_emit_progress(tmp_path):
     assert kwargs["session_id"] == "sess-1"
 
 
+def test_devin_session_update_mcp_tool_names_are_normalized_for_progress(tmp_path):
+    events = []
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+        tool_progress_callback=lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+    process = _FakeProcess()
+
+    handled = client._handle_server_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-2",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool-2",
+                    "title": "Skills list",
+                    "rawInput": {"category": "docs"},
+                    "_meta": {"cognition.ai/inferenceToolName": "mcp__hermes__skills_list"},
+                },
+            },
+        },
+        process=process,
+        cwd=str(tmp_path),
+        text_parts=[],
+        reasoning_parts=[],
+        session_updates=[],
+        tool_trace=[],
+        tool_progress_callback=client._tool_progress_callback,
+    )
+
+    assert handled is True
+    assert events
+    (event_name, tool_name, preview, args), kwargs = events[0]
+    assert event_name == "tool.started"
+    assert tool_name == "skills_list"
+    assert preview == "Skills list"
+    assert args == {"category": "docs"}
+    assert kwargs["tool_call_id"] == "tool-2"
+
+
+def test_extract_tool_calls_understands_function_calls_blocks():
+    tool_calls, cleaned = _extract_tool_calls_from_text(
+        "<function_calls><invoke name=\"mcp__hermes__skills_list\"></invoke></function_calls>\nDone."
+    )
+
+    assert cleaned == "Done."
+    assert tool_calls
+    assert tool_calls[0].function.name == "mcp__hermes__skills_list"
+    assert tool_calls[0].function.arguments == "{}"
+
+
 def test_devin_agent_config_is_json_permissions_and_mcpservers(tmp_path):
     client = CopilotACPClient(
         api_key="devin-acp",
@@ -793,6 +886,8 @@ def test_devin_agent_config_is_json_permissions_and_mcpservers(tmp_path):
 
     assert "hermes" in config["mcpServers"]
     assert config["mcpServers"]["hermes"]["command"]
+    assert isinstance(config["mcpServers"]["hermes"]["env"], dict)
+    assert config["mcpServers"]["hermes"]["env"]["HOME"]
     assert agent_config["permissions"]["allow"] == ["mcp__hermes__*"]
     assert agent_config["permissions"]["deny"] == [
         "Read(**)",
