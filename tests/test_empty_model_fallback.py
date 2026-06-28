@@ -30,6 +30,13 @@ class TestGetDefaultModelForProvider:
         # Custom providers don't have entries in _PROVIDER_MODELS
         assert get_default_model_for_provider("some-random-custom") == ""
 
+    def test_devin_acp_default_is_swe_1_6(self):
+        from hermes_cli.models import _PROVIDER_MODELS, get_default_model_for_provider
+
+        assert _PROVIDER_MODELS["devin-acp"][0] == "swe-1.6"
+        assert "swe-1.6-fast" not in _PROVIDER_MODELS["devin-acp"]
+        assert get_default_model_for_provider("devin-acp") == "swe-1.6"
+
     def test_nous_silent_default_is_not_the_expensive_flagship(self):
         """Nous Portal is a metered aggregator whose curated list is ordered
         most-capable-first, so entry [0] is the priciest flagship
@@ -80,6 +87,7 @@ class TestGatewayEmptyModelFallback:
 
         runner = object.__new__(GatewayRunner)
         runner._session_model_overrides = {}
+        runner._session_db = None
 
         # Mock _resolve_gateway_model to return empty string
         # Mock _resolve_runtime_agent_kwargs to return openai-codex provider
@@ -103,6 +111,7 @@ class TestGatewayEmptyModelFallback:
 
         runner = object.__new__(GatewayRunner)
         runner._session_model_overrides = {}
+        runner._session_db = None
 
         with patch("gateway.run._resolve_gateway_model", return_value="gpt-5.4"), \
              patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
@@ -121,6 +130,7 @@ class TestGatewayEmptyModelFallback:
 
         runner = object.__new__(GatewayRunner)
         runner._session_model_overrides = {}
+        runner._session_db = None
 
         with patch("gateway.run._resolve_gateway_model", return_value=""), \
              patch("gateway.run._resolve_runtime_agent_kwargs", return_value={

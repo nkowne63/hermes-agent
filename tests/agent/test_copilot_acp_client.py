@@ -148,6 +148,34 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.assertIn("error", response)
         self.assertFalse(outside.exists())
 
+    def test_acp_tool_preview_prefers_raw_input_over_generic_hermes_title(self) -> None:
+        preview = self.client._acp_tool_trace_preview(
+            {
+                "sessionUpdate": "tool_call",
+                "title": "Calling search_files from hermes",
+                "rawInput": {
+                    "path": "/home/nkowne63rt/.hermes/hermes-agent",
+                    "pattern": "nuxt3",
+                    "target": "files",
+                },
+            },
+            kind="tool_call",
+        )
+
+        self.assertEqual(preview, "/home/nkowne63rt/.hermes/hermes-agent")
+
+    def test_acp_tool_preview_uses_skill_name_from_raw_input(self) -> None:
+        preview = self.client._acp_tool_trace_preview(
+            {
+                "sessionUpdate": "tool_call",
+                "title": "Calling skill_view from hermes",
+                "rawInput": {"name": "agent-token-usage-analytics"},
+            },
+            kind="tool_call",
+        )
+
+        self.assertEqual(preview, "agent-token-usage-analytics")
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -275,7 +303,7 @@ def test_run_prompt_uses_devin_acp_subcommand_when_args_are_omitted(monkeypatch,
 
     with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
         with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
-            client._run_prompt("hello", model="swe-1.6-fast", timeout_seconds=1)
+            client._run_prompt("hello", model="swe-1.6", timeout_seconds=1)
 
     assert captured["cmd"][0] == "devin"
     assert captured["cmd"][1] == "--config"
@@ -310,6 +338,24 @@ def test_run_prompt_passes_devin_model_env_for_devin_acp(monkeypatch, tmp_path):
     assert captured["cmd"][5] == "acp"
     assert not Path(captured["cmd"][2]).exists()
     assert not Path(captured["cmd"][4]).exists()
+
+
+def test_run_prompt_defaults_devin_model_to_swe_1_6(monkeypatch, tmp_path):
+    captured = {}
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+            with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
+                client._run_prompt("hello", model=None, timeout_seconds=1)
+
+    assert captured["kwargs"]["env"]["DEVIN_MODEL"] == "swe-1.6"
 
 
 def test_devin_default_tools_only_attaches_hermes_mcp_and_restricts_native_tools(tmp_path):
@@ -690,7 +736,7 @@ def test_devin_prompt_uses_structured_json_payload(tmp_path):
     with _patch.object(client._provider_adapter, "prompt_tools", return_value=tools):
         with _patch.object(client, "_run_prompt", side_effect=_fake_run_prompt):
             response = client._create_chat_completion(
-                model="swe-1.6-fast",
+                model="swe-1.6",
                 messages=[
                     {"role": "system", "content": "You are helpful."},
                     {"role": "user", "content": "Read /tmp/x.txt"},
@@ -871,7 +917,7 @@ def test_devin_session_update_tool_events_emit_progress(tmp_path):
     (event_name, tool_name, preview, args), kwargs = events[0]
     assert event_name == "tool.started"
     assert tool_name == "read_file"
-    assert preview == "Read file"
+    assert preview == "/tmp/x.txt"
     assert args == {"path": "/tmp/x.txt"}
     assert kwargs["tool_call_id"] == "tool-1"
     assert kwargs["session_id"] == "sess-1"
@@ -918,7 +964,7 @@ def test_devin_session_update_mcp_tool_names_are_normalized_for_progress(tmp_pat
     (event_name, tool_name, preview, args), kwargs = events[0]
     assert event_name == "tool.started"
     assert tool_name == "skills_list"
-    assert preview == "Skills list"
+    assert preview == '{"category": "docs"}'
     assert args == {"category": "docs"}
     assert kwargs["tool_call_id"] == "tool-2"
 
@@ -1033,7 +1079,7 @@ def test_devin_agent_config_is_json_permissions_and_mcpservers(tmp_path):
         acp_cwd=str(tmp_path),
     )
 
-    args, cleanup = client._provider_adapter.subprocess_args(["acp"], model="swe-1.6-fast")
+    args, cleanup = client._provider_adapter.subprocess_args(["acp"], model="swe-1.6")
     assert args[:2] == ["--config", args[1]]
     config_path = Path(args[1])
     assert config_path.exists()

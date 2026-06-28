@@ -83,7 +83,7 @@ async def test_provider_fallback_session_error_sends_to_discord_session():
         source=source,
         from_provider="devin-acp",
         to_provider="openrouter",
-        from_model="swe-1.6-fast",
+        from_model="swe-1.6",
         to_model="qwen3:8b",
     )
 

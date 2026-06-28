@@ -399,7 +399,7 @@ class CopilotACPProviderAdapter(ACPProviderAdapter):
 
 class DevinACPProviderAdapter(ACPProviderAdapter):
     display_name = "Devin ACP"
-    default_model = "devin-acp"
+    default_model = "swe-1.6"
     marker_prefixes = ("acp://devin",)
     command_names = ("devin", "devin.exe")
     _DEFAULT_DENIED_TOOLS = [
@@ -486,7 +486,7 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         *,
         model: str | None,
     ) -> dict[str, str]:
-        model_value = (model or "").strip()
+        model_value = (model or self.default_model).strip()
         if model_value and model_value.lower() not in {"devin", "devin-acp"}:
             env["DEVIN_MODEL"] = model_value
         reasoning_effort = self._reasoning_effort()
@@ -1842,13 +1842,9 @@ class CopilotACPClient:
         chunk_text: str = "",
     ) -> str | None:
         candidates: list[str] = []
-        title = update.get("title")
-        if isinstance(title, str) and title.strip():
-            candidates.append(title.strip())
-
         raw_input = update.get("rawInput")
         if isinstance(raw_input, dict):
-            for key in ("path", "query", "command", "url", "text", "name", "goal"):
+            for key in ("path", "query", "command", "url", "text", "name", "goal", "pattern"):
                 value = raw_input.get(key)
                 if isinstance(value, str) and value.strip():
                     candidates.append(value.strip())
@@ -1860,6 +1856,20 @@ class CopilotACPClient:
                     pass
         elif raw_input is not None:
             candidates.append(str(raw_input))
+
+        title = update.get("title")
+        if isinstance(title, str) and title.strip():
+            title_text = title.strip()
+            # Devin MCP titles are often generic ("Calling search_files from
+            # hermes"). Prefer rawInput details for Discord progress when
+            # available, but keep the title as a fallback for tools without
+            # structured arguments.
+            if candidates:
+                lowered = title_text.lower()
+                if not (lowered.startswith("calling ") and " from hermes" in lowered):
+                    candidates.append(title_text)
+            else:
+                candidates.append(title_text)
 
         rendered = _render_message_content(update.get("content"))
         if rendered:

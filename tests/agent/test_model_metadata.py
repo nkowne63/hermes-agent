@@ -869,7 +869,7 @@ class TestGetModelContextLength:
         mock_endpoint_fetch.return_value = {}
 
         result = get_model_context_length(
-            "swe-1.6-fast",
+            "swe-1.6",
             base_url="acp://devin",
             api_key="devin-acp",
             provider="devin-acp",

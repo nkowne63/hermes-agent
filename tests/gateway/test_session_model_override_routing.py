@@ -146,7 +146,7 @@ def test_run_agent_prefers_session_override_for_acp_command_args(monkeypatch):
     )
     session_key = "agent:main:discord:dm"
     runner._session_model_overrides[session_key] = {
-        "model": "swe-1.6-fast",
+        "model": "swe-1.6",
         "provider": "devin-acp",
         "api_key": "devin-acp",
         "base_url": "acp://devin",

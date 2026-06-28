@@ -5,7 +5,7 @@ This is an intentionally live diagnostic script, not a unit test. It sends a
 fixed prompt through Hermes with:
 
 1. openai-codex/gpt-5.4-mini as the reference backend
-2. devin-acp/swe-1.6-fast as the ACP backend under test
+2. devin-acp/swe-1.6 as the ACP backend under test
 
 It records Hermes tool-progress callbacks, response text, and Devin CLI logs
 created during the run, then emits a JSON report with heuristic pass/fail
@@ -81,6 +81,18 @@ DEVIN_NATIVE_TOOLS = (
     "find_file_by_name",
     "mcp_list_servers",
     "mcp_list_tools",
+)
+
+GENERIC_HERMES_PREVIEW_RE = re.compile(r"^Calling\\s+.+\\s+from\\s+hermes$", re.IGNORECASE)
+PREVIEW_DETAIL_MARKERS = (
+    "/",
+    "nuxt",
+    "orchestrator",
+    "オーケストレータ",
+    "token",
+    "トークン",
+    "agent-token-usage",
+    "skill",
 )
 
 
@@ -204,11 +216,31 @@ def _summarise_tool_events(events: list[ToolEvent]) -> dict[str, Any]:
     names = [_normalise_tool_name(event.name) for event in events if event.name]
     hermes_like = sorted({name for name in names if any(hint in name for hint in HERMES_TOOL_HINTS)})
     native = sorted({name for name in names if name in DEVIN_NATIVE_TOOLS})
+    started_hermes = [
+        event
+        for event in events
+        if event.event_type == "tool.started"
+        and any(hint in _normalise_tool_name(event.name) for hint in HERMES_TOOL_HINTS)
+    ]
+    generic_previews = [
+        str(event.preview or "")
+        for event in started_hermes
+        if event.preview and GENERIC_HERMES_PREVIEW_RE.match(str(event.preview).strip())
+    ]
+    detailed_previews = [
+        str(event.preview or "")
+        for event in started_hermes
+        if event.preview
+        and not GENERIC_HERMES_PREVIEW_RE.match(str(event.preview).strip())
+        and any(marker.lower() in str(event.preview).lower() for marker in PREVIEW_DETAIL_MARKERS)
+    ]
     return {
         "count": len(events),
         "names": names,
         "hermes_like_names": hermes_like,
         "native_names": native,
+        "generic_hermes_previews": generic_previews,
+        "detailed_hermes_previews": detailed_previews,
         "events": [
             {
                 "event_type": event.event_type,
@@ -289,6 +321,8 @@ def _score_run(run: dict[str, Any], *, devin_logs: list[dict[str, Any]] | None =
     noisy = response.get("noisy_markers") or []
     hermes_like = tools.get("hermes_like_names") or []
     native_progress = tools.get("native_names") or []
+    generic_previews = tools.get("generic_hermes_previews") or []
+    detailed_previews = tools.get("detailed_hermes_previews") or []
     errors = [run.get("error"), (run.get("result_flags") or {}).get("error")]
     errors = [err for err in errors if err]
 
@@ -318,12 +352,16 @@ def _score_run(run: dict[str, Any], *, devin_logs: list[dict[str, Any]] | None =
             and not noisy
             and not errors
             and bool(hermes_like or log_hermes)
+            and bool(detailed_previews)
+            and not generic_previews
         ),
         "details": {
             "relevance_terms": response.get("matched_relevance_terms") or [],
             "noisy_markers": noisy,
             "tool_progress_hermes_like": hermes_like,
             "tool_progress_native": native_progress,
+            "tool_progress_generic_hermes_previews": generic_previews[:20],
+            "tool_progress_detailed_hermes_previews": detailed_previews[:20],
             "devin_log_hermes_tools": sorted(log_hermes),
             "devin_log_native_tools": sorted(log_native),
             "devin_log_cancellations": log_cancelled[:20],
@@ -339,7 +377,7 @@ def main() -> int:
     parser.add_argument("--baseline-provider", default="openai-codex")
     parser.add_argument("--baseline-model", default="gpt-5.4-mini")
     parser.add_argument("--devin-provider", default="devin-acp")
-    parser.add_argument("--devin-model", default="swe-1.6-fast")
+    parser.add_argument("--devin-model", default="swe-1.6")
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--max-iterations", type=int, default=12)
     parser.add_argument("--skip-baseline", action="store_true")

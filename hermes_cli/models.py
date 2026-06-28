@@ -243,9 +243,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "copilot-acp",
     ],
     "devin-acp": [
-        "glm-5.2",
-        "swe-1.6-fast",
         "swe-1.6",
+        "glm-5.2",
         "gpt-5.4-mini",
         "gpt-5.4",
         "claude-sonnet-4.5",

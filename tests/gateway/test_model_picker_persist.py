@@ -219,7 +219,7 @@ async def test_picker_tap_session_override_keeps_acp_launch_args(tmp_path, monke
         "hermes_cli.model_switch.switch_model",
         lambda **kw: types.SimpleNamespace(
             success=True,
-            new_model="swe-1.6-fast",
+            new_model="swe-1.6",
             target_provider="devin-acp",
             provider_changed=True,
             api_key="devin-acp",
