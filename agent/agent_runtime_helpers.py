@@ -1383,6 +1383,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     if agent.provider in {"copilot-acp", "devin-acp", "claude-acp"} or str(client_kwargs.get("base_url", "")).startswith("acp://"):
         from agent.copilot_acp_client import CopilotACPClient
 
+        client_kwargs["tool_progress_callback"] = getattr(agent, "tool_progress_callback", None)
         client = CopilotACPClient(**client_kwargs)
         _ra().logger.info(
             "ACP client created (%s, shared=%s) %s",

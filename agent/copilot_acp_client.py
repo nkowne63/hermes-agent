@@ -326,6 +326,14 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
     default_model = "devin-acp"
     marker_prefixes = ("acp://devin",)
     command_names = ("devin", "devin.exe")
+    _DEFAULT_DENIED_TOOLS = [
+        "Read(**)",
+        "Write(**)",
+        "Grep(**)",
+        "Glob(**)",
+        "Exec(**)",
+        "Fetch(**)",
+    ]
 
     def _settings(self) -> dict[str, Any]:
         return _load_acp_settings("devin", "devin_acp")
@@ -358,7 +366,7 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         if isinstance(raw, list):
             return [str(item).strip() for item in raw if str(item).strip()]
         if self._use_hermes_mcp_bridge():
-            return ["*"]
+            return list(self._DEFAULT_DENIED_TOOLS)
         # Without the Hermes MCP bridge, default-denying every native Devin tool
         # would leave the ACP session with no usable tools.
         return []
@@ -422,33 +430,26 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         if configured:
             return ["--agent-config", configured, *resolved], []
 
-        # The default allow-list targets a future/optional Hermes MCP bridge.
-        # Without an explicit deny list, passing only this allow-list still
-        # hides Devin's native tools while exposing no Hermes MCP tools.  In
-        # that default state, leave Devin's tool configuration alone and rely on
-        # the prompt-level Hermes tool schemas instead.
         if not self._restricts_native_tools():
             return resolved, []
-        allowed_tools = self._allowed_tools()
         deny_tools = self._deny_tools()
-        lines = ["allowed_tools:"]
-        lines.extend(f"  - {json.dumps(tool)}" for tool in allowed_tools)
-        lines.append("permissions:")
-        lines.append("  allow:")
-        lines.extend(f"    - {json.dumps(tool)}" for tool in allowed_tools)
+        cfg = {
+            "permissions": {
+                "allow": ["mcp__hermes__*"],
+            },
+        }
         if deny_tools:
-            lines.append("  deny:")
-            lines.extend(f"    - {json.dumps(tool)}" for tool in deny_tools)
+            cfg["permissions"]["deny"] = deny_tools
 
         tmp = tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",
             prefix="hermes-devin-acp-",
-            suffix=".yaml",
+            suffix=".json",
             delete=False,
         )
         with tmp:
-            tmp.write("\n".join(lines))
+            tmp.write(json.dumps(cfg, ensure_ascii=False, indent=2))
             tmp.write("\n")
         path = Path(tmp.name)
         return ["--agent-config", str(path), *resolved], [path]
@@ -572,7 +573,21 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
             ],
             "env": env,
         }
-        existing = list(merged.get("mcpServers") or [])
+        existing_raw = merged.get("mcpServers") or []
+        if isinstance(existing_raw, dict):
+            existing = [
+                dict(server)
+                for server in existing_raw.values()
+                if isinstance(server, dict)
+            ]
+        elif isinstance(existing_raw, list):
+            existing = [
+                dict(server)
+                for server in existing_raw
+                if isinstance(server, dict)
+            ]
+        else:
+            existing = []
         if not any(isinstance(server, dict) and server.get("name") == "hermes" for server in existing):
             existing.append(hermes_server)
         merged["mcpServers"] = existing
@@ -1031,6 +1046,7 @@ class CopilotACPClient:
         acp_cwd: str | None = None,
         command: str | None = None,
         args: list[str] | None = None,
+        tool_progress_callback: Any = None,
         **_: Any,
     ):
         self.api_key = api_key or "copilot-acp"
@@ -1047,6 +1063,7 @@ class CopilotACPClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self._tool_progress_callback = tool_progress_callback
         self._last_acp_session_updates: list[dict[str, Any]] = []
         self._last_acp_tool_trace: list[dict[str, Any]] = []
         self._last_acp_reasoning_trace: list[str] = []
@@ -1249,6 +1266,7 @@ class CopilotACPClient:
                     reasoning_parts=reasoning_parts,
                     session_updates=session_updates,
                     tool_trace=tool_trace,
+                    tool_progress_callback=self._tool_progress_callback,
                 ):
                     continue
 
@@ -1327,6 +1345,7 @@ class CopilotACPClient:
         reasoning_parts: list[str] | None,
         session_updates: list[dict[str, Any]] | None = None,
         tool_trace: list[dict[str, Any]] | None = None,
+        tool_progress_callback: Any = None,
     ) -> bool:
         method = msg.get("method")
         if not isinstance(method, str):
@@ -1373,6 +1392,23 @@ class CopilotACPClient:
                             "_meta": update.get("_meta"),
                         }
                     )
+            if tool_progress_callback is not None and kind in {"tool_call", "tool_call_update"}:
+                tool_name = self._acp_tool_trace_name(update)
+                preview = self._acp_tool_trace_preview(update, kind=kind, chunk_text=chunk_text)
+                args = self._acp_tool_trace_args(update)
+                try:
+                    tool_progress_callback(
+                        "tool.started",
+                        tool_name,
+                        preview,
+                        args,
+                        session_id=params.get("sessionId"),
+                        tool_call_id=update.get("toolCallId"),
+                        status=update.get("status"),
+                        kind=kind,
+                    )
+                except Exception:
+                    logger.debug("ACP tool_progress_callback failed", exc_info=True)
             if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
                 text_parts.append(chunk_text)
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
@@ -1447,3 +1483,72 @@ class CopilotACPClient:
         process.stdin.write(json.dumps(response) + "\n")
         process.stdin.flush()
         return True
+
+    @staticmethod
+    def _acp_tool_trace_name(update: dict[str, Any]) -> str:
+        meta = update.get("_meta")
+        if isinstance(meta, dict):
+            for key in ("cognition.ai/inferenceToolName", "inferenceToolName"):
+                value = meta.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        for key in ("toolName", "tool_name", "name", "title"):
+            value = update.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        kind = update.get("kind")
+        if isinstance(kind, str) and kind.strip():
+            return kind.strip()
+        return "acp_tool"
+
+    @staticmethod
+    def _acp_tool_trace_args(update: dict[str, Any]) -> dict[str, Any] | None:
+        raw = update.get("rawInput")
+        if isinstance(raw, dict):
+            return raw
+        if raw is None:
+            return None
+        return {"rawInput": raw}
+
+    @staticmethod
+    def _acp_tool_trace_preview(
+        update: dict[str, Any],
+        *,
+        kind: str,
+        chunk_text: str = "",
+    ) -> str | None:
+        candidates: list[str] = []
+        title = update.get("title")
+        if isinstance(title, str) and title.strip():
+            candidates.append(title.strip())
+
+        raw_input = update.get("rawInput")
+        if isinstance(raw_input, dict):
+            for key in ("path", "query", "command", "url", "text", "name", "goal"):
+                value = raw_input.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidates.append(value.strip())
+                    break
+            else:
+                try:
+                    candidates.append(json.dumps(raw_input, ensure_ascii=False))
+                except Exception:
+                    pass
+        elif raw_input is not None:
+            candidates.append(str(raw_input))
+
+        rendered = _render_message_content(update.get("content"))
+        if rendered:
+            candidates.append(rendered)
+        if chunk_text.strip():
+            candidates.append(chunk_text.strip())
+        if kind == "tool_call_update":
+            status = update.get("status")
+            if isinstance(status, str) and status.strip():
+                candidates.append(status.strip())
+
+        for candidate in candidates:
+            candidate = " ".join(str(candidate).split()).strip()
+            if candidate:
+                return candidate[:177] + "..." if len(candidate) > 180 else candidate
+        return None

@@ -685,3 +685,81 @@ def test_devin_session_update_tool_events_are_captured_structurally(tmp_path):
     assert tool_trace[0]["event"] == "tool_call"
     assert tool_trace[0]["tool_call_id"] == "tool-1"
     assert tool_trace[0]["raw_input"] == {"command": "echo hello"}
+
+
+def test_devin_session_update_tool_events_emit_progress(tmp_path):
+    events = []
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+        tool_progress_callback=lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+    process = _FakeProcess()
+
+    handled = client._handle_server_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool-1",
+                    "title": "Read file",
+                    "rawInput": {"path": "/tmp/x.txt"},
+                    "_meta": {"cognition.ai/inferenceToolName": "read_file"},
+                },
+            },
+        },
+        process=process,
+        cwd=str(tmp_path),
+        text_parts=[],
+        reasoning_parts=[],
+        session_updates=[],
+        tool_trace=[],
+        tool_progress_callback=client._tool_progress_callback,
+    )
+
+    assert handled is True
+    assert events
+    (event_name, tool_name, preview, args), kwargs = events[0]
+    assert event_name == "tool.started"
+    assert tool_name == "read_file"
+    assert preview == "Read file"
+    assert args == {"path": "/tmp/x.txt"}
+    assert kwargs["tool_call_id"] == "tool-1"
+    assert kwargs["session_id"] == "sess-1"
+
+
+def test_devin_agent_config_is_json_permissions_and_mcpservers(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    args, cleanup = client._provider_adapter.subprocess_args(["acp"], model="swe-1.6-fast")
+    assert args[:2] == ["--agent-config", args[1]]
+    config_path = Path(args[1])
+    assert config_path.exists()
+    try:
+        config = json.loads(config_path.read_text())
+    finally:
+        for path in cleanup:
+            path.unlink(missing_ok=True)
+        config_path.unlink(missing_ok=True)
+
+    assert config["permissions"]["allow"] == ["mcp__hermes__*"]
+    assert config["permissions"]["deny"] == [
+        "Read(**)",
+        "Write(**)",
+        "Grep(**)",
+        "Glob(**)",
+        "Exec(**)",
+        "Fetch(**)",
+    ]
