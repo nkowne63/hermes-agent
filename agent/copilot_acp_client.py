@@ -81,7 +81,17 @@ def _resolve_command(base_url: str | None = None) -> str:
         or "copilot"
     )
 
-def _resolve_args() -> list[str]:
+def _resolve_args(base_url: str | None = None) -> list[str]:
+    marker = (base_url or "").strip().lower()
+    if marker.startswith("acp://devin"):
+        raw = os.getenv("HERMES_DEVIN_ACP_ARGS", "").strip()
+        return shlex.split(raw) if raw else ["acp"]
+    if marker.startswith("acp://claude"):
+        raw = os.getenv("HERMES_CLAUDE_ACP_ARGS", "").strip()
+        if raw:
+            return shlex.split(raw)
+        return ["@agentclientprotocol/claude-agent-acp"]
+
     raw = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
     if not raw:
         return ["--acp", "--stdio"]
@@ -1257,7 +1267,7 @@ class CopilotACPClient:
         self.base_url = base_url or ACP_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command(base_url)
-        self._acp_args = list(acp_args or args or _resolve_args())
+        self._acp_args = list(acp_args or args or _resolve_args(base_url))
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self._provider_adapter = _resolve_acp_provider_adapter(
             base_url=self.base_url,

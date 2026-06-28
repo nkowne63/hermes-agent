@@ -262,6 +262,30 @@ def test_run_prompt_uses_provider_specific_default_command_for_devin_acp(monkeyp
     assert not Path(captured["cmd"][4]).exists()
 
 
+def test_run_prompt_uses_devin_acp_subcommand_when_args_are_omitted(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_DEVIN_ACP_ARGS", raising=False)
+
+    captured = {}
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
+            client._run_prompt("hello", model="swe-1.6-fast", timeout_seconds=1)
+
+    assert captured["cmd"][0] == "devin"
+    assert captured["cmd"][1] == "--config"
+    assert captured["cmd"][3] == "--agent-config"
+    assert captured["cmd"][5:7] == ["--permission-mode", "dangerous"]
+    assert captured["cmd"][7] == "acp"
+    assert not Path(captured["cmd"][2]).exists()
+    assert not Path(captured["cmd"][4]).exists()
+
+
 def test_run_prompt_passes_devin_model_env_for_devin_acp(monkeypatch, tmp_path):
     monkeypatch.delenv("DEVIN_MODEL", raising=False)
     monkeypatch.delenv("DEVIN_REASONING_EFFORT", raising=False)
