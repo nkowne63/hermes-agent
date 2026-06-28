@@ -253,8 +253,12 @@ def test_run_prompt_uses_provider_specific_default_command_for_devin_acp(monkeyp
             client._run_prompt("hello", model="opus", timeout_seconds=1)
 
     assert captured["cmd"][0] == "devin"
-    assert captured["cmd"][1] == "--agent-config"
-    assert captured["cmd"][-1] == "acp"
+    assert captured["cmd"][1] == "--config"
+    assert captured["cmd"][3] == "--agent-config"
+    assert captured["cmd"][5:7] == ["--permission-mode", "dangerous"]
+    assert captured["cmd"][7] == "acp"
+    assert not Path(captured["cmd"][2]).exists()
+    assert not Path(captured["cmd"][4]).exists()
 
 
 def test_run_prompt_passes_devin_model_env_for_devin_acp(monkeypatch, tmp_path):
@@ -277,9 +281,12 @@ def test_run_prompt_passes_devin_model_env_for_devin_acp(monkeypatch, tmp_path):
 
     assert captured["kwargs"]["env"]["DEVIN_MODEL"] == "opus"
     assert captured["kwargs"]["env"]["DEVIN_REASONING_EFFORT"] == "low"
-    assert captured["cmd"][:2] == ["devin", "--agent-config"]
-    assert captured["cmd"][3:] == ["acp"]
+    assert captured["cmd"][:2] == ["devin", "--config"]
+    assert captured["cmd"][3] == "--agent-config"
+    assert captured["cmd"][5:7] == ["--permission-mode", "dangerous"]
+    assert captured["cmd"][7] == "acp"
     assert not Path(captured["cmd"][2]).exists()
+    assert not Path(captured["cmd"][4]).exists()
 
 
 def test_devin_default_tools_only_attaches_hermes_mcp_and_restricts_native_tools(tmp_path):
@@ -293,27 +300,19 @@ def test_devin_default_tools_only_attaches_hermes_mcp_and_restricts_native_tools
 
     with _patch.object(client._provider_adapter, "_settings", return_value={}):
         args, cleanup = client._provider_adapter.subprocess_args(["acp"], model="opus")
-        assert args[:2] == ["--agent-config", args[1]]
-        assert args[2:] == ["acp"]
-        assert cleanup and cleanup[0] == Path(args[1])
-        assert "mcp__hermes__*" in cleanup[0].read_text(encoding="utf-8")
+        assert args[:2] == ["--config", args[1]]
+        assert args[2:4] == ["--agent-config", args[3]]
+        assert args[4:6] == ["--permission-mode", "dangerous"]
+        assert args[6:] == ["acp"]
+        assert cleanup and Path(args[1]) in cleanup and Path(args[3]) in cleanup
+        devin_config = json.loads(Path(args[1]).read_text(encoding="utf-8"))
+        assert "hermes" in devin_config["mcpServers"]
+        assert devin_config["mcpServers"]["hermes"]["command"]
+        assert "mcp__hermes__*" in Path(args[3]).read_text(encoding="utf-8")
         assert client._provider_adapter.client_capabilities() == {}
         assert client._provider_adapter.supports_client_method("fs/read_text_file") is False
         for path in cleanup:
             path.unlink(missing_ok=True)
-
-        params = client._provider_adapter.session_new_params(
-            {"cwd": str(tmp_path), "mcpServers": []},
-            model="opus",
-        )
-        servers = params["mcpServers"]
-        assert len(servers) == 1
-        assert servers[0]["name"] == "hermes"
-        assert servers[0]["command"]
-        assert "mcp_hermes_tools.py" in servers[0]["args"][0]
-        assert "--platform" in servers[0]["args"]
-        env = {item["name"]: item["value"] for item in servers[0]["env"]}
-        assert env["HERMES_MCP_TOOL_PLATFORM"] == "discord"
 
 
 def test_devin_mcp_bridge_can_be_disabled_to_keep_native_tools(tmp_path):
@@ -346,13 +345,17 @@ def test_devin_explicit_deny_tools_generates_agent_config(tmp_path):
             with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
                 client._run_prompt("hello", model="opus", timeout_seconds=1)
 
-    assert captured["cmd"][:3] == [
+    assert captured["cmd"][:5] == [
         "devin",
-        "--agent-config",
+        "--config",
         captured["cmd"][2],
+        "--agent-config",
+        captured["cmd"][4],
     ]
-    assert captured["cmd"][3:] == ["acp"]
+    assert captured["cmd"][5:7] == ["--permission-mode", "dangerous"]
+    assert captured["cmd"][7] == "acp"
     assert not Path(captured["cmd"][2]).exists()
+    assert not Path(captured["cmd"][4]).exists()
 
 
 def test_run_prompt_does_not_pass_sentinel_model_as_devin_model(monkeypatch, tmp_path):
@@ -396,7 +399,16 @@ def test_run_prompt_uses_configured_devin_agent_config(monkeypatch, tmp_path):
             with pytest.raises(RuntimeError, match="Could not start Devin ACP command"):
                 client._run_prompt("hello", model="opus", timeout_seconds=1)
 
-    assert captured["cmd"] == ["devin", "--agent-config", str(configured), "acp"]
+    assert captured["cmd"] == [
+        "devin",
+        "--config",
+        captured["cmd"][2],
+        "--agent-config",
+        str(configured),
+        "--permission-mode",
+        "dangerous",
+        "acp",
+    ]
 
 
 def test_devin_explicit_tools_only_disables_fs_client_capabilities(tmp_path):
@@ -527,7 +539,7 @@ def test_claude_mcp_bridge_can_be_disabled_to_keep_native_tools(tmp_path):
         assert client._provider_adapter.supports_client_method("fs/read_text_file") is True
 
 
-def test_acp_tools_only_uses_discord_platform_tools(tmp_path):
+def test_acp_tools_only_uses_hermes_mcp_tools(tmp_path):
     client = CopilotACPClient(
         api_key="claude-acp",
         base_url="acp://claude",
@@ -538,13 +550,14 @@ def test_acp_tools_only_uses_discord_platform_tools(tmp_path):
     original = [
         {"type": "function", "function": {"name": "terminal", "parameters": {}}},
     ]
-    discord_tools = [
-        {"type": "function", "function": {"name": "discord", "parameters": {}}},
+    hermes_tools = [
+        {"type": "function", "function": {"name": "mcp__hermes__skill_view", "parameters": {}}},
+        {"type": "function", "function": {"name": "mcp__hermes__skills_list", "parameters": {}}},
     ]
 
     with _patch.object(client._provider_adapter, "_settings", return_value={}):
-        with _patch("agent.copilot_acp_client._platform_tool_definitions", return_value=discord_tools):
-            assert client._provider_adapter.prompt_tools(original) == discord_tools
+        with _patch("agent.copilot_acp_client._hermes_mcp_tool_definitions", return_value=hermes_tools):
+            assert client._provider_adapter.prompt_tools(original) == hermes_tools
 
 
 def test_create_chat_completion_includes_tools_and_extracts_tool_calls(tmp_path):
@@ -641,6 +654,27 @@ def test_devin_prompt_uses_structured_json_payload(tmp_path):
     provider_data = response.choices[0].message.provider_data
     assert provider_data["acp_session_updates"] is None
     assert provider_data["acp_tool_trace"] is None
+
+
+def test_devin_prompt_uses_hermes_mcp_tools_only(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+    original = [
+        {"type": "function", "function": {"name": "terminal", "parameters": {}}},
+    ]
+    hermes_tools = [
+        {"type": "function", "function": {"name": "mcp__hermes__skill_view", "parameters": {}}},
+        {"type": "function", "function": {"name": "mcp__hermes__skills_list", "parameters": {}}},
+    ]
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        with _patch("agent.copilot_acp_client._hermes_mcp_tool_definitions", return_value=hermes_tools):
+            assert client._provider_adapter.prompt_tools(original) == hermes_tools
 
 
 def test_devin_session_update_tool_events_are_captured_structurally(tmp_path):
@@ -744,22 +778,32 @@ def test_devin_agent_config_is_json_permissions_and_mcpservers(tmp_path):
     )
 
     args, cleanup = client._provider_adapter.subprocess_args(["acp"], model="swe-1.6-fast")
-    assert args[:2] == ["--agent-config", args[1]]
+    assert args[:2] == ["--config", args[1]]
     config_path = Path(args[1])
     assert config_path.exists()
     try:
         config = json.loads(config_path.read_text())
+        agent_config_path = Path(args[3])
+        agent_config = json.loads(agent_config_path.read_text())
     finally:
         for path in cleanup:
             path.unlink(missing_ok=True)
         config_path.unlink(missing_ok=True)
+        agent_config_path.unlink(missing_ok=True)
 
-    assert config["permissions"]["allow"] == ["mcp__hermes__*"]
-    assert config["permissions"]["deny"] == [
+    assert "hermes" in config["mcpServers"]
+    assert config["mcpServers"]["hermes"]["command"]
+    assert agent_config["permissions"]["allow"] == ["mcp__hermes__*"]
+    assert agent_config["permissions"]["deny"] == [
         "Read(**)",
         "Write(**)",
         "Grep(**)",
         "Glob(**)",
         "Exec(**)",
         "Fetch(**)",
+        "skill",
+        "mcp_list_tools",
+        "mcp_list_servers",
+        "mcp_list_resources",
+        "mcp_list_prompts",
     ]

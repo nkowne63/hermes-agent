@@ -139,6 +139,20 @@ def _load_acp_settings(provider_key: str, legacy_key: str) -> dict[str, Any]:
     return merged
 
 
+def _load_json_file(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _platform_tool_definitions(platform: str) -> list[dict[str, Any]]:
     platform = (platform or "").strip()
     if not platform:
@@ -159,6 +173,55 @@ def _platform_tool_definitions(platform: str) -> list[dict[str, Any]]:
         )
     except Exception:
         return []
+
+
+def _hermes_mcp_tool_definitions() -> list[dict[str, Any]]:
+    """Return the tool schema surface exposed through the injected Hermes MCP server.
+
+    ACP providers should see the same hermes-side tool surface that their
+    ``session/new`` payload injects. Returning the unprefixed platform tool
+    list here leaves native provider tools in play, which is exactly the
+    class of mix-up we want to avoid for Devin/Claude ACP.
+    """
+    try:
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+        from model_tools import get_tool_definitions
+    except Exception:
+        return []
+
+    tool_defs = {
+        td["function"]["name"]: td["function"]
+        for td in (get_tool_definitions(quiet_mode=True) or [])
+        if isinstance(td, dict)
+        and td.get("type") == "function"
+        and isinstance(td.get("function"), dict)
+    }
+
+    resolved: list[dict[str, Any]] = []
+    for name in EXPOSED_TOOLS:
+        spec = tool_defs.get(name)
+        if not spec:
+            continue
+        tool_name = str(spec.get("name") or name).strip()
+        if not tool_name:
+            tool_name = name
+        if tool_name.startswith("mcp__hermes__"):
+            pass
+        elif tool_name.startswith("mcp__"):
+            tool_name = f"mcp__hermes__{tool_name.removeprefix('mcp__')}"
+        else:
+            tool_name = f"mcp__hermes__{tool_name}"
+        resolved.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "description": spec.get("description") or f"Hermes MCP tool {name}",
+                    "parameters": spec.get("parameters") or {"type": "object", "properties": {}},
+                },
+            }
+        )
+    return resolved
 
 
 def _build_hermes_mcp_server(*, platform: str, session_prefix: str, cwd: str) -> dict[str, Any]:
@@ -333,6 +396,11 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         "Glob(**)",
         "Exec(**)",
         "Fetch(**)",
+        "skill",
+        "mcp_list_tools",
+        "mcp_list_servers",
+        "mcp_list_resources",
+        "mcp_list_prompts",
     ]
 
     def _settings(self) -> dict[str, Any]:
@@ -421,17 +489,30 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
     ) -> tuple[list[str], list[Path]]:
         del model
         resolved = list(args)
-        if not self._hermes_tools_only():
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
             return resolved, []
+        if "--config" in resolved:
+            return resolved, []
+        if "--permission-mode" in resolved:
+            permission_mode_args: list[str] = []
+        else:
+            permission_mode_args = ["--permission-mode", "dangerous"]
+
+        cleanup_paths: list[Path] = []
+        devin_config_path, config_cleanup = _build_devin_config_path(
+            cwd=getattr(self, "_acp_cwd", os.getcwd()),
+            session_prefix="devin-acp",
+        )
+        cleanup_paths.extend(config_cleanup)
+
         if "--agent-config" in resolved:
-            return resolved, []
+            return ["--config", str(devin_config_path), *resolved], cleanup_paths
 
         configured = self._agent_config_path()
         if configured:
-            return ["--agent-config", configured, *resolved], []
-
+            return ["--config", str(devin_config_path), "--agent-config", configured, *permission_mode_args, *resolved], cleanup_paths
         if not self._restricts_native_tools():
-            return resolved, []
+            return ["--config", str(devin_config_path), *permission_mode_args, *resolved], cleanup_paths
         deny_tools = self._deny_tools()
         cfg = {
             "permissions": {
@@ -452,7 +533,8 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
             tmp.write(json.dumps(cfg, ensure_ascii=False, indent=2))
             tmp.write("\n")
         path = Path(tmp.name)
-        return ["--agent-config", str(path), *resolved], [path]
+        cleanup_paths.append(path)
+        return ["--config", str(devin_config_path), "--agent-config", str(path), *permission_mode_args, *resolved], cleanup_paths
 
     def client_capabilities(self) -> dict[str, Any]:
         if self._restricts_native_tools():
@@ -467,12 +549,17 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
     def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         if not self._hermes_tools_only():
             return tools
-        resolved_tools = _platform_tool_definitions(self._tool_platform()) or tools
+        hermes_tools = _hermes_mcp_tool_definitions()
+        resolved_tools = hermes_tools or tools
         logger.debug(
-            "Devin ACP prompt tools: platform=%s count=%d",
-            self._tool_platform(),
-            len(resolved_tools or []),
+            "Devin ACP prompt tools: hermes_mcp=%d fallback=%d",
+            len(hermes_tools),
+            len(tools or []),
         )
+        if not resolved_tools:
+            logger.warning(
+                "Devin ACP hermes MCP tool surface is empty; falling back to the provided tool list"
+            )
         return resolved_tools
 
     def exposes_reasoning(self) -> bool:
@@ -719,12 +806,17 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
     def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         if not self._hermes_tools_only():
             return tools
-        resolved_tools = _platform_tool_definitions(self._tool_platform()) or tools
+        hermes_tools = _hermes_mcp_tool_definitions()
+        resolved_tools = hermes_tools or tools
         logger.debug(
-            "Claude ACP prompt tools: platform=%s count=%d",
-            self._tool_platform(),
-            len(resolved_tools or []),
+            "Claude ACP prompt tools: hermes_mcp=%d fallback=%d",
+            len(hermes_tools),
+            len(tools or []),
         )
+        if not resolved_tools:
+            logger.warning(
+                "Claude ACP hermes MCP tool surface is empty; falling back to the provided tool list"
+            )
         return resolved_tools
 
     def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
@@ -809,6 +901,43 @@ def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
             "message": message,
         },
     }
+
+
+def _build_devin_config_path(*, cwd: str, session_prefix: str) -> tuple[Path, list[Path]]:
+    """Create a temporary Devin config that injects the Hermes MCP server."""
+    base_config = _load_json_file(Path.home() / ".config" / "devin" / "config.json")
+    merged = dict(base_config)
+    existing = merged.get("mcpServers")
+    if isinstance(existing, dict):
+        servers = {name: dict(cfg) for name, cfg in existing.items() if isinstance(cfg, dict)}
+    elif isinstance(existing, list):
+        servers = {
+            str(cfg.get("name")): dict(cfg)
+            for cfg in existing
+            if isinstance(cfg, dict) and str(cfg.get("name") or "").strip()
+        }
+    else:
+        servers = {}
+
+    hermes_server = _build_hermes_mcp_server(
+        platform="discord",
+        session_prefix=session_prefix,
+        cwd=cwd,
+    )
+    servers.setdefault("hermes", hermes_server)
+    merged["mcpServers"] = servers
+
+    tmp = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        prefix="hermes-devin-config-",
+        suffix=".json",
+        delete=False,
+    )
+    with tmp:
+        json.dump(merged, tmp, ensure_ascii=False, indent=2)
+        tmp.write("\n")
+    return Path(tmp.name), [Path(tmp.name)]
 
 
 def _permission_denied(message_id: Any) -> dict[str, Any]:
@@ -1059,6 +1188,7 @@ class CopilotACPClient:
             base_url=self.base_url,
             command=self._acp_command,
         )
+        setattr(self._provider_adapter, "_acp_cwd", self._acp_cwd)
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
