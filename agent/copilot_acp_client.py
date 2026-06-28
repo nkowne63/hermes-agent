@@ -14,6 +14,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -190,8 +191,9 @@ def _hermes_mcp_tool_definitions(platform: str = "discord") -> list[dict[str, An
     """Return the Hermes tool schema surface exposed through the injected MCP server.
 
     ACP providers should see the same Hermes-side tool surface that the
-    target platform would normally expose, with MCP namespace prefixes
-    applied only at the wire boundary.
+    target platform would normally expose. Devin's prompt-facing tool names
+    are prefixed so the model asks for the MCP server namespace explicitly;
+    the Hermes MCP shim accepts both raw and prefixed aliases.
     """
     try:
         from model_tools import get_tool_definitions
@@ -212,15 +214,10 @@ def _hermes_mcp_tool_definitions(platform: str = "discord") -> list[dict[str, An
         spec = tool_defs.get(name)
         if not spec:
             continue
-        tool_name = str(spec.get("name") or name).strip()
+        tool_name = normalize_hermes_tool_name(str(spec.get("name") or name).strip())
         if not tool_name:
             tool_name = name
-        if tool_name.startswith("mcp__hermes__"):
-            pass
-        elif tool_name.startswith("mcp__"):
-            tool_name = f"mcp__hermes__{tool_name.removeprefix('mcp__')}"
-        else:
-            tool_name = f"mcp__hermes__{tool_name}"
+        tool_name = f"mcp__hermes__{tool_name}"
         resolved.append(
             {
                 "type": "function",
@@ -309,6 +306,9 @@ class ACPProviderAdapter:
         model: str | None,
     ) -> tuple[list[str], list[Path]]:
         return list(args), []
+
+    def subprocess_cwd(self, cwd: str) -> tuple[str, list[Path]]:
+        return cwd, []
 
     def client_capabilities(self) -> dict[str, Any]:
         return {
@@ -403,12 +403,12 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
     marker_prefixes = ("acp://devin",)
     command_names = ("devin", "devin.exe")
     _DEFAULT_DENIED_TOOLS = [
-        "Read(**)",
-        "Write(**)",
-        "Grep(**)",
-        "Glob(**)",
-        "Exec(**)",
-        "Fetch(**)",
+        "read",
+        "edit",
+        "grep",
+        "glob",
+        "exec",
+        "fetch",
         "skill",
         "mcp_list_tools",
         "mcp_list_servers",
@@ -508,6 +508,11 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
             return resolved, []
         if "--permission-mode" in resolved:
             permission_mode_args: list[str] = []
+        elif self._restricts_native_tools():
+            # Let the generated allow/deny config do the gating. Bypass/dangerous
+            # mode can auto-run native Devin tools that the Hermes MCP bridge is
+            # trying to keep off the surface.
+            permission_mode_args = []
         else:
             permission_mode_args = ["--permission-mode", "dangerous"]
 
@@ -548,6 +553,39 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
         path = Path(tmp.name)
         cleanup_paths.append(path)
         return ["--config", str(devin_config_path), "--agent-config", str(path), *permission_mode_args, *resolved], cleanup_paths
+
+    def subprocess_cwd(self, cwd: str) -> tuple[str, list[Path]]:
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return cwd, []
+
+        process_cwd = Path(tempfile.mkdtemp(prefix="hermes-devin-project-"))
+        devin_dir = process_cwd / ".devin"
+        devin_dir.mkdir(parents=True, exist_ok=True)
+        hermes_server = _build_hermes_mcp_server(
+            platform=self._tool_platform(),
+            session_prefix="devin-acp",
+            cwd=cwd,
+        )
+        server_config = {
+            key: value
+            for key, value in hermes_server.items()
+            if key != "name"
+        }
+        env_items = server_config.get("env")
+        if isinstance(env_items, list):
+            server_config["env"] = {
+                str(item.get("name")): item.get("value")
+                for item in env_items
+                if isinstance(item, dict)
+                and str(item.get("name") or "").strip()
+            }
+        server_config["transport"] = "stdio"
+        (devin_dir / "config.local.json").write_text(
+            json.dumps({"mcpServers": {"hermes": server_config}}, ensure_ascii=False, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        return str(process_cwd), [process_cwd]
 
     def client_capabilities(self) -> dict[str, Any]:
         if self._restricts_native_tools():
@@ -622,6 +660,10 @@ class DevinACPProviderAdapter(ACPProviderAdapter):
             [
                 "You are being used as the active ACP agent backend for Hermes.",
                 "Use the structured JSON conversation payload below as the source of truth.",
+                "The tools listed in the payload are Hermes MCP tools exposed by the MCP server named `hermes`.",
+                "When you need one of those tools, call the MCP tool `mcp__hermes__<tool_name>`.",
+                "Do not use Devin-native tools such as skill, read, grep, glob, find_file_by_name, or exec when a Hermes MCP tool can satisfy the request.",
+                "For Hermes skills, use mcp__hermes__skill_view or mcp__hermes__skills_list; do not use Devin's native skill tool.",
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 "Continue from the latest user request.",
                 "Return only the final answer. Start directly with the answer.",
@@ -952,6 +994,7 @@ def _build_devin_config_path(*, cwd: str, session_prefix: str) -> tuple[Path, li
         for key, value in hermes_server.items()
         if key != "name"
     }
+    hermes_server_config["transport"] = "stdio"
     env_items = hermes_server_config.get("env")
     if isinstance(env_items, list):
         hermes_server_config["env"] = {
@@ -962,6 +1005,17 @@ def _build_devin_config_path(*, cwd: str, session_prefix: str) -> tuple[Path, li
         }
     servers.setdefault("hermes", hermes_server_config)
     merged["mcpServers"] = servers
+    permissions = dict(merged.get("permissions") or {})
+    allow = list(permissions.get("allow") or [])
+    deny = list(permissions.get("deny") or [])
+    if "mcp__hermes__*" not in allow:
+        allow.append("mcp__hermes__*")
+    for tool_name in DevinACPProviderAdapter._DEFAULT_DENIED_TOOLS:
+        if tool_name not in deny:
+            deny.append(tool_name)
+    permissions["allow"] = allow
+    permissions["deny"] = deny
+    merged["permissions"] = permissions
 
     tmp = tempfile.NamedTemporaryFile(
         "w",
@@ -1083,6 +1137,10 @@ def _render_message_content(content: Any) -> str:
             return str(content.get("text") or "").strip()
         if "content" in content and isinstance(content.get("content"), str):
             return str(content.get("content") or "").strip()
+        if "content" in content:
+            nested = _render_message_content(content.get("content"))
+            if nested:
+                return nested
         return json.dumps(content, ensure_ascii=True)
     if isinstance(content, list):
         parts: list[str] = []
@@ -1093,6 +1151,10 @@ def _render_message_content(content: Any) -> str:
                 text = item.get("text")
                 if isinstance(text, str) and text.strip():
                     parts.append(text.strip())
+                elif "content" in item:
+                    nested = _render_message_content(item.get("content"))
+                    if nested:
+                        parts.append(nested)
         return "\n".join(parts).strip()
     return str(content).strip()
 
@@ -1282,6 +1344,7 @@ class CopilotACPClient:
         self._last_acp_session_updates: list[dict[str, Any]] = []
         self._last_acp_tool_trace: list[dict[str, Any]] = []
         self._last_acp_reasoning_trace: list[str] = []
+        self._completed_acp_tool_call_ids: set[str] = set()
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -1386,11 +1449,16 @@ class CopilotACPClient:
             self._acp_args,
             model=model,
         )
+        process_cwd, cwd_cleanup_paths = self._provider_adapter.subprocess_cwd(self._acp_cwd)
+        cleanup_paths.extend(cwd_cleanup_paths)
 
         def _cleanup_generated_files() -> None:
             for path in cleanup_paths:
                 try:
-                    path.unlink()
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
                 except FileNotFoundError:
                     pass
                 except Exception:
@@ -1404,7 +1472,7 @@ class CopilotACPClient:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-                cwd=self._acp_cwd,
+                cwd=process_cwd,
                 env=env,
             )
         except FileNotFoundError as exc:
@@ -1428,6 +1496,7 @@ class CopilotACPClient:
         stderr_tail: deque[str] = deque(maxlen=40)
         session_updates: list[dict[str, Any]] = []
         tool_trace: list[dict[str, Any]] = []
+        self._completed_acp_tool_call_ids = set()
 
         def _stdout_reader() -> None:
             if proc.stdout is None:
@@ -1630,16 +1699,38 @@ class CopilotACPClient:
                 preview = self._acp_tool_trace_preview(update, kind=kind, chunk_text=chunk_text)
                 args = self._acp_tool_trace_args(update)
                 try:
-                    tool_progress_callback(
-                        "tool.started",
-                        tool_name,
-                        preview,
-                        args,
-                        session_id=params.get("sessionId"),
-                        tool_call_id=update.get("toolCallId"),
-                        status=update.get("status"),
-                        kind=kind,
-                    )
+                    tool_call_id = str(update.get("toolCallId") or "").strip()
+                    if kind == "tool_call":
+                        tool_progress_callback(
+                            "tool.started",
+                            tool_name,
+                            preview,
+                            args,
+                            session_id=params.get("sessionId"),
+                            tool_call_id=update.get("toolCallId"),
+                            status=update.get("status"),
+                            kind=kind,
+                        )
+                    else:
+                        terminal = self._acp_tool_update_terminal_state(update)
+                        if terminal and (
+                            not tool_call_id
+                            or tool_call_id not in self._completed_acp_tool_call_ids
+                        ):
+                            if tool_call_id:
+                                self._completed_acp_tool_call_ids.add(tool_call_id)
+                            tool_progress_callback(
+                                "tool.completed",
+                                tool_name,
+                                None,
+                                None,
+                                session_id=params.get("sessionId"),
+                                tool_call_id=update.get("toolCallId"),
+                                status=update.get("status"),
+                                kind=kind,
+                                is_error=terminal == "failed",
+                                result=_render_message_content(update.get("content")),
+                            )
                 except Exception:
                     logger.debug("ACP tool_progress_callback failed", exc_info=True)
             if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
@@ -1784,4 +1875,16 @@ class CopilotACPClient:
             candidate = " ".join(str(candidate).split()).strip()
             if candidate:
                 return candidate[:177] + "..." if len(candidate) > 180 else candidate
+        return None
+
+    @staticmethod
+    def _acp_tool_update_terminal_state(update: dict[str, Any]) -> str | None:
+        status = update.get("status")
+        if not isinstance(status, str):
+            return None
+        normalized = status.strip().lower().replace("-", "_")
+        if normalized in {"completed", "complete", "succeeded", "success", "done"}:
+            return "completed"
+        if normalized in {"failed", "failure", "error", "errored", "cancelled", "canceled"}:
+            return "failed"
         return None
