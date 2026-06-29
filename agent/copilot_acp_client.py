@@ -1111,6 +1111,8 @@ def _format_messages_as_prompt(
         "Use ACP capabilities to complete tasks.",
         "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
         "If no tool is needed, answer normally.",
+        "After tool results are present in the transcript, answer from those results. Do not return planning text such as 'I will search/read/fetch now' as the final answer.",
+        "If you still need another tool after seeing tool results, emit the tool call only; do not mix the tool call with a draft or final answer.",
     ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")

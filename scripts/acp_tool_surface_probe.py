@@ -97,6 +97,21 @@ PREVIEW_DETAIL_MARKERS = (
     "agent-token-usage",
     "skill",
 )
+INTERMEDIATE_RESPONSE_RE = re.compile(
+    r"("
+    r"これから|まず|次に|並行して|取得します|確認します|検索します|読み込みます|"
+    r"調べます|探します|使います|実行します|will use|going to|let me|I'll|I will|"
+    r"fetch|search|inspect|read"
+    r")",
+    re.IGNORECASE,
+)
+FINAL_RESPONSE_RE = re.compile(
+    r"("
+    r"要約|まとめ|現状|結論|確認した範囲|読んだ範囲|総トークン|トークン使用量|"
+    r"summary|conclusion|total tokens|token usage"
+    r")",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -207,6 +222,16 @@ def _summarise_response(response: str) -> dict[str, Any]:
         )
         if marker.lower() in lowered
     ]
+    if (
+        INTERMEDIATE_RESPONSE_RE.search(response)
+        and not FINAL_RESPONSE_RE.search(response)
+        and (
+            "session_store_sql" in lowered
+            or "mcp__hermes__" in lowered
+            or len(response) < 500
+        )
+    ):
+        noisy_markers.append("intermediate_planning_text")
     return {
         "chars": len(response),
         "matched_relevance_terms": matched,

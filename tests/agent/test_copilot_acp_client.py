@@ -737,6 +737,8 @@ def test_create_chat_completion_includes_tools_and_extracts_tool_calls(tmp_path)
     prompt_text = captured["prompt"]
     assert "Available tools (OpenAI function schema)." in prompt_text
     assert '"name": "read_file"' in prompt_text
+    assert "After tool results are present" in prompt_text
+    assert "Do not return planning text" in prompt_text
     assert response.choices[0].message.content == "Done."
     assert response.choices[0].message.tool_calls
     assert response.choices[0].finish_reason == "tool_calls"

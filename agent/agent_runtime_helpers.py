@@ -15,6 +15,7 @@ Methods covered:
 * ``drop_thinking_only_and_merge_users`` — Anthropic-style cleanup
 * ``restore_primary_runtime`` — un-do fallback activation
 * ``extract_reasoning`` — pull reasoning fields out of API responses
+* ``looks_like_acp_intermediate_ack`` — detect ACP planning text that is not a final answer
 * ``dump_api_request_debug`` — write request body for post-mortem
 * ``anthropic_prompt_cache_policy`` — compute cache_control breakpoints
 * ``create_openai_client`` — build the per-agent OpenAI SDK client
@@ -1166,6 +1167,65 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
         return "\n\n".join(reasoning_parts)
     
     return None
+
+
+_ACP_INTERMEDIATE_ACTION_RE = re.compile(
+    r"("
+    r"これから|まず|次に|並行して|取得します|確認します|検索します|読み込みます|"
+    r"調べます|探します|使います|実行します|call|calling|will use|going to|"
+    r"need to|let me|I'll|I will|fetch|search|inspect|read"
+    r")",
+    re.IGNORECASE,
+)
+_ACP_FINAL_ANSWER_RE = re.compile(
+    r"("
+    r"要約|まとめ|現状|結論|確認した範囲|読んだ範囲|総トークン|トークン使用量|"
+    r"summary|summarize|conclusion|found|confirmed|total tokens|token usage"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def looks_like_acp_intermediate_ack(
+    agent,
+    *,
+    assistant_content: str,
+    messages: List[Dict[str, Any]],
+) -> bool:
+    """Return True for ACP planning text that should not be final-visible."""
+
+    provider = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "").lower()
+    if not (provider.endswith("-acp") or base_url.startswith("acp://")):
+        return False
+
+    text = (assistant_content or "").strip()
+    if not text or len(text) > 800:
+        return False
+
+    recent = messages[-8:] if isinstance(messages, list) else []
+    if not any(isinstance(m, dict) and m.get("role") == "tool" for m in recent):
+        return False
+
+    lowered = text.lower()
+    noisy_protocol = (
+        "session_store_sql" in lowered
+        or "mcp__hermes__" in lowered
+        or "agent_thought" in lowered
+    )
+    has_action = bool(_ACP_INTERMEDIATE_ACTION_RE.search(text))
+    has_final = bool(_ACP_FINAL_ANSWER_RE.search(text))
+    has_evidence_shape = (
+        ("`" in text and len(text.splitlines()) >= 4)
+        or len(re.findall(r"(^|\n)\s*[-*]\s+", text)) >= 2
+        or len(re.findall(r"\d", text)) >= 4
+    )
+
+    if noisy_protocol and has_action and not has_evidence_shape:
+        return True
+    if has_action and not has_final and not has_evidence_shape:
+        return True
+    return False
 
 
 

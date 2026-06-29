@@ -3631,6 +3631,37 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_copilot_acp_intermediate_ack_after_tools_is_not_final(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "copilot-acp"
+        agent.base_url = "acp://copilot"
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_turn = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        contaminated = _mock_response(
+            content=(
+                "`session_store_sql` が使えない環境なので、`session_search` と "
+                "`search_files` で情報を取得します。並行して取得します。"
+            ),
+            finish_reason="stop",
+        )
+        final = _mock_response(
+            content="読んだ範囲での要約です。Nuxt3移行は最終e2e待ちです。",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [tool_turn, contaminated, final]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("nuxt3移行を要約して")
+
+        assert result["final_response"] == "読んだ範囲での要約です。Nuxt3移行は最終e2e待ちです。"
+        assert result["api_calls"] == 3
+        assert any(m.get("_acp_intermediate_ack") for m in result["messages"])
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

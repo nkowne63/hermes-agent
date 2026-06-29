@@ -581,6 +581,7 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    acp_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -4633,6 +4634,47 @@ def run_conversation(
                     continue
 
                 codex_ack_continuations = 0
+
+                if (
+                    acp_ack_continuations < 2
+                    and agent._looks_like_acp_intermediate_ack(
+                        assistant_content=final_response,
+                        messages=messages,
+                    )
+                ):
+                    acp_ack_continuations += 1
+                    logger.info(
+                        "ACP intermediate planning text detected after tool results; "
+                        "continuing instead of surfacing as final response "
+                        "(%d/2, provider=%s, model=%s)",
+                        acp_ack_continuations,
+                        agent.provider,
+                        agent.model,
+                    )
+                    agent._buffer_status(
+                        "↻ ACP returned planning text after tool results — "
+                        f"requesting final answer ({acp_ack_continuations}/2)"
+                    )
+                    interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
+                    interim_msg["_acp_intermediate_ack"] = True
+                    messages.append(interim_msg)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[System: The previous assistant text was an "
+                                "intermediate plan, not a final answer. Do not "
+                                "call more tools unless strictly necessary. Read "
+                                "the tool results already in the transcript and "
+                                "provide the concise final answer now.]"
+                            ),
+                            "_acp_intermediate_ack": True,
+                        }
+                    )
+                    agent._session_messages = messages
+                    continue
+
+                acp_ack_continuations = 0
 
                 if truncated_response_parts:
                     final_response = "".join(truncated_response_parts) + final_response
