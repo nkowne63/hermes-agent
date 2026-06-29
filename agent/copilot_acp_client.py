@@ -1296,6 +1296,12 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
         r"<invoke\b([^>]*)>(.*?)</invoke>|<invoke\b([^>]*)/>",
         re.DOTALL | re.IGNORECASE,
     )
+    direct_mcp_pattern = re.compile(
+        r"<(?P<name>mcp__hermes__[A-Za-z0-9_]+)\b(?P<attrs>[^>]*)>"
+        r"(?P<body>.*?)</(?P=name)>"
+        r"|<(?P<self_name>mcp__hermes__[A-Za-z0-9_]+)\b(?P<self_attrs>[^>]*)/>",
+        re.DOTALL | re.IGNORECASE,
+    )
     for m in function_calls_pattern.finditer(text):
         block = m.group(1) or ""
         matched_invoke = False
@@ -1313,6 +1319,20 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
             matched_invoke = True
         if matched_invoke:
             consumed_spans.append((m.start(), m.end()))
+
+    for m in direct_mcp_pattern.finditer(text):
+        name = m.group("name") or m.group("self_name") or ""
+        attrs = m.group("attrs") or m.group("self_attrs") or ""
+        body = m.group("body") or ""
+        attr_args = _extract_xml_attribute_arguments(attrs)
+        param_args = _extract_invoke_parameter_arguments(body)
+        args: dict[str, str] = {}
+        if attr_args:
+            args.update(attr_args)
+        if param_args:
+            args.update(param_args)
+        _try_add_invoke(name, json.dumps(args, ensure_ascii=False) if args else body)
+        consumed_spans.append((m.start(), m.end()))
 
     if not consumed_spans:
         return extracted, text.strip()
@@ -1363,6 +1383,25 @@ def _extract_invoke_parameter_arguments(raw_args: str) -> dict[str, str] | None:
         params[name] = unescape(match.group(2) or "").strip()
 
     return params or None
+
+
+def _extract_xml_attribute_arguments(raw_attrs: str) -> dict[str, str] | None:
+    """Parse simple XML-style tool attributes into JSON arguments."""
+    if not isinstance(raw_attrs, str) or not raw_attrs.strip():
+        return None
+
+    args: dict[str, str] = {}
+    attr_re = re.compile(
+        r"([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*([\"'])(.*?)\2",
+        re.DOTALL,
+    )
+    for match in attr_re.finditer(raw_attrs):
+        name = unescape(match.group(1)).strip()
+        if not name:
+            continue
+        args[name] = unescape(match.group(3) or "").strip()
+
+    return args or None
 
 
 

@@ -1145,6 +1145,22 @@ def test_extract_tool_calls_parses_claude_invoke_parameters_as_json_arguments():
     }
 
 
+def test_extract_tool_calls_parses_direct_claude_mcp_tags():
+    tool_calls, cleaned = _extract_tool_calls_from_text(
+        'I will load it.\n\n'
+        '<mcp__hermes__skill_view name="nuxt3-regression-context">\n'
+        '</mcp__hermes__skill_view>\n\n'
+        'Done.'
+    )
+
+    assert cleaned == "I will load it.\nDone."
+    assert tool_calls
+    assert tool_calls[0].function.name == "skill_view"
+    assert json.loads(tool_calls[0].function.arguments) == {
+        "name": "nuxt3-regression-context"
+    }
+
+
 def test_devin_agent_config_is_json_permissions_and_mcpservers(tmp_path):
     client = CopilotACPClient(
         api_key="devin-acp",
