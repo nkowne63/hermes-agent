@@ -455,8 +455,14 @@ class CopilotACPProviderAdapter(ACPProviderAdapter):
         *,
         model: str | None,
     ) -> tuple[list[str], list[Path]]:
-        del model
         resolved = list(args)
+        model_value = str(model or "").strip()
+        if (
+            model_value
+            and model_value.lower() != self.default_model
+            and not self._has_option(resolved, "--model")
+        ):
+            resolved.append(f"--model={model_value}")
         if not self._restricts_native_tools():
             return resolved, []
 
