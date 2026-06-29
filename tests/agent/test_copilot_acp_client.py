@@ -14,6 +14,7 @@ from unittest.mock import patch
 from agent.copilot_acp_client import CopilotACPClient
 from agent.copilot_acp_client import _extract_tool_calls_from_text
 from agent.copilot_acp_client import _resolve_command
+from agent.copilot_acp_client import _strip_devin_artifacts
 
 
 class _FakeProcess:
@@ -24,6 +25,7 @@ class _FakeProcess:
 class CopilotACPClientSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = CopilotACPClient(acp_cwd="/tmp")
+        self.client._provider_adapter._settings = lambda: {"hermes_mcp_bridge": False}
 
     def _dispatch(self, message: dict, *, cwd: str) -> dict:
         process = _FakeProcess()
@@ -176,6 +178,16 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
 
         self.assertEqual(preview, "agent-token-usage-analytics")
 
+    def test_strip_copilot_tool_filter_info_lines(self) -> None:
+        text = (
+            "Info: Disabled tools: bash, create, edit, glob, grep, "
+            "list_agents, list_bash, read_agent, read_bash, "
+            "session_store_sql, skill, sql, stop_bash, task, view, web_fetch"
+            "要約です。"
+        )
+
+        self.assertEqual(_strip_devin_artifacts(text), "要約です。")
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -246,11 +258,96 @@ def test_run_prompt_does_not_pass_devin_model_env_for_copilot_acp(monkeypatch, t
     captured = {}
     client = _make_home_client(tmp_path)
 
-    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
-        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
-            client._run_prompt("hello", model="opus", timeout_seconds=1)
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+            with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+                client._run_prompt("hello", model="opus", timeout_seconds=1)
 
     assert "DEVIN_MODEL" not in captured["kwargs"]["env"]
+    assert "--disable-builtin-mcps" in captured["cmd"]
+    assert "--no-ask-user" in captured["cmd"]
+    assert "--excluded-tools=bash" in captured["cmd"]
+    assert "--available-tools=mcp__hermes__*" not in captured["cmd"]
+
+
+def test_copilot_default_tools_only_restricts_native_tools(tmp_path):
+    client = CopilotACPClient(
+        api_key="copilot-acp",
+        base_url="acp://copilot",
+        acp_command="copilot",
+        acp_args=["--acp", "--stdio"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        args, cleanup = client._provider_adapter.subprocess_args(["--acp", "--stdio"], model="claude")
+        assert cleanup == []
+        assert args == [
+            "--acp",
+            "--stdio",
+            "--disable-builtin-mcps",
+            "--no-ask-user",
+            "--excluded-tools=bash",
+            "--excluded-tools=create",
+            "--excluded-tools=edit",
+            "--excluded-tools=glob",
+            "--excluded-tools=grep",
+            "--excluded-tools=list_agents",
+            "--excluded-tools=list_bash",
+            "--excluded-tools=read_agent",
+            "--excluded-tools=read_bash",
+            "--excluded-tools=session_store_sql",
+            "--excluded-tools=skill",
+            "--excluded-tools=sql",
+            "--excluded-tools=stop_bash",
+            "--excluded-tools=task",
+            "--excluded-tools=view",
+            "--excluded-tools=web_fetch",
+        ]
+        assert client._provider_adapter.client_capabilities() == {}
+        assert client._provider_adapter.supports_client_method("fs/read_text_file") is False
+        assert client._provider_adapter.supports_client_method("session/request_permission") is True
+
+
+def test_copilot_mcp_bridge_can_be_disabled_to_keep_native_tools(tmp_path):
+    client = CopilotACPClient(
+        api_key="copilot-acp",
+        base_url="acp://copilot",
+        acp_command="copilot",
+        acp_args=["--acp", "--stdio"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={"hermes_mcp_bridge": False}):
+        assert client._provider_adapter.subprocess_args(["--acp", "--stdio"], model="claude") == (
+            ["--acp", "--stdio"],
+            [],
+        )
+        assert client._provider_adapter.client_capabilities()["fs"]["readTextFile"] is True
+        assert client._provider_adapter.supports_client_method("fs/read_text_file") is True
+
+
+def test_copilot_session_params_inject_hermes_mcp_bridge(tmp_path):
+    client = CopilotACPClient(
+        api_key="copilot-acp",
+        base_url="acp://copilot",
+        acp_command="copilot",
+        acp_args=["--acp", "--stdio"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        params = client._provider_adapter.session_new_params(
+            {"cwd": str(tmp_path), "mcpServers": []},
+            model="claude-haiku-4.5",
+        )
+
+    hermes_server = next(server for server in params["mcpServers"] if server["name"] == "hermes")
+    assert hermes_server["command"]
+    assert "mcp_hermes_tools.py" in hermes_server["args"][0]
+    env = {item["name"]: item["value"] for item in hermes_server["env"]}
+    assert env["HERMES_MCP_TOOL_PLATFORM"] == "discord"
+    assert env["HERMES_MCP_CWD"] == str(tmp_path)
 
 
 def test_resolve_command_defaults_are_provider_specific(monkeypatch):
@@ -726,19 +823,20 @@ def test_create_chat_completion_includes_tools_and_extracts_tool_calls(tmp_path)
             "reasoning text",
         )
 
-    with _patch.object(client._provider_adapter, "prompt_tools", return_value=tools):
-        with _patch.object(client, "_run_prompt", side_effect=_fake_run_prompt):
-            response = client._create_chat_completion(
-                model="claude-sonnet-4.6",
-                messages=[{"role": "user", "content": "Inspect /tmp/x.txt"}],
-                tools=tools,
-            )
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        with _patch.object(client._provider_adapter, "prompt_tools", return_value=tools):
+            with _patch.object(client, "_run_prompt", side_effect=_fake_run_prompt):
+                response = client._create_chat_completion(
+                    model="claude-sonnet-4.6",
+                    messages=[{"role": "user", "content": "Inspect /tmp/x.txt"}],
+                    tools=tools,
+                )
 
     prompt_text = captured["prompt"]
-    assert "Available tools (OpenAI function schema)." in prompt_text
+    assert "Available Hermes MCP tools:" in prompt_text
     assert '"name": "read_file"' in prompt_text
-    assert "After tool results are present" in prompt_text
-    assert "Do not return planning text" in prompt_text
+    assert "After tool results appear" in prompt_text
+    assert "do not announce that you will call the same tools again" in prompt_text
     assert response.choices[0].message.content == "Done."
     assert response.choices[0].message.tool_calls
     assert response.choices[0].finish_reason == "tool_calls"

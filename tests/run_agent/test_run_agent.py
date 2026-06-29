@@ -3662,6 +3662,39 @@ class TestRunConversation:
         assert result["api_calls"] == 3
         assert any(m.get("_acp_intermediate_ack") for m in result["messages"])
 
+    def test_copilot_acp_initial_planning_ack_executes_tools(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "copilot-acp"
+        agent.base_url = "acp://copilot"
+        planning = _mock_response(
+            content="Let me load the relevant skills and check the session history simultaneously.",
+            finish_reason="stop",
+        )
+        tc = _mock_tool_call(name="session_search", arguments='{"query":"nuxt3"}', call_id="c1")
+        tool_turn = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        final = _mock_response(
+            content="現状要約です。総トークン使用量は286,197,091 tokensです。",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [planning, tool_turn, final]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="session result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("nuxt3移行関連のファイルとorchestoratorを読んで要約して")
+
+        assert result["final_response"] == "現状要約です。総トークン使用量は286,197,091 tokensです。"
+        assert result["api_calls"] == 3
+        assert any(m.get("role") == "tool" for m in result["messages"])
+        continuation = next(
+            m for m in result["messages"]
+            if isinstance(m, dict) and m.get("_acp_intermediate_ack") and m.get("role") == "user"
+        )
+        assert "Execute the required Hermes tool calls now" in continuation["content"]
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

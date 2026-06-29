@@ -1204,7 +1204,24 @@ def looks_like_acp_intermediate_ack(
         return False
 
     recent = messages[-8:] if isinstance(messages, list) else []
-    if not any(isinstance(m, dict) and m.get("role") == "tool" for m in recent):
+    has_recent_tool = any(isinstance(m, dict) and m.get("role") == "tool" for m in recent)
+    recent_user_text = "\n".join(
+        str(m.get("content") or "")
+        for m in recent
+        if isinstance(m, dict) and m.get("role") == "user"
+    ).lower()
+    user_requested_tool_work = bool(
+        re.search(
+            r"("
+            r"read|search|inspect|look up|fetch|load|file|files|session|skill|"
+            r"読む|読んで|検索|探し|調べ|ファイル|セッション|スキル|"
+            r"orchestrator|orchestorator|token|トークン"
+            r")",
+            recent_user_text,
+            re.IGNORECASE,
+        )
+    )
+    if not has_recent_tool and not user_requested_tool_work:
         return False
 
     lowered = text.lower()
@@ -1222,6 +1239,8 @@ def looks_like_acp_intermediate_ack(
     )
 
     if noisy_protocol and has_action and not has_evidence_shape:
+        return True
+    if not has_recent_tool and user_requested_tool_work and has_action and not has_final:
         return True
     if has_action and not has_final and not has_evidence_shape:
         return True

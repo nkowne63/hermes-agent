@@ -4658,16 +4658,30 @@ def run_conversation(
                     interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
                     interim_msg["_acp_intermediate_ack"] = True
                     messages.append(interim_msg)
+                    has_recent_tool = any(
+                        isinstance(m, dict) and m.get("role") == "tool"
+                        for m in messages[-8:]
+                    )
+                    if has_recent_tool:
+                        continuation_text = (
+                            "[System: The previous assistant text was an "
+                            "intermediate plan, not a final answer. Do not "
+                            "call more tools unless strictly necessary. Read "
+                            "the tool results already in the transcript and "
+                            "provide the concise final answer now.]"
+                        )
+                    else:
+                        continuation_text = (
+                            "[System: The previous assistant text was an "
+                            "intermediate plan, not a final answer. Execute "
+                            "the required Hermes tool calls now. Only provide "
+                            "the final answer after the requested reading or "
+                            "searching has actually completed.]"
+                        )
                     messages.append(
                         {
                             "role": "user",
-                            "content": (
-                                "[System: The previous assistant text was an "
-                                "intermediate plan, not a final answer. Do not "
-                                "call more tools unless strictly necessary. Read "
-                                "the tool results already in the transcript and "
-                                "provide the concise final answer now.]"
-                            ),
+                            "content": continuation_text,
                             "_acp_intermediate_ack": True,
                         }
                     )

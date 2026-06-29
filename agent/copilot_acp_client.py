@@ -372,6 +372,241 @@ class CopilotACPProviderAdapter(ACPProviderAdapter):
     default_model = "copilot-acp"
     marker_prefixes = ("acp://copilot",)
     command_names = ("copilot", "copilot.exe")
+    _DEFAULT_DENIED_TOOLS = [
+        "bash",
+        "create",
+        "edit",
+        "glob",
+        "grep",
+        "list_agents",
+        "list_bash",
+        "read_agent",
+        "read_bash",
+        "session_store_sql",
+        "skill",
+        "sql",
+        "stop_bash",
+        "task",
+        "view",
+        "web_fetch",
+    ]
+
+    def _settings(self) -> dict[str, Any]:
+        return _load_acp_settings("copilot", "copilot_acp")
+
+    def _hermes_tools_only(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_tools_only", settings.get("tools_only", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _use_hermes_mcp_bridge(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_mcp_bridge", settings.get("mcp_bridge", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _tool_platform(self) -> str:
+        settings = self._settings()
+        return str(settings.get("tool_platform") or "discord").strip()
+
+    def _available_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("available_tools")
+        if isinstance(raw, list):
+            tools = [str(item).strip() for item in raw if str(item).strip()]
+            if tools:
+                return tools
+        return []
+
+    def _deny_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("deny_tools")
+        if isinstance(raw, list):
+            return [str(item).strip() for item in raw if str(item).strip()]
+        return list(self._DEFAULT_DENIED_TOOLS)
+
+    def _restricts_native_tools(self) -> bool:
+        return self._hermes_tools_only() and self._use_hermes_mcp_bridge()
+
+    @staticmethod
+    def _has_option(args: list[str], *names: str) -> bool:
+        return any(arg == name or arg.startswith(f"{name}=") for arg in args for name in names)
+
+    def subprocess_args(
+        self,
+        args: list[str],
+        *,
+        model: str | None,
+    ) -> tuple[list[str], list[Path]]:
+        del model
+        resolved = list(args)
+        if not self._restricts_native_tools():
+            return resolved, []
+
+        # Keep Copilot's GitHub MCP off by default and restrict the model-visible
+        # tool surface to the Hermes MCP namespace. This prevents native Copilot
+        # file/shell tools from satisfying requests outside Hermes' auditable
+        # tool loop.
+        if not self._has_option(resolved, "--disable-builtin-mcps"):
+            resolved.append("--disable-builtin-mcps")
+        if not self._has_option(resolved, "--no-ask-user"):
+            resolved.append("--no-ask-user")
+        if not self._has_option(resolved, "--available-tools"):
+            for tool_name in self._available_tools():
+                resolved.append(f"--available-tools={tool_name}")
+        if not self._has_option(resolved, "--excluded-tools"):
+            for tool_name in self._deny_tools():
+                resolved.append(f"--excluded-tools={tool_name}")
+        return resolved, []
+
+    def client_capabilities(self) -> dict[str, Any]:
+        if self._restricts_native_tools():
+            return {}
+        return super().client_capabilities()
+
+    def supports_client_method(self, method: str) -> bool:
+        if self._restricts_native_tools() and method.startswith("fs/"):
+            return False
+        return True
+
+    def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        if not self._hermes_tools_only():
+            return tools
+        hermes_tools = _hermes_mcp_tool_definitions(self._tool_platform())
+        logger.debug(
+            "Copilot ACP prompt tools: hermes_mcp=%d fallback=%d",
+            len(hermes_tools),
+            len(tools or []),
+        )
+        return hermes_tools or tools
+
+    def format_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+    ) -> str:
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return super().format_prompt(
+                messages,
+                model=model,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+
+        sections: list[str] = [
+            "You are being used as the active Copilot ACP agent backend for Hermes.",
+            "Use the conversation transcript below as the source of truth.",
+            "Hermes tools are exposed through the MCP server named `hermes`.",
+            "When a tool is needed, call the MCP tool named `mcp__hermes__<tool_name>`.",
+            "Do not use Copilot-native file, shell, grep, search, edit, browser, or GitHub tools when a Hermes MCP tool can satisfy the request.",
+            "For Hermes skills, use `mcp__hermes__skill_view` or `mcp__hermes__skills_list`.",
+            "If the user explicitly asks to read files, search files, inspect paths, or uses words like `file`, `files`, `ファイル`, or `ファイル検索`, include `mcp__hermes__search_files` and/or `mcp__hermes__read_file` in the first relevant tool batch.",
+            "For `mcp__hermes__search_files`, use `pattern` as the required search argument, not `query`.",
+            "Do not say you searched or read files unless you actually called a Hermes file tool.",
+            "When you call tools, emit only the tool calls for that assistant turn; do not include a draft answer or a final answer alongside the tool calls.",
+            "After tool results appear in the transcript, answer from those results; do not announce that you will call the same tools again unless you are actually calling them again.",
+            "Do not print XML, JSON function calls, MCP protocol messages, or tool transcripts in the final answer.",
+        ]
+        if model:
+            sections.append(f"Hermes requested model hint: {model}")
+        if tool_choice is not None:
+            sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
+
+        if isinstance(tools, list) and tools:
+            tool_specs: list[dict[str, Any]] = []
+            for t in tools:
+                if not isinstance(t, dict):
+                    continue
+                fn = t.get("function") or {}
+                if not isinstance(fn, dict):
+                    continue
+                name = fn.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                tool_specs.append(
+                    {
+                        "name": name.strip(),
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters", {}),
+                    }
+                )
+            if tool_specs:
+                sections.append(
+                    "Available Hermes MCP tools:\n"
+                    + json.dumps(tool_specs, ensure_ascii=False)
+                )
+
+        transcript: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "unknown").strip().lower()
+            content = _render_message_content(message.get("content"))
+            if not content:
+                continue
+            if role == "tool":
+                tool_name = str(message.get("name") or "tool").strip() or "tool"
+                transcript.append(f"Tool result ({tool_name}):\n{content}")
+            elif role in {"system", "user", "assistant"}:
+                transcript.append(f"{role.title()}:\n{content}")
+            else:
+                transcript.append(f"Context:\n{content}")
+
+        if transcript:
+            sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+        sections.append("Continue from the latest user request. Return only the final answer.")
+        return "\n\n".join(section.strip() for section in sections if section and section.strip())
+
+    def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
+        del model
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return params
+
+        merged = dict(params)
+        existing_raw = merged.get("mcpServers") or []
+        if isinstance(existing_raw, dict):
+            existing = [
+                {"name": str(name), **dict(server)}
+                for name, server in existing_raw.items()
+                if isinstance(server, dict) and str(name).strip()
+            ]
+        elif isinstance(existing_raw, list):
+            existing = [
+                dict(server)
+                for server in existing_raw
+                if isinstance(server, dict)
+            ]
+        else:
+            existing = []
+
+        hermes_server = _build_hermes_mcp_server(
+            platform=self._tool_platform(),
+            session_prefix="copilot-acp",
+            cwd=str(merged.get("cwd") or os.getcwd()),
+        )
+        if not any(
+            isinstance(server, dict) and server.get("name") == "hermes"
+            for server in existing
+        ):
+            existing.append(hermes_server)
+        merged["mcpServers"] = existing
+        logger.debug(
+            "Copilot ACP session new params: platform=%s mcp_servers=%d cwd=%s",
+            self._tool_platform(),
+            len(existing),
+            str(merged.get("cwd") or os.getcwd()),
+        )
+        return merged
 
     def missing_command_error(self, command: str) -> str:
         return (
@@ -1182,6 +1417,18 @@ def _strip_devin_artifacts(text: str) -> str:
         return ""
     cleaned = re.sub(r"\s*<ref_[^>]+/>\s*", " ", text)
     cleaned = re.sub(r"\s*<ref_[^>]+>.*?</ref_[^>]+>\s*", " ", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(
+        r"^\s*(?:Info:\s*Disabled tools:\s*.*?web_fetch\s*)+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^\s*(?:Info:\s*Unknown tool name in the tool allowlist:\s*\"[^\"]+\"\s*)+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
