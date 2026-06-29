@@ -71,6 +71,19 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+_ACP_PROCESS_PROVIDERS = {"copilot-acp", "devin-acp", "claude-acp"}
+
+
+def _is_acp_session_prompt_timeout(error: Exception, provider: str) -> bool:
+    if (provider or "").strip().lower() not in _ACP_PROCESS_PROVIDERS:
+        return False
+    if not isinstance(error, TimeoutError):
+        return False
+    method = getattr(error, "method", None)
+    if method == "session/prompt":
+        return True
+    return "response to session/prompt" in str(error).lower()
+
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
@@ -2300,6 +2313,8 @@ def run_conversation(
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
                 )
+                if _is_acp_session_prompt_timeout(api_error, getattr(agent, "provider", "") or ""):
+                    max_retries = min(max_retries, 2)
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,

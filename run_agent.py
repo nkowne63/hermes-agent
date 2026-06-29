@@ -1115,7 +1115,7 @@ class AIAgent:
         if env_timeout is not None:
             return env_float("HERMES_API_TIMEOUT", 1800.0)
         if str(self.provider or "").strip().lower() == "copilot-acp":
-            return 300.0
+            return 180.0
         return 1800.0
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:

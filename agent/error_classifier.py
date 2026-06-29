@@ -535,6 +535,21 @@ def classify_api_error(
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
+    # Subprocess ACP providers (Copilot/Devin/Claude) run a whole agent loop
+    # behind one ``session/prompt`` JSON-RPC call. If that method times out,
+    # a fresh subprocess can recover, but repeated multi-minute retries should
+    # be bounded by the conversation loop before falling back.
+    if (
+        isinstance(error, TimeoutError)
+        and provider_lower in {"copilot-acp", "devin-acp", "claude-acp"}
+        and getattr(error, "method", None) == "session/prompt"
+    ):
+        return _result(
+            FailoverReason.timeout,
+            retryable=True,
+            should_fallback=True,
+        )
+
     # Provider content-policy / safety-filter block. The provider has made a
     # deterministic refusal decision about THIS prompt — retrying unchanged
     # just reproduces the same refusal and burns paid attempts. Must run

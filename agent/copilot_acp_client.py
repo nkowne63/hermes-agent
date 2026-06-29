@@ -13,6 +13,7 @@ import logging
 import os
 import queue
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -52,6 +53,15 @@ _DEPRECATION_MARKERS = (
     "has been deprecated",
     "no commands will be executed",
 )
+
+
+class ACPProviderTimeoutError(TimeoutError):
+    """Timeout raised by subprocess ACP providers for one JSON-RPC method."""
+
+    def __init__(self, provider_name: str, method: str) -> None:
+        self.provider_name = provider_name
+        self.method = method
+        super().__init__(f"Timed out waiting for {provider_name} response to {method}.")
 
 
 def _is_gh_copilot_deprecation_message(stderr_text: str) -> bool:
@@ -360,7 +370,7 @@ class ACPProviderAdapter:
         return RuntimeError(f"{self.display_name} process exited early: {stderr_text}")
 
     def timeout_error(self, method: str) -> TimeoutError:
-        return TimeoutError(f"Timed out waiting for {self.display_name} response to {method}.")
+        return ACPProviderTimeoutError(self.display_name, method)
 
     def method_error(self, method: str, error: Any) -> RuntimeError:
         message = error.get("message") if isinstance(error, dict) else None
@@ -1827,12 +1837,24 @@ class CopilotACPClient:
         self.is_closed = True
         if proc is None:
             return
+        pgid: int | None = None
+        if os.name != "nt":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:
+                pgid = None
         try:
-            proc.terminate()
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                proc.terminate()
             proc.wait(timeout=2)
         except Exception:
             try:
-                proc.kill()
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    proc.kill()
             except Exception:
                 pass
 
@@ -1942,16 +1964,18 @@ class CopilotACPClient:
                     pass
 
         try:
-            proc = subprocess.Popen(
-                [self._acp_command] + acp_args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd=process_cwd,
-                env=env,
-            )
+            popen_kwargs: dict[str, Any] = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "bufsize": 1,
+                "cwd": process_cwd,
+                "env": env,
+            }
+            if os.name != "nt":
+                popen_kwargs["start_new_session"] = True
+            proc = subprocess.Popen([self._acp_command] + acp_args, **popen_kwargs)
         except FileNotFoundError as exc:
             _cleanup_generated_files()
             raise RuntimeError(

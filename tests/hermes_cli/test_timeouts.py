@@ -214,7 +214,7 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
     # Case D: Copilot ACP has a bounded subprocess default unless configured
     agent2.provider = "copilot-acp"
     agent2.model = "claude-haiku-4.5"
-    assert agent2._resolved_api_call_timeout() == 300.0
+    assert agent2._resolved_api_call_timeout() == 180.0
 
 
 def test_resolved_api_call_stale_timeout_priority(monkeypatch, tmp_path):

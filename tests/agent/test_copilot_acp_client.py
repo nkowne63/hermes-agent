@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
+import subprocess
 import shutil
 import tempfile
 import unittest
@@ -235,6 +237,8 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
 
     assert captured["kwargs"]["env"]["HOME"] == str(real_home)
     assert captured["kwargs"]["env"]["HERMES_REAL_HOME"] == str(real_home)
+    if os.name != "nt":
+        assert captured["kwargs"]["start_new_session"] is True
 
 
 def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
@@ -250,6 +254,44 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
 
     assert "env" in captured["kwargs"]
     assert captured["kwargs"]["env"]["HOME"]
+    if os.name != "nt":
+        assert captured["kwargs"]["start_new_session"] is True
+
+
+def test_close_terminates_acp_process_group_on_posix(monkeypatch, tmp_path):
+    if os.name == "nt":
+        pytest.skip("process groups use different primitives on Windows")
+
+    class _FakeRunningProcess:
+        pid = 4242
+
+        def __init__(self):
+            self.kill_called = False
+
+        def terminate(self):
+            raise AssertionError("process group termination should be used")
+
+        def kill(self):
+            self.kill_called = True
+
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired("copilot", timeout)
+
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr("agent.copilot_acp_client.os.getpgid", lambda pid: 42420)
+    monkeypatch.setattr(
+        "agent.copilot_acp_client.os.killpg",
+        lambda pgid, sig: sent.append((pgid, sig)),
+    )
+
+    client = _make_home_client(tmp_path)
+    proc = _FakeRunningProcess()
+    client._active_process = proc
+
+    client.close()
+
+    assert sent == [(42420, signal.SIGTERM), (42420, signal.SIGKILL)]
+    assert proc.kill_called is False
 
 
 def test_run_prompt_does_not_pass_devin_model_env_for_copilot_acp(monkeypatch, tmp_path):
