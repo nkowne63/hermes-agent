@@ -77,6 +77,8 @@ async def test_model_picker_clears_controls_before_running_switch_callback():
         ("switch", "456", "gpt-5.4", "copilot"),
         ("final-edit", "⚙ Model Switched", "Model switched", None),
     ]
+    assert view.resolved is True
+    assert view.stopped is True
     interaction.response.edit_message.assert_awaited_once()
     interaction.response.defer.assert_not_called()
     interaction.edit_original_response.assert_awaited_once()
@@ -168,3 +170,48 @@ async def test_expensive_model_requires_confirmation(monkeypatch):
         ("switch", "456", "openai/gpt-5.5-pro", "openrouter"),
         ("final-edit", "⚙ Model Switched", "Model switched", None),
     ]
+    assert view.resolved is True
+    assert view.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_model_picker_timeout_does_not_overwrite_successful_switch():
+    async def on_model_selected(chat_id: str, model_id: str, provider_slug: str) -> str:
+        return "Model switched"
+
+    message = SimpleNamespace(edit=AsyncMock())
+    view = ModelPickerView(
+        providers=[
+            {
+                "slug": "copilot",
+                "name": "GitHub Copilot",
+                "models": ["gpt-5.4"],
+                "total_models": 1,
+                "is_current": True,
+            }
+        ],
+        current_model="gpt-5-mini",
+        current_provider="copilot",
+        session_key="session-1",
+        on_model_selected=on_model_selected,
+        allowed_user_ids={"123"},
+    )
+    view._selected_provider = "copilot"
+    view._message = message
+
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123),
+        channel_id=456,
+        data={"values": ["gpt-5.4"]},
+        response=SimpleNamespace(
+            defer=AsyncMock(),
+            send_message=AsyncMock(),
+            edit_message=AsyncMock(),
+        ),
+        edit_original_response=AsyncMock(),
+    )
+
+    await view._on_model_selected(interaction)
+    await view.on_timeout()
+
+    message.edit.assert_not_awaited()

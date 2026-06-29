@@ -136,10 +136,13 @@ def _ensure_discord_mock() -> None:
         def __init__(self, timeout=None):
             self.timeout = timeout
             self.children = []
+            self.stopped = False
         def add_item(self, item):
             self.children.append(item)
         def clear_items(self):
             self.children.clear()
+        def stop(self):
+            self.stopped = True
 
     class _FakeSelect:
         def __init__(self, *, placeholder=None, options=None, custom_id=None, **_):
@@ -448,4 +451,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-

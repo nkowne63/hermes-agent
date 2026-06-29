@@ -6440,6 +6440,7 @@ def _define_discord_view_classes() -> None:
 
             self.resolved = True
             self.clear_items()
+            self.stop()
             await interaction.response.edit_message(
                 embed=discord.Embed(
                     title="⚙ Switching Model",
@@ -6542,6 +6543,7 @@ def _define_discord_view_classes() -> None:
         async def _on_cancel(self, interaction: discord.Interaction):
             self.resolved = True
             self.clear_items()
+            self.stop()
             await interaction.response.edit_message(
                 embed=discord.Embed(
                     title="⚙ Model Configuration",
@@ -6552,6 +6554,8 @@ def _define_discord_view_classes() -> None:
             )
 
         async def on_timeout(self):
+            if self.resolved:
+                return
             self.resolved = True
             self.clear_items()
             # Visually update the Discord message so it appears expired.

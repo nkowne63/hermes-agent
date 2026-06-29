@@ -1099,7 +1099,8 @@ class AIAgent:
           1. ``providers.<id>.models.<model>.timeout_seconds`` (per-model override)
           2. ``providers.<id>.request_timeout_seconds`` (provider-wide)
           3. ``HERMES_API_TIMEOUT`` env var (legacy escape hatch)
-          4. 1800.0s default
+          4. provider-specific default for subprocess ACP providers
+          5. 1800.0s default
 
         Used by OpenAI-wire chat completions (streaming and non-streaming) so
         the per-provider config knob wins over the 1800s default.  Without this
@@ -1110,7 +1111,12 @@ class AIAgent:
         cfg = get_provider_request_timeout(self.provider, self.model)
         if cfg is not None:
             return cfg
-        return env_float("HERMES_API_TIMEOUT", 1800.0)
+        env_timeout = os.getenv("HERMES_API_TIMEOUT")
+        if env_timeout is not None:
+            return env_float("HERMES_API_TIMEOUT", 1800.0)
+        if str(self.provider or "").strip().lower() == "copilot-acp":
+            return 300.0
+        return 1800.0
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Resolve the base non-stream stale timeout and whether it is implicit.
