@@ -50,7 +50,9 @@ from run_agent import AIAgent  # noqa: E402
 
 DEFAULT_PROMPT = (
     "nuxt3移行関連のドキュメントを読み、orchestoratorとその使用トークンの"
-    "内訳に注意しつつ短く要約して"
+    "内訳に注意しつつ短く要約して。場所が曖昧でも確認質問はせず、まず"
+    "session_searchやskill_viewなどのfocused Hermes toolsを1〜2回使って探して。"
+    "広範囲のfilesystem検索は避けて"
 )
 
 RELEVANCE_TERMS = (

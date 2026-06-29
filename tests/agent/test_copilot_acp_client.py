@@ -661,6 +661,8 @@ def test_claude_tools_only_uses_native_mcp_surface_not_prompt_schemas(tmp_path):
 
     assert "Available tools (OpenAI function schema)." not in prompt
     assert "mcp__hermes__<tool_name>" in prompt
+    assert "do not ask for clarification first" in prompt
+    assert "mcp__hermes__session_search" in prompt
     assert "Do not print XML" in prompt
 
 
@@ -868,6 +870,22 @@ def test_claude_initial_session_mode_prefers_bypass_when_hermes_bridge_is_on(tmp
 
     with _patch.object(client._provider_adapter, "_settings", return_value={}):
         assert client._provider_adapter.initial_session_mode() == "bypass"
+
+
+def test_acp_session_update_records_provider_activity(tmp_path):
+    events = []
+    client = CopilotACPClient(
+        api_key="claude-acp",
+        base_url="acp://claude",
+        acp_command="npx",
+        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_cwd=str(tmp_path),
+        activity_callback=lambda desc: events.append(desc),
+    )
+
+    client._record_provider_activity("Claude ACP event received")
+
+    assert events == ["Claude ACP event received"]
 
 
 def test_devin_session_update_tool_events_are_captured_structurally(tmp_path):

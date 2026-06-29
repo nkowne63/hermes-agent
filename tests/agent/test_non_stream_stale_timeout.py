@@ -125,6 +125,24 @@ def test_short_codex_request_uses_base_only(monkeypatch, tmp_path):
     assert agent._compute_non_stream_stale_timeout(payload) == 90.0
 
 
+def test_claude_acp_implicit_stale_timeout_floor(monkeypatch, tmp_path):
+    """Claude ACP needs more headroom for subprocess/agent first responses."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+
+    agent = _make_agent(
+        tmp_path,
+        provider="claude-acp",
+        base_url="acp://claude",
+        model="claude-sonnet-4.6",
+    )
+
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    assert agent._compute_non_stream_stale_timeout(payload) == 240.0
+
+
 def test_long_codex_request_bumps_to_50k_tier(monkeypatch, tmp_path):
     """Codex payload > 50k tokens -> at least 150s."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

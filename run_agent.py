@@ -1138,6 +1138,9 @@ class AIAgent:
         if env_timeout is not None:
             return float(env_timeout), False
 
+        if str(self.provider or "").strip().lower() == "claude-acp":
+            return 240.0, False
+
         # Reasoning-model floor: auto-mitigation for known reasoning models
         # (Nemotron 3 Ultra, OpenAI o1/o3, Anthropic Opus 4.x thinking,
         # DeepSeek R1, Qwen QwQ, xAI Grok reasoning, etc.) whose cloud

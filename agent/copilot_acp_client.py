@@ -899,6 +899,8 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
             "Use the conversation transcript below as the source of truth.",
             "Hermes tools are exposed natively through the MCP server named `hermes`.",
             "When a tool is needed, call the native MCP tool named `mcp__hermes__<tool_name>`.",
+            "For documentation lookup tasks, do not ask for clarification first; start with one or two focused Hermes tools such as `mcp__hermes__session_search` or `mcp__hermes__skill_view`.",
+            "Avoid broad filesystem searches unless the focused Hermes tools fail to find relevant context.",
             "Do not print XML, JSON function calls, MCP protocol messages, or tool transcripts in the final answer.",
         ]
         if model:
@@ -1405,6 +1407,7 @@ class CopilotACPClient:
         command: str | None = None,
         args: list[str] | None = None,
         tool_progress_callback: Any = None,
+        activity_callback: Any = None,
         **_: Any,
     ):
         self.api_key = api_key or "copilot-acp"
@@ -1423,10 +1426,20 @@ class CopilotACPClient:
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
         self._tool_progress_callback = tool_progress_callback
+        self._activity_callback = activity_callback
         self._last_acp_session_updates: list[dict[str, Any]] = []
         self._last_acp_tool_trace: list[dict[str, Any]] = []
         self._last_acp_reasoning_trace: list[str] = []
         self._completed_acp_tool_call_ids: set[str] = set()
+
+    def _record_provider_activity(self, desc: str) -> None:
+        callback = self._activity_callback
+        if callback is None:
+            return
+        try:
+            callback(desc)
+        except Exception:
+            logger.debug("ACP activity_callback failed", exc_info=True)
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -1624,6 +1637,9 @@ class CopilotACPClient:
                 except queue.Empty:
                     continue
 
+                self._record_provider_activity(
+                    f"{self._provider_adapter.display_name} ACP event received"
+                )
                 if self._handle_server_message(
                     msg,
                     process=proc,
