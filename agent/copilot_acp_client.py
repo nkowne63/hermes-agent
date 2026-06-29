@@ -867,23 +867,65 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
     def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         if not self._hermes_tools_only():
             return tools
-        hermes_tools = _hermes_mcp_tool_definitions(self._tool_platform())
-        resolved_tools = hermes_tools or tools
         logger.debug(
-            "Claude ACP prompt tools: hermes_mcp=%d fallback=%d",
-            len(hermes_tools),
+            "Claude ACP prompt tools: using native MCP surface, suppressing prompt schemas (fallback=%d)",
             len(tools or []),
         )
-        if not resolved_tools:
-            logger.warning(
-                "Claude ACP hermes MCP tool surface is empty; falling back to the provided tool list"
-            )
-        return resolved_tools
+        return None
 
     def initial_session_mode(self) -> str | None:
         if self._hermes_tools_only() and self._use_hermes_mcp_bridge():
             return "bypass"
         return None
+
+    def format_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+    ) -> str:
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return super().format_prompt(
+                messages,
+                model=model,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+
+        sections: list[str] = [
+            "You are being used as the active Claude ACP agent backend for Hermes.",
+            "Use the conversation transcript below as the source of truth.",
+            "Hermes tools are exposed natively through the MCP server named `hermes`.",
+            "When a tool is needed, call the native MCP tool named `mcp__hermes__<tool_name>`.",
+            "Do not print XML, JSON function calls, MCP protocol messages, or tool transcripts in the final answer.",
+        ]
+        if model:
+            sections.append(f"Hermes requested model hint: {model}")
+        if tool_choice is not None:
+            sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
+
+        transcript: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "unknown").strip().lower()
+            content = _render_message_content(message.get("content"))
+            if not content:
+                continue
+            if role == "tool":
+                tool_name = str(message.get("name") or "tool").strip() or "tool"
+                transcript.append(f"Tool result ({tool_name}):\n{content}")
+            elif role in {"system", "user", "assistant"}:
+                transcript.append(f"{role.title()}:\n{content}")
+            else:
+                transcript.append(f"Context:\n{content}")
+
+        if transcript:
+            sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+        sections.append("Continue from the latest user request. Return only the final answer.")
+        return "\n\n".join(section.strip() for section in sections if section and section.strip())
 
     def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
         if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
@@ -892,8 +934,8 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
         model_value = self._normalize_model_for_cli(model)
         options: dict[str, Any] = {
             "tools": [],
+            "allowedTools": self._allowed_tools(),
             "disallowedTools": list(self._DISALLOWED_BUILTIN_TOOLS),
-            "mcpServers": {},
         }
         if model_value and model_value.lower() not in {"claude", "claude-acp"}:
             options["env"] = {"ANTHROPIC_MODEL": model_value}
@@ -903,28 +945,36 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
         meta = dict(merged.get("_meta") or {})
         claude_code = dict(meta.get("claudeCode") or {})
         existing_options = dict(claude_code.get("options") or {})
-        existing_servers = existing_options.get("mcpServers") or {}
-        if isinstance(existing_servers, list):
-            existing_servers = {
-                str(server.get("name")): dict(server)
-                for server in existing_servers
-                if isinstance(server, dict) and str(server.get("name") or "").strip()
-            }
-        elif not isinstance(existing_servers, dict):
-            existing_servers = {}
+        existing_raw = merged.get("mcpServers") or []
+        if isinstance(existing_raw, dict):
+            existing_servers = [
+                {"name": str(name), **dict(server)}
+                for name, server in existing_raw.items()
+                if isinstance(server, dict) and str(name).strip()
+            ]
+        elif isinstance(existing_raw, list):
+            existing_servers = [
+                dict(server)
+                for server in existing_raw
+                if isinstance(server, dict)
+            ]
+        else:
+            existing_servers = []
 
         hermes_server = _build_hermes_mcp_server(
             platform=self._tool_platform(),
             session_prefix="claude-acp",
             cwd=str(merged.get("cwd") or os.getcwd()),
         )
-        existing_servers = dict(existing_servers)
-        existing_servers.setdefault("hermes", hermes_server)
-        options["mcpServers"] = existing_servers
+        if not any(
+            isinstance(server, dict) and server.get("name") == "hermes"
+            for server in existing_servers
+        ):
+            existing_servers.append(hermes_server)
+        merged["mcpServers"] = existing_servers
 
         merged_options = dict(existing_options)
         merged_options.update(options)
-        merged_options["mcpServers"] = existing_servers
         claude_code["options"] = merged_options
         meta["claudeCode"] = claude_code
         merged["_meta"] = meta

@@ -607,12 +607,12 @@ def test_claude_session_params_inject_hermes_mcp_bridge(tmp_path):
 
     options = params["_meta"]["claudeCode"]["options"]
     assert options["tools"] == []
-    assert "hermes" in options["mcpServers"]
+    assert options["allowedTools"] == ["mcp__hermes__*"]
     assert "Bash" in options["disallowedTools"]
     assert options["env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4-5"
     assert options["settings"]["availableModels"] == ["claude-sonnet-4-5"]
 
-    hermes_server = options["mcpServers"]["hermes"]
+    hermes_server = next(server for server in params["mcpServers"] if server["name"] == "hermes")
     assert hermes_server["command"]
     assert "mcp_hermes_tools.py" in hermes_server["args"][0]
     env = {item["name"]: item["value"] for item in hermes_server["env"]}
@@ -639,12 +639,37 @@ def test_claude_mcp_bridge_can_be_disabled_to_keep_native_tools(tmp_path):
         assert client._provider_adapter.supports_client_method("fs/read_text_file") is True
 
 
-def test_acp_tools_only_uses_hermes_mcp_tools(tmp_path):
+def test_claude_tools_only_uses_native_mcp_surface_not_prompt_schemas(tmp_path):
     client = CopilotACPClient(
         api_key="claude-acp",
         base_url="acp://claude",
         acp_command="npx",
         acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_cwd=str(tmp_path),
+    )
+    original = [
+        {"type": "function", "function": {"name": "terminal", "parameters": {}}},
+    ]
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        assert client._provider_adapter.prompt_tools(original) is None
+        prompt = client._provider_adapter.format_prompt(
+            [{"role": "user", "content": "Inspect the repo"}],
+            model="claude-sonnet-4.6",
+            tools=original,
+        )
+
+    assert "Available tools (OpenAI function schema)." not in prompt
+    assert "mcp__hermes__<tool_name>" in prompt
+    assert "Do not print XML" in prompt
+
+
+def test_devin_acp_tools_only_uses_hermes_mcp_tools(tmp_path):
+    client = CopilotACPClient(
+        api_key="devin-acp",
+        base_url="acp://devin",
+        acp_command="devin",
+        acp_args=["acp"],
         acp_cwd=str(tmp_path),
     )
     original = [
@@ -662,10 +687,10 @@ def test_acp_tools_only_uses_hermes_mcp_tools(tmp_path):
 
 def test_create_chat_completion_includes_tools_and_extracts_tool_calls(tmp_path):
     client = CopilotACPClient(
-        api_key="claude-acp",
-        base_url="acp://claude",
-        acp_command="npx",
-        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        api_key="copilot-acp",
+        base_url="acp://copilot",
+        acp_command="copilot",
+        acp_args=["--acp", "--stdio"],
         acp_cwd=str(tmp_path),
     )
     tools = [
@@ -825,6 +850,19 @@ def test_devin_initial_session_mode_prefers_bypass_when_hermes_bridge_is_on(tmp_
         base_url="acp://devin",
         acp_command="devin",
         acp_args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch.object(client._provider_adapter, "_settings", return_value={}):
+        assert client._provider_adapter.initial_session_mode() == "bypass"
+
+
+def test_claude_initial_session_mode_prefers_bypass_when_hermes_bridge_is_on(tmp_path):
+    client = CopilotACPClient(
+        api_key="claude-acp",
+        base_url="acp://claude",
+        acp_command="npx",
+        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
         acp_cwd=str(tmp_path),
     )
 
