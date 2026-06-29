@@ -1650,6 +1650,29 @@ def test_interim_commentary_preserves_assistant_content(monkeypatch):
     assert "I'll inspect the repo structure first." in observed["text"]
 
 
+def test_acp_tool_call_turn_content_is_not_emitted_as_interim_commentary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.provider = "claude-acp"
+    observed = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: observed.append(text)
+    )
+
+    agent._emit_interim_assistant_message({
+        "role": "assistant",
+        "content": "I will search files.\n\nPlease tell me where to look.",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search_files", "arguments": "{}"},
+            }
+        ],
+    })
+
+    assert observed == []
+
+
 def test_stream_delta_strips_leaked_memory_context(monkeypatch):
     agent = _build_agent(monkeypatch)
     observed = []

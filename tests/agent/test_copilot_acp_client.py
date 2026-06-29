@@ -663,6 +663,13 @@ def test_claude_tools_only_uses_native_mcp_surface_not_prompt_schemas(tmp_path):
     assert "mcp__hermes__<tool_name>" in prompt
     assert "do not ask for clarification first" in prompt
     assert "mcp__hermes__session_search" in prompt
+    assert "mcp__hermes__search_files" in prompt
+    assert "ファイル検索" in prompt
+    assert "pattern" in prompt
+    assert "not `query`" in prompt
+    assert "actually called a file tool" in prompt
+    assert "only the tool calls" in prompt
+    assert "answer from those results" in prompt
     assert "Do not print XML" in prompt
 
 
@@ -1149,6 +1156,39 @@ def test_extract_tool_calls_understands_function_calls_json_arrays():
     }
 
 
+def test_extract_tool_calls_understands_function_calls_bracket_syntax():
+    tool_calls, cleaned = _extract_tool_calls_from_text(
+        "Thinking.\n"
+        "<function_calls>\n"
+        '[mcp__hermes__search_files(query="nuxt3 migration"), '
+        'mcp__hermes__read_file(path="/tmp/notes.md")]\n'
+        "</function_calls>\n"
+        "Done."
+    )
+
+    assert cleaned == "Thinking.\nDone."
+    assert [tc.function.name for tc in tool_calls] == ["search_files", "read_file"]
+    assert json.loads(tool_calls[0].function.arguments) == {
+        "query": "nuxt3 migration",
+        "pattern": "nuxt3 migration",
+    }
+    assert json.loads(tool_calls[1].function.arguments) == {
+        "path": "/tmp/notes.md"
+    }
+
+
+def test_extract_tool_calls_maps_search_files_query_to_pattern():
+    tool_calls, _cleaned = _extract_tool_calls_from_text(
+        '<function_calls>[mcp__hermes__search_files(query="nuxt3")]</function_calls>'
+    )
+
+    assert [tc.function.name for tc in tool_calls] == ["search_files"]
+    assert json.loads(tool_calls[0].function.arguments) == {
+        "query": "nuxt3",
+        "pattern": "nuxt3",
+    }
+
+
 def test_extract_tool_calls_parses_claude_invoke_parameters_as_json_arguments():
     tool_calls, cleaned = _extract_tool_calls_from_text(
         "<function_calls>"
@@ -1182,6 +1222,38 @@ def test_extract_tool_calls_parses_direct_claude_mcp_tags():
     assert json.loads(tool_calls[0].function.arguments) == {
         "name": "nuxt3-regression-context"
     }
+
+
+def test_create_chat_completion_extracts_tool_calls_from_reasoning(tmp_path):
+    client = CopilotACPClient(
+        api_key="claude-acp",
+        base_url="acp://claude",
+        acp_command="npx",
+        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    def _fake_run_prompt(_prompt_text, **_kwargs):
+        return (
+            "I will summarize after the search.",
+            '<function_calls>[mcp__hermes__search_files(query="nuxt3")]</function_calls>',
+        )
+
+    with patch.object(client, "_run_prompt", side_effect=_fake_run_prompt):
+        response = client._create_chat_completion(
+            model="claude-haiku-4.5",
+            messages=[{"role": "user", "content": "ファイル検索して"}],
+            tools=None,
+        )
+
+    message = response.choices[0].message
+    assert response.choices[0].finish_reason == "tool_calls"
+    assert [tc.function.name for tc in message.tool_calls] == ["search_files"]
+    assert json.loads(message.tool_calls[0].function.arguments) == {
+        "query": "nuxt3",
+        "pattern": "nuxt3",
+    }
+    assert message.reasoning is None
 
 
 def test_devin_agent_config_is_json_permissions_and_mcpservers(tmp_path):

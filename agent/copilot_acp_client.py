@@ -901,6 +901,11 @@ class ClaudeACPProviderAdapter(ACPProviderAdapter):
             "When a tool is needed, call the native MCP tool named `mcp__hermes__<tool_name>`.",
             "For documentation lookup tasks, do not ask for clarification first; start with one or two focused Hermes tools such as `mcp__hermes__session_search` or `mcp__hermes__skill_view`.",
             "Avoid broad filesystem searches unless the focused Hermes tools fail to find relevant context.",
+            "If the user explicitly asks to read files, search files, inspect paths, or uses words like `file`, `files`, `ファイル`, or `ファイル検索`, include `mcp__hermes__search_files` and/or `mcp__hermes__read_file` in the first relevant tool batch.",
+            "For `mcp__hermes__search_files`, use `pattern` as the required search argument, not `query`.",
+            "Do not say you searched or read files unless you actually called a file tool.",
+            "When you call tools, emit only the tool calls for that assistant turn; do not include a draft answer or a final answer alongside the tool calls.",
+            "After tool results appear in the transcript, answer from those results; do not announce that you will call the same tools again unless you are actually calling them again.",
             "Do not print XML, JSON function calls, MCP protocol messages, or tool transcripts in the final answer.",
         ]
         if model:
@@ -1252,17 +1257,24 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
     def _try_add_invoke(name: str, raw_args: str = "") -> None:
         if not isinstance(name, str) or not name.strip():
             return
+        normalized_name = normalize_hermes_tool_name(name)
         args_text = raw_args.strip()
         if not args_text:
             fn_args = "{}"
         else:
             parameter_args = _extract_invoke_parameter_arguments(args_text)
             if parameter_args is not None:
-                fn_args = json.dumps(parameter_args, ensure_ascii=False)
+                fn_args = json.dumps(
+                    _normalize_extracted_tool_arguments(normalized_name, parameter_args),
+                    ensure_ascii=False,
+                )
             else:
                 try:
-                    json.loads(args_text)
-                    fn_args = args_text
+                    parsed_args = json.loads(args_text)
+                    fn_args = json.dumps(
+                        _normalize_extracted_tool_arguments(normalized_name, parsed_args),
+                        ensure_ascii=False,
+                    )
                 except Exception:
                     fn_args = json.dumps({"text": args_text}, ensure_ascii=False)
         call_id = f"acp_call_{len(extracted)+1}"
@@ -1272,7 +1284,7 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
                 call_id=call_id,
                 response_item_id=None,
                 type="function",
-                function=SimpleNamespace(name=normalize_hermes_tool_name(name), arguments=fn_args),
+                function=SimpleNamespace(name=normalized_name, arguments=fn_args),
             )
         )
 
@@ -1322,6 +1334,10 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
         r"|<(?P<self_name>mcp__hermes__[A-Za-z0-9_]+)\b(?P<self_attrs>[^>]*)/>",
         re.DOTALL | re.IGNORECASE,
     )
+    bracket_call_pattern = re.compile(
+        r"\b(?P<name>mcp__hermes__[A-Za-z0-9_]+)\s*\((?P<args>[^()]*)\)",
+        re.DOTALL | re.IGNORECASE,
+    )
     for m in function_calls_pattern.finditer(text):
         block = m.group(1) or ""
         matched_invoke = False
@@ -1346,6 +1362,14 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
             for item in items:
                 if _try_add_function_call_item(item):
                     matched_invoke = True
+        if not matched_invoke:
+            for call in bracket_call_pattern.finditer(block):
+                args = _extract_call_expression_arguments(call.group("args") or "")
+                _try_add_invoke(
+                    call.group("name") or "",
+                    json.dumps(args, ensure_ascii=False) if args else "{}",
+                )
+                matched_invoke = True
         if matched_invoke:
             consumed_spans.append((m.start(), m.end()))
 
@@ -1431,6 +1455,43 @@ def _extract_xml_attribute_arguments(raw_attrs: str) -> dict[str, str] | None:
         args[name] = unescape(match.group(3) or "").strip()
 
     return args or None
+
+
+def _extract_call_expression_arguments(raw_args: str) -> dict[str, Any] | None:
+    """Parse simple Claude-style `tool(key="value")` argument lists."""
+    if not isinstance(raw_args, str) or not raw_args.strip():
+        return None
+
+    args: dict[str, Any] = {}
+    arg_re = re.compile(
+        r"([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*"
+        r"(?:(['\"])(.*?)\2|([^,\s]+))",
+        re.DOTALL,
+    )
+    for match in arg_re.finditer(raw_args):
+        name = match.group(1).strip()
+        if not name:
+            continue
+        if match.group(2):
+            value: Any = unescape(match.group(3) or "").strip()
+        else:
+            raw_value = (match.group(4) or "").strip()
+            try:
+                value = json.loads(raw_value)
+            except Exception:
+                value = raw_value
+        args[name] = value
+
+    return args or None
+
+
+def _normalize_extracted_tool_arguments(tool_name: str, args: Any) -> Any:
+    if tool_name != "search_files" or not isinstance(args, dict):
+        return args
+    if "pattern" not in args and isinstance(args.get("query"), str):
+        args = dict(args)
+        args["pattern"] = args["query"]
+    return args
 
 
 
@@ -1566,6 +1627,10 @@ class CopilotACPClient:
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        if not tool_calls and reasoning_text:
+            tool_calls, cleaned_reasoning = _extract_tool_calls_from_text(reasoning_text)
+            if tool_calls:
+                reasoning_text = cleaned_reasoning
 
         usage = SimpleNamespace(
             prompt_tokens=0,

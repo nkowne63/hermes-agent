@@ -4241,6 +4241,13 @@ class AIAgent:
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
             return
+        provider = str(getattr(self, "provider", "") or "").strip().lower()
+        base_url = str(getattr(self, "base_url", "") or "").strip().lower()
+        if assistant_msg.get("tool_calls") and (
+            provider in {"copilot-acp", "devin-acp", "claude-acp"}
+            or base_url.startswith("acp://")
+        ):
+            return
         content = assistant_msg.get("content")
         visible = self._strip_think_blocks(content or "").strip()
         if not visible or visible == "(empty)":
