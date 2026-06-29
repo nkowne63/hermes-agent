@@ -21,6 +21,7 @@ import threading
 import time
 import sys
 import uuid
+from html import unescape
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -1192,7 +1193,7 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
                 call_id=call_id,
                 response_item_id=None,
                 type="function",
-                function=SimpleNamespace(name=fn_name.strip(), arguments=fn_args),
+                function=SimpleNamespace(name=normalize_hermes_tool_name(fn_name), arguments=fn_args),
             )
         )
 
@@ -1203,11 +1204,15 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
         if not args_text:
             fn_args = "{}"
         else:
-            try:
-                json.loads(args_text)
-                fn_args = args_text
-            except Exception:
-                fn_args = json.dumps({"text": args_text}, ensure_ascii=False)
+            parameter_args = _extract_invoke_parameter_arguments(args_text)
+            if parameter_args is not None:
+                fn_args = json.dumps(parameter_args, ensure_ascii=False)
+            else:
+                try:
+                    json.loads(args_text)
+                    fn_args = args_text
+                except Exception:
+                    fn_args = json.dumps({"text": args_text}, ensure_ascii=False)
         call_id = f"acp_call_{len(extracted)+1}"
         extracted.append(
             SimpleNamespace(
@@ -1215,7 +1220,7 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
                 call_id=call_id,
                 response_item_id=None,
                 type="function",
-                function=SimpleNamespace(name=name.strip(), arguments=fn_args),
+                function=SimpleNamespace(name=normalize_hermes_tool_name(name), arguments=fn_args),
             )
         )
 
@@ -1279,6 +1284,33 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
 
     cleaned = "\n".join(p.strip() for p in parts if p and p.strip()).strip()
     return extracted, cleaned
+
+
+def _extract_invoke_parameter_arguments(raw_args: str) -> dict[str, str] | None:
+    """Parse Claude-style invoke parameter XML into OpenAI JSON arguments."""
+    if not isinstance(raw_args, str) or "<parameter" not in raw_args.lower():
+        return None
+
+    params: dict[str, str] = {}
+    parameter_re = re.compile(
+        r"<parameter\b([^>]*)>(.*?)</parameter>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    for match in parameter_re.finditer(raw_args):
+        attrs = match.group(1) or ""
+        name_match = re.search(
+            r'name\s*=\s*["\']([^"\']+)["\']',
+            attrs,
+            flags=re.IGNORECASE,
+        )
+        if not name_match:
+            continue
+        name = unescape(name_match.group(1)).strip()
+        if not name:
+            continue
+        params[name] = unescape(match.group(2) or "").strip()
+
+    return params or None
 
 
 

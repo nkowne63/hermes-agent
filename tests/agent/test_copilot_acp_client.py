@@ -1066,8 +1066,27 @@ def test_extract_tool_calls_understands_function_calls_blocks():
 
     assert cleaned == "Done."
     assert tool_calls
-    assert tool_calls[0].function.name == "mcp__hermes__skills_list"
+    assert tool_calls[0].function.name == "skills_list"
     assert tool_calls[0].function.arguments == "{}"
+
+
+def test_extract_tool_calls_parses_claude_invoke_parameters_as_json_arguments():
+    tool_calls, cleaned = _extract_tool_calls_from_text(
+        "<function_calls>"
+        "<invoke name=\"mcp__hermes__execute_code\">"
+        "<parameter name=\"code\">from hermes_tools import terminal\n"
+        "result = terminal('pwd')\n"
+        "print(result)</parameter>"
+        "</invoke>"
+        "</function_calls>\nDone."
+    )
+
+    assert cleaned == "Done."
+    assert tool_calls
+    assert tool_calls[0].function.name == "execute_code"
+    assert json.loads(tool_calls[0].function.arguments) == {
+        "code": "from hermes_tools import terminal\nresult = terminal('pwd')\nprint(result)"
+    }
 
 
 def test_devin_agent_config_is_json_permissions_and_mcpservers(tmp_path):

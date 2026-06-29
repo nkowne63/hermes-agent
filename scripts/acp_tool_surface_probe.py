@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Probe Hermes tool-surface behavior through a baseline model and Devin ACP.
+"""Probe Hermes tool-surface behavior through a baseline model and ACP backend.
 
 This is an intentionally live diagnostic script, not a unit test. It sends a
 fixed prompt through Hermes with:
 
 1. openai-codex/gpt-5.4-mini as the reference backend
-2. devin-acp/swe-1.6 as the ACP backend under test
+2. an ACP-backed provider/model as the backend under test
 
-It records Hermes tool-progress callbacks, response text, and Devin CLI logs
-created during the run, then emits a JSON report with heuristic pass/fail
-signals for whether Hermes tools were surfaced and executed cleanly.
+It records Hermes tool-progress callbacks, response text, and provider-specific
+diagnostic logs where available, then emits a JSON report with heuristic
+pass/fail signals for whether Hermes tools were surfaced and executed cleanly.
 """
 
 from __future__ import annotations
@@ -49,8 +49,8 @@ from run_agent import AIAgent  # noqa: E402
 
 
 DEFAULT_PROMPT = (
-    "nuxt3移行関連ファイルを読んで、特にオーケストレータの状況と"
-    "使用トークン数の内訳についてフォーカスして短く要約して"
+    "nuxt3移行関連のドキュメントを読み、orchestoratorとその使用トークンの"
+    "内訳に注意しつつ短く要約して"
 )
 
 RELEVANCE_TERMS = (
@@ -82,6 +82,7 @@ DEVIN_NATIVE_TOOLS = (
     "mcp_list_servers",
     "mcp_list_tools",
 )
+ACP_NATIVE_TOOL_HINTS = DEVIN_NATIVE_TOOLS
 
 GENERIC_HERMES_PREVIEW_RE = re.compile(r"^Calling\\s+.+\\s+from\\s+hermes$", re.IGNORECASE)
 PREVIEW_DETAIL_MARKERS = (
@@ -215,7 +216,7 @@ def _summarise_response(response: str) -> dict[str, Any]:
 def _summarise_tool_events(events: list[ToolEvent]) -> dict[str, Any]:
     names = [_normalise_tool_name(event.name) for event in events if event.name]
     hermes_like = sorted({name for name in names if any(hint in name for hint in HERMES_TOOL_HINTS)})
-    native = sorted({name for name in names if name in DEVIN_NATIVE_TOOLS})
+    native = sorted({name for name in names if name in ACP_NATIVE_TOOL_HINTS})
     started_hermes = [
         event
         for event in events
@@ -314,7 +315,7 @@ def _run_agent(
     }
 
 
-def _score_run(run: dict[str, Any], *, devin_logs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _score_run(run: dict[str, Any], *, provider_logs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     response = run.get("response") or {}
     tools = run.get("tool_progress") or {}
     relevance_count = len(response.get("matched_relevance_terms") or [])
@@ -331,7 +332,7 @@ def _score_run(run: dict[str, Any], *, devin_logs: list[dict[str, Any]] | None =
     log_cancelled: list[str] = []
     log_failures: list[str] = []
     log_double_prefix: list[str] = []
-    for item in devin_logs or []:
+    for item in provider_logs or []:
         log_hermes.update(item.get("hermes_tools") or [])
         log_native.update(item.get("native_tools") or [])
         log_cancelled.extend(item.get("cancellations") or [])
@@ -342,10 +343,14 @@ def _score_run(run: dict[str, Any], *, devin_logs: list[dict[str, Any]] | None =
         "response_relevant": relevance_count >= 3,
         "response_clean": not noisy,
         "hermes_tools_observed": bool(hermes_like or log_hermes),
+        "native_provider_tools_observed": bool(native_progress or log_native),
+        "provider_cancelled_tool_call": bool(log_cancelled),
+        "provider_failures_observed": bool(log_failures),
+        "double_prefixed_hermes_tools_observed": bool(log_double_prefix),
+        # Backward-compatible field names for older Devin-focused automation.
         "native_devin_tools_observed": bool(native_progress or log_native),
         "devin_cancelled_tool_call": bool(log_cancelled),
         "devin_failures_observed": bool(log_failures),
-        "double_prefixed_hermes_tools_observed": bool(log_double_prefix),
         "errors_observed": errors,
         "passed_reference_shape": (
             relevance_count >= 3
@@ -362,6 +367,11 @@ def _score_run(run: dict[str, Any], *, devin_logs: list[dict[str, Any]] | None =
             "tool_progress_native": native_progress,
             "tool_progress_generic_hermes_previews": generic_previews[:20],
             "tool_progress_detailed_hermes_previews": detailed_previews[:20],
+            "provider_log_hermes_tools": sorted(log_hermes),
+            "provider_log_native_tools": sorted(log_native),
+            "provider_log_cancellations": log_cancelled[:20],
+            "provider_log_failures": log_failures[:20],
+            "provider_log_double_prefixed": sorted(set(log_double_prefix)),
             "devin_log_hermes_tools": sorted(log_hermes),
             "devin_log_native_tools": sorted(log_native),
             "devin_log_cancellations": log_cancelled[:20],
@@ -376,15 +386,21 @@ def main() -> int:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--baseline-provider", default="openai-codex")
     parser.add_argument("--baseline-model", default="gpt-5.4-mini")
-    parser.add_argument("--devin-provider", default="devin-acp")
-    parser.add_argument("--devin-model", default="swe-1.6")
+    parser.add_argument("--acp-provider", default=None)
+    parser.add_argument("--acp-model", default=None)
+    parser.add_argument("--acp-label", default="acp")
+    parser.add_argument("--devin-provider", dest="legacy_devin_provider", default=None)
+    parser.add_argument("--devin-model", dest="legacy_devin_model", default=None)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--max-iterations", type=int, default=12)
     parser.add_argument("--skip-baseline", action="store_true")
-    parser.add_argument("--skip-devin", action="store_true")
+    parser.add_argument("--skip-acp", action="store_true")
+    parser.add_argument("--skip-devin", dest="skip_acp", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--print-response", action="store_true")
     args = parser.parse_args()
+    acp_provider = args.acp_provider or args.legacy_devin_provider or "devin-acp"
+    acp_model = args.acp_model or args.legacy_devin_model or "swe-1.6"
 
     run_id = uuid.uuid4().hex[:10]
     overall_started = time.time()
@@ -412,23 +428,27 @@ def main() -> int:
         if args.print_response:
             print("\n[baseline response]\n" + baseline["response"]["excerpt"])
 
-    devin_log_start = time.time()
-    if not args.skip_devin:
-        devin = _run_agent(
-            label="devin",
-            provider=args.devin_provider,
-            model=args.devin_model,
+    provider_log_start = time.time()
+    if not args.skip_acp:
+        acp = _run_agent(
+            label=args.acp_label,
+            provider=acp_provider,
+            model=acp_model,
             prompt=args.prompt,
             run_id=run_id,
             timeout_seconds=args.timeout,
             max_iterations=args.max_iterations,
         )
-        devin_logs = [_parse_devin_log(path) for path in _find_new_devin_logs(devin_log_start)]
-        devin["devin_logs"] = devin_logs
-        report["runs"]["devin"] = devin
-        report["verdicts"]["devin"] = _score_run(devin, devin_logs=devin_logs)
+        provider_logs = []
+        if acp_provider == "devin-acp":
+            provider_logs = [_parse_devin_log(path) for path in _find_new_devin_logs(provider_log_start)]
+        acp["provider_logs"] = provider_logs
+        if acp_provider == "devin-acp":
+            acp["devin_logs"] = provider_logs
+        report["runs"][args.acp_label] = acp
+        report["verdicts"][args.acp_label] = _score_run(acp, provider_logs=provider_logs)
         if args.print_response:
-            print("\n[devin response]\n" + devin["response"]["excerpt"])
+            print(f"\n[{args.acp_label} response]\n" + acp["response"]["excerpt"])
 
     report["elapsed_seconds"] = round(time.time() - overall_started, 3)
 
