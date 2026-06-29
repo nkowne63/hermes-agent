@@ -1126,6 +1126,29 @@ def test_extract_tool_calls_understands_function_calls_blocks():
     assert tool_calls[0].function.arguments == "{}"
 
 
+def test_extract_tool_calls_understands_function_calls_json_arrays():
+    tool_calls, cleaned = _extract_tool_calls_from_text(
+        "Checking context.\n"
+        "<function_calls>\n"
+        "[\n"
+        '  {"tool_name": "mcp__hermes__skill_view", "parameters": {"name": "nuxt3-regression-context"}},\n'
+        '  {"tool_name": "mcp__hermes__session_search", "parameters": {"query": "nuxt3 token", "limit": 5}}\n'
+        "]\n"
+        "</function_calls>\n"
+        "Done."
+    )
+
+    assert cleaned == "Checking context.\nDone."
+    assert [tc.function.name for tc in tool_calls] == ["skill_view", "session_search"]
+    assert json.loads(tool_calls[0].function.arguments) == {
+        "name": "nuxt3-regression-context"
+    }
+    assert json.loads(tool_calls[1].function.arguments) == {
+        "query": "nuxt3 token",
+        "limit": 5,
+    }
+
+
 def test_extract_tool_calls_parses_claude_invoke_parameters_as_json_arguments():
     tool_calls, cleaned = _extract_tool_calls_from_text(
         "<function_calls>"

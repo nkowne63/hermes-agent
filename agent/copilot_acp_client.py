@@ -1276,6 +1276,26 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
             )
         )
 
+    def _try_add_function_call_item(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            raw_args = fn.get("arguments", "{}")
+        else:
+            name = item.get("tool_name") or item.get("name")
+            raw_args = item.get("parameters", item.get("arguments", {}))
+        if not isinstance(name, str) or not name.strip():
+            return False
+        if isinstance(raw_args, str):
+            args_text = raw_args
+        else:
+            args_text = json.dumps(raw_args, ensure_ascii=False)
+        before = len(extracted)
+        _try_add_invoke(name, args_text)
+        return len(extracted) > before
+
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
         raw = m.group(1)
         _try_add_tool_call(raw)
@@ -1317,6 +1337,15 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
                 continue
             _try_add_invoke(name_match.group(1), body)
             matched_invoke = True
+        if not matched_invoke:
+            try:
+                parsed_block = json.loads(block.strip())
+            except Exception:
+                parsed_block = None
+            items = parsed_block if isinstance(parsed_block, list) else [parsed_block]
+            for item in items:
+                if _try_add_function_call_item(item):
+                    matched_invoke = True
         if matched_invoke:
             consumed_spans.append((m.start(), m.end()))
 
