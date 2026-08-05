@@ -15,6 +15,7 @@ Methods covered:
 * ``drop_thinking_only_and_merge_users`` — Anthropic-style cleanup
 * ``restore_primary_runtime`` — un-do fallback activation
 * ``extract_reasoning`` — pull reasoning fields out of API responses
+* ``looks_like_acp_intermediate_ack`` — detect ACP planning text that is not a final answer
 * ``dump_api_request_debug`` — write request body for post-mortem
 * ``anthropic_prompt_cache_policy`` — compute cache_control breakpoints
 * ``create_openai_client`` — build the per-agent OpenAI SDK client
@@ -1722,6 +1723,19 @@ def restore_primary_runtime(agent) -> bool:
         from agent.chat_completion_helpers import rewrite_prompt_model_identity
         rewrite_prompt_model_identity(agent, rt["model"], rt["provider"])
 
+        _session_db = getattr(agent, "_session_db", None)
+        _session_id = getattr(agent, "session_id", None)
+        if _session_db is not None and _session_id:
+            cached_prompt = getattr(agent, "_cached_system_prompt", None)
+            if isinstance(cached_prompt, str) and cached_prompt:
+                try:
+                    _session_db.update_system_prompt(_session_id, cached_prompt)
+                except Exception:
+                    logger.warning(
+                        "Failed to persist restored primary system prompt",
+                        exc_info=True,
+                    )
+
         logger.info(
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,
@@ -1820,6 +1834,84 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
         return "\n\n".join(reasoning_parts)
     
     return None
+
+
+_ACP_INTERMEDIATE_ACTION_RE = re.compile(
+    r"("
+    r"これから|まず|次に|並行して|取得します|確認します|検索します|読み込みます|"
+    r"調べます|探します|使います|実行します|call|calling|will use|going to|"
+    r"need to|let me|I'll|I will|fetch|search|inspect|read"
+    r")",
+    re.IGNORECASE,
+)
+_ACP_FINAL_ANSWER_RE = re.compile(
+    r"("
+    r"要約|まとめ|現状|結論|確認した範囲|読んだ範囲|総トークン|トークン使用量|"
+    r"summary|summarize|conclusion|found|confirmed|total tokens|token usage"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def looks_like_acp_intermediate_ack(
+    agent,
+    *,
+    assistant_content: str,
+    messages: List[Dict[str, Any]],
+) -> bool:
+    """Return True for ACP planning text that should not be final-visible."""
+
+    provider = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "").lower()
+    if not (provider.endswith("-acp") or base_url.startswith("acp://")):
+        return False
+
+    text = (assistant_content or "").strip()
+    if not text or len(text) > 800:
+        return False
+
+    recent = messages[-8:] if isinstance(messages, list) else []
+    has_recent_tool = any(isinstance(m, dict) and m.get("role") == "tool" for m in recent)
+    recent_user_text = "\n".join(
+        str(m.get("content") or "")
+        for m in recent
+        if isinstance(m, dict) and m.get("role") == "user"
+    ).lower()
+    user_requested_tool_work = bool(
+        re.search(
+            r"("
+            r"read|search|inspect|look up|fetch|load|file|files|session|skill|"
+            r"読む|読んで|検索|探し|調べ|ファイル|セッション|スキル|"
+            r"orchestrator|orchestorator|token|トークン"
+            r")",
+            recent_user_text,
+            re.IGNORECASE,
+        )
+    )
+    if not has_recent_tool and not user_requested_tool_work:
+        return False
+
+    lowered = text.lower()
+    noisy_protocol = (
+        "session_store_sql" in lowered
+        or "mcp__hermes__" in lowered
+        or "agent_thought" in lowered
+    )
+    has_action = bool(_ACP_INTERMEDIATE_ACTION_RE.search(text))
+    has_final = bool(_ACP_FINAL_ANSWER_RE.search(text))
+    has_evidence_shape = (
+        ("`" in text and len(text.splitlines()) >= 4)
+        or len(re.findall(r"(^|\n)\s*[-*]\s+", text)) >= 2
+        or len(re.findall(r"\d", text)) >= 4
+    )
+
+    if noisy_protocol and has_action and not has_evidence_shape:
+        return True
+    if not has_recent_tool and user_requested_tool_work and has_action and not has_final:
+        return True
+    if has_action and not has_final and not has_evidence_shape:
+        return True
+    return False
 
 
 
@@ -2255,12 +2347,22 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+    if agent.provider in {"copilot-acp", "devin-acp", "claude-acp"} or str(client_kwargs.get("base_url", "")).startswith("acp://"):
         from agent.copilot_acp_client import CopilotACPClient
 
+        client_kwargs["tool_progress_callback"] = getattr(agent, "tool_progress_callback", None)
+
+        def _acp_activity(desc: str) -> None:
+            agent._acp_non_stream_last_activity_ts = time.time()
+            try:
+                agent._touch_activity(desc)
+            except Exception:
+                pass
+
+        client_kwargs["activity_callback"] = _acp_activity
         client = CopilotACPClient(**client_kwargs)
         _ra().logger.info(
-            "Copilot ACP client created (%s, shared=%s) %s",
+            "ACP client created (%s, shared=%s) %s",
             reason,
             shared,
             agent._client_log_context(),
@@ -2711,7 +2813,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     except Exception as _reasoning_err:
         logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
 
-    # ── Invalidate cached system prompt so it rebuilds next turn ──
+    # The runtime rewrite above keeps the cached system prompt aligned
+    # with the selected runtime, so preserve it for the next turn.
+    # Rebuild it after the model-specific reasoning configuration is resolved.
     agent._cached_system_prompt = None
 
     # ── Reset the cross-turn stale-call circuit breaker (#58962) ──
@@ -2776,6 +2880,25 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
     )
+
+    # Keep the cached system prompt aligned with the newly-selected runtime
+    # and persist that rewritten snapshot so the next turn can reuse it
+    # verbatim instead of rebuilding the whole prompt from scratch.
+    from agent.chat_completion_helpers import rewrite_prompt_model_identity
+    rewrite_prompt_model_identity(agent, agent.model, agent.provider)
+
+    _session_db = getattr(agent, "_session_db", None)
+    _session_id = getattr(agent, "session_id", None)
+    if _session_db is not None and _session_id:
+        cached_prompt = getattr(agent, "_cached_system_prompt", None)
+        if isinstance(cached_prompt, str) and cached_prompt:
+            try:
+                _session_db.update_system_prompt(_session_id, cached_prompt)
+            except Exception:
+                logger.warning(
+                    "Failed to persist rewritten system prompt after model switch",
+                    exc_info=True,
+                )
 
     # ── Persist billing route to session DB ──
     # The agent's _session_db / session_id may not be set in all contexts

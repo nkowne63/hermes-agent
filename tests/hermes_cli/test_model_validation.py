@@ -15,6 +15,7 @@ from hermes_cli.models import (
     normalize_provider,
     opencode_model_api_mode,
     parse_model_input,
+    cached_provider_model_ids,
     probe_api_models,
     provider_label,
     provider_model_ids,
@@ -55,6 +56,87 @@ class TestParseModelInput:
         assert provider == "openrouter"
         assert model == "anthropic/claude-sonnet-4.5"
 
+    def test_provider_colon_model_switches_provider(self):
+        provider, model = parse_model_input("openrouter:anthropic/claude-sonnet-4.5", "nous")
+        assert provider == "openrouter"
+        assert model == "anthropic/claude-sonnet-4.5"
+
+    def test_provider_alias_resolved(self):
+        provider, model = parse_model_input("glm:glm-5", "openrouter")
+        assert provider == "zai"
+        assert model == "glm-5"
+
+    def test_stepfun_alias_resolved(self):
+        provider, model = parse_model_input("step:step-3.5-flash", "openrouter")
+        assert provider == "stepfun"
+        assert model == "step-3.5-flash"
+
+    def test_no_slash_no_colon_keeps_provider(self):
+        provider, model = parse_model_input("gpt-5.4", "openrouter")
+        assert provider == "openrouter"
+        assert model == "gpt-5.4"
+
+    def test_nous_provider_switch(self):
+        provider, model = parse_model_input("nous:hermes-3", "openrouter")
+        assert provider == "nous"
+        assert model == "hermes-3"
+
+    def test_empty_model_after_colon_keeps_current(self):
+        provider, model = parse_model_input("openrouter:", "nous")
+        assert provider == "nous"
+        assert model == "openrouter:"
+
+    def test_colon_at_start_keeps_current(self):
+        provider, model = parse_model_input(":something", "openrouter")
+        assert provider == "openrouter"
+        assert model == ":something"
+
+    def test_unknown_prefix_colon_not_treated_as_provider(self):
+        """Colons are only provider delimiters if the left side is a known provider."""
+        provider, model = parse_model_input("anthropic/claude-3.5-sonnet:beta", "openrouter")
+        assert provider == "openrouter"
+        assert model == "anthropic/claude-3.5-sonnet:beta"
+
+    def test_http_url_not_treated_as_provider(self):
+        provider, model = parse_model_input("http://localhost:8080/model", "openrouter")
+        assert provider == "openrouter"
+        assert model == "http://localhost:8080/model"
+
+    def test_custom_colon_model_single(self):
+        """custom:model-name → anonymous custom provider."""
+        provider, model = parse_model_input("custom:qwen-2.5", "openrouter")
+        assert provider == "custom"
+        assert model == "qwen-2.5"
+
+    def test_custom_triple_syntax(self):
+        """custom:name:model → named custom provider."""
+        provider, model = parse_model_input("custom:local-server:qwen-2.5", "openrouter")
+        assert provider == "custom:local-server"
+        assert model == "qwen-2.5"
+
+    def test_custom_triple_spaces(self):
+        """Triple syntax should handle whitespace."""
+        provider, model = parse_model_input("custom: my-server : my-model ", "openrouter")
+        assert provider == "custom:my-server"
+        assert model == "my-model"
+
+    def test_custom_triple_empty_model_falls_back(self):
+        """custom:name: with no model → treated as custom:name (bare)."""
+        provider, model = parse_model_input("custom:name:", "openrouter")
+        # Empty model after second colon → no triple match, falls through
+        assert provider == "custom"
+        assert model == "name:"
+
+    def test_acp_slash_prefix_switches_provider(self):
+        provider, model = parse_model_input("claude-acp/claude-sonnet-4.6", "devin-acp")
+        assert provider == "claude-acp"
+        assert model == "claude-sonnet-4.6"
+
+    def test_acp_alias_slash_prefix_switches_provider(self):
+        provider, model = parse_model_input("claude-agent-acp/claude-sonnet-4.6", "devin-acp")
+        assert provider == "claude-acp"
+        assert model == "claude-sonnet-4.6"
+
 
 # -- curated_models_for_provider ---------------------------------------------
 
@@ -73,6 +155,21 @@ class TestCuratedModelsForProvider:
 
     def test_unknown_provider_returns_empty(self):
         assert curated_models_for_provider("totally-unknown") == []
+
+
+def test_cached_provider_model_ids_strips_acp_prefixes(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.models.provider_model_ids",
+        lambda provider, **kw: ["claude-acp/claude-sonnet-4.6", "claude-acp/claude-opus-4.6"],
+    )
+    monkeypatch.setattr("hermes_cli.models._credential_fingerprint", lambda provider: "fp")
+    monkeypatch.setattr("hermes_cli.models._load_provider_models_cache", lambda: {})
+    monkeypatch.setattr("hermes_cli.models._save_provider_models_cache", lambda _data: None)
+
+    assert cached_provider_model_ids("claude-acp", force_refresh=True) == [
+        "claude-sonnet-4.6",
+        "claude-opus-4.6",
+    ]
 
 
 # -- normalize_provider ------------------------------------------------------

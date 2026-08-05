@@ -94,6 +94,139 @@ def test_passthrough_kwargs_to_base(monkeypatch):
 
 
 
+def test_custom_endpoint_with_api_url_kept_when_models_empty(monkeypatch):
+    """User-defined endpoints with an ``api_url`` survive even if models empty.
+
+    Rationale: custom endpoints may accept any model id the user types --
+    the picker still shows the row so the user can enter one manually.
+    """
+    base = [
+        _make_provider("local-ollama", is_user_defined=True,
+                       api_url="http://localhost:11434/v1", models=[],
+                       source="user-config"),
+    ]
+
+    monkeypatch.setattr(model_switch, "list_authenticated_providers",
+                        lambda **kw: list(base))
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+
+    result = model_switch.list_picker_providers(max_models=50)
+
+    assert len(result) == 1
+    assert result[0]["slug"] == "local-ollama"
+    assert result[0]["models"] == []
+
+
+def test_user_defined_without_api_url_and_empty_models_dropped(monkeypatch):
+    """An is_user_defined row WITHOUT api_url and no models is still dropped.
+
+    The exemption is specifically for custom endpoints that can accept
+    arbitrary model ids; without an api_url there's nothing to point at.
+    """
+    base = [
+        _make_provider("orphan", is_user_defined=True, api_url=None, models=[]),
+    ]
+
+    monkeypatch.setattr(model_switch, "list_authenticated_providers",
+                        lambda **kw: list(base))
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+
+    result = model_switch.list_picker_providers(max_models=50)
+
+    assert result == []
+
+
+def test_max_models_caps_openrouter_live_output(monkeypatch):
+    """``max_models`` caps how many OpenRouter IDs land in the row."""
+    live = [(f"vendor/model-{i}", "") for i in range(20)]
+    base = [_make_provider("openrouter", models=["placeholder"])]
+
+    monkeypatch.setattr(model_switch, "list_authenticated_providers",
+                        lambda **kw: list(base))
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: list(live))
+
+    result = model_switch.list_picker_providers(max_models=5)
+
+    assert len(result) == 1
+    assert len(result[0]["models"]) == 5
+    assert result[0]["models"] == [mid for mid, _ in live[:5]]
+    # total_models reflects the full live catalog, not the capped slice.
+    assert result[0]["total_models"] == 20
+
+def test_current_custom_endpoint_passthrough_marks_current_row(monkeypatch):
+    """Interactive picker should preserve current custom endpoint semantics."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+
+    result = model_switch.list_picker_providers(
+        current_provider="custom:ollama",
+        current_base_url="http://localhost:11434/v1",
+        current_model="glm-5.1",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Ollama — GLM 5.1",
+                "base_url": "http://localhost:11434/v1",
+                "api_key": "ollama",
+                "model": "glm-5.1",
+            },
+            {
+                "name": "Ollama — Qwen3",
+                "base_url": "http://localhost:11434/v1",
+                "api_key": "ollama",
+                "model": "qwen3",
+            },
+        ],
+        max_models=50,
+    )
+
+    custom_rows = [p for p in result if p.get("is_user_defined")]
+    assert len(custom_rows) == 1
+    row = custom_rows[0]
+    assert row["slug"] == "custom:ollama"
+    assert row["is_current"] is True
+    assert row["models"] == ["glm-5.1", "qwen3"]
+
+
+def test_external_process_providers_use_auth_status_for_picker(monkeypatch):
+    """ACP process providers should appear in interactive pickers without API keys."""
+    from hermes_cli.providers import HERMES_OVERLAYS
+
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {})
+    monkeypatch.setattr(
+        "hermes_cli.providers.HERMES_OVERLAYS",
+        {k: HERMES_OVERLAYS[k] for k in ("devin-acp", "claude-acp")},
+    )
+    monkeypatch.setattr("hermes_cli.models.get_curated_nous_model_ids", lambda: [])
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_provider_model_ids",
+        lambda provider, *a, **kw: {
+            "devin-acp": ["glm-5.2", "devin-acp"],
+            "claude-acp": ["claude-sonnet-4.6", "claude-opus-4.6", "claude-opus-4.8", "claude-haiku-4.5"],
+        }.get(provider, []),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"configured": provider in {"devin-acp", "claude-acp"}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_openrouter_models",
+        lambda *a, **kw: pytest.fail("openrouter should not be listed"),
+    )
+
+    result = model_switch.list_picker_providers(max_models=50)
+
+    by_slug = {p["slug"]: p for p in result}
+    assert by_slug["devin-acp"]["models"] == ["glm-5.2", "devin-acp"]
+    assert by_slug["claude-acp"]["models"] == ["claude-sonnet-4.6", "claude-opus-4.6", "claude-opus-4.8", "claude-haiku-4.5"]
+
 # ---------------------------------------------------------------------------
 # list_authenticated_providers: alias/canonical de-dup for Kimi (#49439)
 # ---------------------------------------------------------------------------

@@ -70,7 +70,7 @@ def _resolve_requests_verify() -> bool | str:
 # Only these are stripped — Ollama-style "model:tag" colons (e.g. "qwen3.5:27b")
 # are preserved so the full model name reaches cache lookups and server queries.
 _PROVIDER_PREFIXES: frozenset[str] = frozenset({
-    "openrouter", "nous", "openai-codex", "copilot", "copilot-acp",
+    "openrouter", "nous", "openai-codex", "copilot", "copilot-acp", "devin-acp", "claude-acp",
     "gemini", "ollama-cloud", "zai", "kimi-coding", "kimi-coding-cn", "stepfun", "minimax", "minimax-oauth", "minimax-cn", "anthropic", "deepseek", "deepinfra",
     "opencode-zen", "opencode-go", "ai-gateway", "kilocode", "alibaba", "novita",
     "qwen-oauth",
@@ -135,6 +135,8 @@ _MODEL_CACHE_TTL = 3600
 _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
+_ACP_PROCESS_PROVIDERS = frozenset({"devin-acp", "claude-acp"})
+
 # Bounded-lifetime cache: after the first successful probe we remember the
 # server type so subsequent refreshes skip the full waterfall (no more 404
 # spam every 5 minutes on non-matching endpoints like /api/v1/models on vllm).
@@ -2594,6 +2596,21 @@ def get_model_context_length(
     if endpoint_context is not None:
         return endpoint_context
 
+    # ACP process providers are launched through external CLIs rather than an
+    # HTTP model endpoint. Their live context-length probing path can interfere
+    # with the very first request after a model switch, so resolve them from the
+    # static catalog only.
+    if provider in _ACP_PROCESS_PROVIDERS or _normalize_base_url(base_url).startswith("acp://"):
+        model_lower = model.lower()
+        for default_model, length in sorted(
+            DEFAULT_CONTEXT_LENGTHS.items(),
+            key=lambda x: len(x[0]),
+            reverse=True,
+        ):
+            if default_model in model_lower:
+                return length
+        return DEFAULT_FALLBACK_CONTEXT
+
     is_bedrock_context = provider == "bedrock" or (
         base_url
         and base_url_hostname(base_url).startswith("bedrock-runtime.")
@@ -2831,7 +2848,7 @@ def get_model_context_length(
     # This catches account-specific models (e.g. claude-opus-4.6-1m) that
     # don't exist in models.dev. For models that ARE in models.dev, this
     # returns the provider-enforced limit which is what users can actually use.
-    if effective_provider in {"copilot", "copilot-acp", "github-copilot"}:
+    if effective_provider in {"copilot", "copilot-acp", "devin-acp", "claude-acp", "github-copilot"}:
         try:
             from hermes_cli.models import get_copilot_model_context
             ctx = get_copilot_model_context(model, api_key=api_key)

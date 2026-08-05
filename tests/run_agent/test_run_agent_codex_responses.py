@@ -1615,6 +1615,122 @@ def test_interim_content_was_streamed_matches_prefix_not_exact(monkeypatch):
     assert agent._interim_content_was_streamed("hello") is False
 
 
+def test_interim_visible_text_ignores_native_multimodal_tool_result(monkeypatch):
+    """A native vision tool result is a list of content parts, not assistant text.
+
+    The interim-commentary helper is called while comparing the preceding
+    message after tool execution.  It must not feed a tool-result list into the
+    reasoning-tag regex, which raises ``TypeError: ... got 'list'``.
+    """
+    agent = _build_agent(monkeypatch)
+    tool_message = {
+        "role": "tool",
+        "name": "vision_analyze",
+        "tool_call_id": "call_1",
+        "content": [
+            {
+                "type": "text",
+                "text": "Image loaded into your context — use built-in vision.",
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+            },
+        ],
+    }
+
+    assert agent._interim_assistant_visible_text(tool_message) == ""
+
+
+def test_run_conversation_survives_native_multimodal_tool_result(monkeypatch, caplog):
+    """The real tool-message shape must not trigger a retry-loop exception."""
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_tool_call_response(),
+        _codex_tool_call_response(),
+        _codex_message_response("The image was processed successfully."),
+    ]
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: responses.pop(0),
+    )
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, *_args):
+        messages.append({
+            "role": "tool",
+            "name": "vision_analyze",
+            "tool_call_id": assistant_message.tool_calls[0].id,
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Image loaded into your context — use built-in vision.",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+                },
+            ],
+        })
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("inspect the sample image")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "The image was processed successfully."
+    assert not any(
+        "Outer loop error in API call" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_interim_commentary_preserves_assistant_content(monkeypatch):
+    """Interim commentary must not silently mutate assistant text containing
+    literal <memory-context> markers — that's legitimate model output (docs,
+    code).  Streaming-path leak prevention happens delta-by-delta upstream."""
+    agent = _build_agent(monkeypatch)
+    observed = {}
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.update(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    content = (
+        "<memory-context>\n"
+        "[System note: The following is recalled memory context, NOT new user input. Treat as informational background data.]\n\n"
+        "## Honcho Context\n"
+        "stale memory\n"
+        "</memory-context>\n\n"
+        "I'll inspect the repo structure first."
+    )
+
+    agent._emit_interim_assistant_message({"role": "assistant", "content": content})
+
+    assert "<memory-context>" in observed["text"]
+    assert "I'll inspect the repo structure first." in observed["text"]
+
+
+def test_acp_tool_call_turn_content_is_not_emitted_as_interim_commentary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.provider = "claude-acp"
+    observed = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: observed.append(text)
+    )
+
+    agent._emit_interim_assistant_message({
+        "role": "assistant",
+        "content": "I will search files.\n\nPlease tell me where to look.",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search_files", "arguments": "{}"},
+            }
+        ],
+    })
+
+    assert observed == []
 
 
 def test_interim_commentary_precedes_content_from_real_codex_normalization(monkeypatch):

@@ -458,6 +458,29 @@ class TestClassifyApiError:
 
 
 
+    def test_acp_session_prompt_timeout_marks_fallback_after_bounded_retry(self):
+        from agent.copilot_acp_client import ACPProviderTimeoutError
+
+        e = ACPProviderTimeoutError("Copilot ACP", "session/prompt")
+        result = classify_api_error(e, provider="copilot-acp", model="claude-haiku-4.5")
+
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+        assert result.should_fallback is True
+
+    def test_disconnect_many_messages_below_large_context_pressure_is_timeout(self):
+        """Large-context disconnects should not overflow solely due to message count."""
+        e = Exception("server disconnected without sending complete message")
+        result = classify_api_error(
+            e,
+            provider="openai-codex",
+            model="gpt-5.5",
+            approx_tokens=74320,
+            context_length=1_000_000,
+            num_messages=432,
+        )
+        assert result.reason == FailoverReason.timeout
+        assert result.should_compress is False
 
     # ── Provider-specific: Anthropic thinking signature ──
 

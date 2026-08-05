@@ -1715,6 +1715,7 @@ class GatewaySlashCommandsMixin:
             is_once=one_turn,
             explicit_provider=explicit_provider,
         )
+        picker_persist_global = persist_global
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -1760,6 +1761,10 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+        if source.platform == Platform.DISCORD:
+            # Discord model-picker selections are session-scoped by design so
+            # a tap in one thread/channel does not rewrite the shared default.
+            picker_persist_global = False
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None
@@ -1892,6 +1897,19 @@ class GatewaySlashCommandsMixin:
                                     ),
                                 )
 
+                        resolved_runtime = {}
+                        try:
+                            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                            resolved_runtime = resolve_runtime_provider(
+                                requested=result.target_provider,
+                                explicit_api_key=result.api_key,
+                                explicit_base_url=result.base_url,
+                                target_model=result.new_model,
+                            )
+                        except Exception:
+                            resolved_runtime = {}
+
                         # Persist the new model to the session DB so the
                         # dashboard shows the updated model (#34850).
                         _sess_db = getattr(_self, "_session_db", None)
@@ -1902,6 +1920,12 @@ class GatewaySlashCommandsMixin:
                                 )
                                 await _sess_db.update_session_model(
                                     _sess_entry.session_id, result.new_model
+                                )
+                                await _sess_db.update_session_billing_route(
+                                    _sess_entry.session_id,
+                                    provider=result.target_provider,
+                                    base_url=result.base_url or "",
+                                    billing_mode=result.api_mode,
                                 )
                             except Exception as exc:
                                 logger.debug(
@@ -1929,6 +1953,10 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
+                        if "command" in resolved_runtime:
+                            _self._session_model_overrides[_session_key]["command"] = resolved_runtime.get("command")
+                        if "args" in resolved_runtime:
+                            _self._session_model_overrides[_session_key]["args"] = list(resolved_runtime.get("args") or [])
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
@@ -1952,7 +1980,7 @@ class GatewaySlashCommandsMixin:
                         # Persist to config (default) unless --session opted out,
                         # mirroring the text /model command path above so a picked
                         # model survives across sessions like a typed one (#49066).
-                        if persist_global:
+                        if picker_persist_global:
                             try:
                                 # Write-back round-trip: raw read is correct
                                 # (merged defaults must not be persisted).
@@ -2052,7 +2080,7 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
-                        if persist_global:
+                        if picker_persist_global:
                             lines.append(t("gateway.model.saved_global"))
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
@@ -2199,6 +2227,19 @@ class GatewaySlashCommandsMixin:
                         ),
                     )
 
+            resolved_runtime = {}
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                resolved_runtime = resolve_runtime_provider(
+                    requested=result.target_provider,
+                    explicit_api_key=result.api_key,
+                    explicit_base_url=result.base_url,
+                    target_model=result.new_model,
+                )
+            except Exception:
+                resolved_runtime = {}
+
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
             _sess_db = getattr(self, "_session_db", None)
@@ -2212,6 +2253,12 @@ class GatewaySlashCommandsMixin:
                         _sess_entry.was_auto_reset = False
                     await _sess_db.update_session_model(
                         _sess_entry.session_id, result.new_model
+                    )
+                    await _sess_db.update_session_billing_route(
+                        _sess_entry.session_id,
+                        provider=result.target_provider,
+                        base_url=result.base_url or "",
+                        billing_mode=result.api_mode,
                     )
                 except Exception as exc:
                     logger.debug(
@@ -2240,6 +2287,10 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+            if "command" in resolved_runtime:
+                self._session_model_overrides[session_key]["command"] = resolved_runtime.get("command")
+            if "args" in resolved_runtime:
+                self._session_model_overrides[session_key]["args"] = list(resolved_runtime.get("args") or [])
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):
                     self._pending_one_turn_model_restores = {}
@@ -3907,6 +3958,7 @@ class GatewaySlashCommandsMixin:
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
+                session_id=session_entry.session_id,
             )
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")

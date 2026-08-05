@@ -1261,6 +1261,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    inject_to_active_loop: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1305,6 +1306,10 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        attach_to_session: When explicitly set, controls continuable transcript
+                mirroring for this job.
+        inject_to_active_loop: When explicitly True, steer clean output into the
+                currently running origin agent at its safe turn boundary.
 
     Returns:
         The created job dict
@@ -1337,6 +1342,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_inject = inject_to_active_loop if isinstance(inject_to_active_loop, bool) else None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1432,6 +1438,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_inject is not None:
+        job["inject_to_active_loop"] = normalized_inject
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1707,6 +1715,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # Clear scheduler-owned active run claim on completion. The
+                # worker finally block also clears it; this is the durable
+                # completion fallback for shutdown/error races.
+                job["active_run"] = None
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1916,6 +1928,32 @@ def claim_dispatch(job_id: str) -> bool:
             job_id,
         )
         return True
+
+
+def set_active_run_claim(job_id: str, *, owner: str, pid: int, pid_start_time: str | None) -> bool:
+    """Persist the scheduler-owned claim for an in-flight recurring/one-shot run."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") == job_id:
+                job["active_run"] = {"owner": owner, "pid": pid, "pid_start_time": pid_start_time, "started_at": _hermes_now().isoformat()}
+                save_jobs(jobs)
+                return True
+    return True
+
+
+def clear_active_run_claim(job_id: str, *, owner: str | None = None) -> bool:
+    """Clear a scheduler-owned active claim, preserving a newer owner's claim."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") == job_id:
+                claim = job.get("active_run")
+                if isinstance(claim, dict) and owner is not None and claim.get("owner") != owner: return False
+                job["active_run"] = None
+                save_jobs(jobs)
+                return True
+    return False
 
 
 def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:

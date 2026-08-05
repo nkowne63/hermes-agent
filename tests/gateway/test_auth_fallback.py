@@ -45,7 +45,7 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         with patch(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
             side_effect=_mock_resolve,
-        ):
+        ), patch("gateway.run.logger") as log:
             from gateway.run import _resolve_runtime_agent_kwargs
             result = _resolve_runtime_agent_kwargs()
 
@@ -53,5 +53,6 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         assert result["api_key"] == "fallback-key"
         # Should have been called at least twice (primary + fallback)
         assert call_count["n"] >= 2
+        assert any("Provider fallback selected" in str(call.args[0]) for call in log.warning.call_args_list)
 
 

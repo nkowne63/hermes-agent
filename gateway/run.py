@@ -744,6 +744,54 @@ def _resolve_gateway_display_bool(
     return bool(value)
 
 
+def _resolve_gateway_show_reasoning(
+    user_config: dict,
+    source: Any,
+    *,
+    default: bool = False,
+) -> bool:
+    """Resolve final-response reasoning visibility for one gateway source.
+
+    Parent-only display channels suppress transient output in the parent while
+    leaving explicit threads unaffected.  Keep that decision local to the
+    final-response path instead of relying on state computed by the agent-run
+    path (which is a different function scope).
+    """
+    config = user_config if isinstance(user_config, dict) else {}
+    platform = getattr(source, "platform", None)
+    platform_key = _platform_config_key(platform)
+
+    try:
+        from gateway.display_config import is_thread_only_display_channel
+
+        thread_only_parent = is_thread_only_display_channel(
+            config,
+            channel_id=getattr(source, "chat_id", None),
+            thread_id=getattr(source, "thread_id", None),
+            parent_channel_id=getattr(source, "parent_chat_id", None),
+        )
+    except Exception:
+        thread_only_parent = False
+
+    try:
+        show_reasoning = _resolve_gateway_display_bool(
+            config,
+            platform_key,
+            "show_reasoning",
+            default=default,
+            platform=platform,
+            require_platform_override_for={Platform.MATTERMOST},
+        )
+    except Exception:
+        show_reasoning = (
+            False
+            if platform == Platform.MATTERMOST
+            else bool(default)
+        )
+
+    return False if thread_only_parent else show_reasoning
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
 
@@ -2409,6 +2457,8 @@ def _resolve_runtime_agent_kwargs() -> dict:
     )
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
+    model_cfg: dict[str, Any] | dict = {}
+    primary_provider = ""
     try:
         runtime = resolve_runtime_provider()
     except AuthError as auth_exc:
@@ -2422,6 +2472,26 @@ def _resolve_runtime_agent_kwargs() -> dict:
             logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
         fb_config = _try_resolve_fallback_provider()
         if fb_config is not None:
+            try:
+                model_cfg = _get_model_config()
+                if isinstance(model_cfg, dict):
+                    primary_provider = str(model_cfg.get("provider") or "").strip()
+                fallback_provider = str(fb_config.get("provider") or "").strip()
+                fallback_model = str(fb_config.get("model") or "").strip()
+                logger.warning(
+                    "Provider fallback selected: %s -> %s model=%s",
+                    primary_provider or "(unknown)",
+                    fallback_provider or "(unknown)",
+                    fallback_model or "(default)",
+                )
+            except Exception:
+                logger.warning("Provider fallback selected, but could not format route summary")
+            fb_config["_fallback_notice"] = {
+                "from_provider": primary_provider or "",
+                "to_provider": fb_config.get("provider") or "",
+                "from_model": model_cfg.get("default") if isinstance(model_cfg, dict) else "",
+                "to_model": fb_config.get("model") or "",
+            }
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
@@ -3321,6 +3391,81 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
 # adapter for plugin platforms.  Set in GatewayRunner.__init__().
 import weakref as _weakref
 _gateway_runner_ref: _weakref.ref = lambda: None
+
+
+def _origin_matches_live_source(origin: dict, source) -> bool:
+    """Return True when a cron origin identifies a cached live session source."""
+    if not isinstance(origin, dict) or source is None:
+        return False
+    platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+    if str(origin.get("platform", "")).lower() != str(platform).lower():
+        return False
+    if str(origin.get("chat_id", "")) != str(getattr(source, "chat_id", "")):
+        return False
+
+    # Thread/topic and server/profile scopes must match exactly when the cron
+    # origin carries them. A missing live scope is a fail-closed mismatch rather
+    # than a reason to steer a similarly named channel.
+    source_scope = getattr(source, "scope_id", None) or getattr(source, "guild_id", None)
+    origin_scope = origin.get("scope_id") or origin.get("guild_id")
+    if origin_scope is not None and str(origin_scope) != str(source_scope or ""):
+        return False
+    for field in ("thread_id", "parent_chat_id", "profile"):
+        origin_value = origin.get(field)
+        if origin_value is not None and str(origin_value) != str(getattr(source, field, None) or ""):
+            return False
+
+    # Thread sessions are shared by default; threadless group sessions may be
+    # per-user isolated. If the origin identifies a participant, require the
+    # cached source to identify the same participant too.
+    origin_user = origin.get("user_id") or origin.get("user_id_alt")
+    if origin_user is not None and str(origin_user) != str(
+        getattr(source, "user_id", None) or getattr(source, "user_id_alt", None) or ""
+    ):
+        return False
+    return True
+
+
+def steer_active_agent_for_origin(origin: dict, text: str) -> bool:
+    """Steer one active gateway agent matching a cron origin.
+
+    This is deliberately best-effort and fail-closed. It reuses ``AIAgent.steer``
+    so the message is consumed at the existing safe turn boundary; it never
+    interrupts an in-flight tool/API call and never appends directly to the
+    transcript. A missing gateway, pending startup sentinel, stale origin, or
+    ambiguous match returns ``False``.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+    if runner is None:
+        return False
+
+    running_agents = getattr(runner, "_running_agents", None) or {}
+    cached_sources = getattr(runner, "_session_sources", None) or {}
+    matches = []
+    for session_key, agent in list(running_agents.items()):
+        if agent is _AGENT_PENDING_SENTINEL:
+            continue
+        source = cached_sources.get(session_key)
+        if _origin_matches_live_source(origin, source):
+            matches.append(agent)
+
+    # Never guess if multiple active sessions happen to share incomplete origin
+    # metadata. The next ordinary delivery can still handle the result.
+    if len(matches) != 1:
+        return False
+    steer = getattr(matches[0], "steer", None)
+    if not callable(steer):
+        return False
+    try:
+        return bool(steer(text.strip()))
+    except Exception:
+        logger.debug("Cron active-loop steer failed", exc_info=True)
+        return False
 
 
 def _normalize_empty_agent_response(
@@ -5662,6 +5807,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_command_source: Optional[SessionSource] = None
     _stop_task: Optional[asyncio.Task] = None
     _restart_task: Optional[asyncio.Task] = None
+    _session_model_overrides: Dict[str, Dict[str, Any]] = {}
+    _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
@@ -6816,6 +6963,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
         user_config: Optional[dict] = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
@@ -6852,6 +7000,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "max_tokens": override.get("max_tokens"),
                 "credential_pool": override.get("credential_pool"),
             }
+            if "command" in override:
+                override_runtime["command"] = override.get("command")
+            if "args" in override:
+                override_runtime["args"] = list(override.get("args") or [])
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(
@@ -6921,6 +7073,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if ch_runtime_model and not ch.model:
                         model = ch_runtime_model
 
+        if getattr(self, "_session_db", None) is not None and not override:
+            persisted_route = self._load_persisted_session_runtime(
+                session_id=session_id,
+                session_key=resolved_session_key,
+            )
+            if persisted_route:
+                persisted_model = persisted_route.get("model")
+                if persisted_model:
+                    model = persisted_model
+                persisted_provider = str(persisted_route.get("provider") or "").strip()
+                if persisted_provider:
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                        persisted_runtime = resolve_runtime_provider(
+                            requested=persisted_provider,
+                            explicit_base_url=(persisted_route.get("base_url") or None),
+                        )
+                        runtime_kwargs.update(
+                            {
+                                "api_key": persisted_runtime.get("api_key"),
+                                "base_url": persisted_runtime.get("base_url"),
+                                "provider": persisted_runtime.get("provider"),
+                                "api_mode": persisted_runtime.get("api_mode"),
+                                "command": persisted_runtime.get("command"),
+                                "args": list(persisted_runtime.get("args") or []),
+                                "credential_pool": persisted_runtime.get("credential_pool"),
+                            }
+                        )
+                    except Exception:
+                        runtime_kwargs.update(
+                            {
+                                "provider": persisted_provider or runtime_kwargs.get("provider"),
+                                "base_url": persisted_route.get("base_url") or runtime_kwargs.get("base_url"),
+                                "api_mode": persisted_route.get("api_mode") or runtime_kwargs.get("api_mode"),
+                            }
+                        )
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -6978,6 +7167,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_state("*").conversation.last_resolved_model = model
 
         return model, runtime_kwargs
+
+    def _load_persisted_session_runtime(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+    ) -> dict:
+        """Load a session's persisted model/provider route from SQLite.
+
+        This is the durable counterpart to the in-memory ``_session_model_overrides``
+        map.  It lets a restarted gateway or a cache miss reconstruct the
+        last explicit session model/provider selection instead of falling back
+        to the global config provider.
+        """
+        db_owner = getattr(self, "_session_db", None)
+        if db_owner is None:
+            return {}
+        resolved_session_id = session_id
+        if not resolved_session_id and session_key and getattr(self, "session_store", None):
+            try:
+                entry = self.session_store._entries.get(session_key)
+            except Exception:
+                entry = None
+            resolved_session_id = getattr(entry, "session_id", None)
+        if not resolved_session_id:
+            return {}
+
+        # AsyncSessionDB must not be driven synchronously from the gateway loop.
+        # This helper is also called from run_sync's executor thread, where the
+        # underlying sync DB handle is safe and preserves persisted route
+        # recovery after restarts.
+        db = getattr(db_owner, "_db", None)
+        if type(db).__module__ == "unittest.mock":
+            db = None
+        if db is not None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                return {}
+        else:
+            db = db_owner
+
+        get_session = getattr(db, "get_session", None)
+        if not callable(get_session):
+            return {}
+        try:
+            row = get_session(resolved_session_id)
+        except Exception:
+            return {}
+        if not row:
+            return {}
+        runtime = {}
+        model = row.get("model")
+        if model:
+            runtime["model"] = model
+        provider = row.get("billing_provider")
+        if provider is not None:
+            runtime["provider"] = provider
+        base_url = row.get("billing_base_url")
+        if base_url is not None:
+            runtime["base_url"] = base_url
+        api_mode = row.get("billing_mode")
+        if api_mode is not None:
+            runtime["api_mode"] = api_mode
+        return runtime
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
@@ -16385,7 +16641,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         try:
                             session_info = await asyncio.to_thread(
-                                self._reset_notice_session_info, source
+                                self._reset_notice_session_info,
+                                source,
+                                session_entry.session_id,
                             )
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
@@ -16587,6 +16845,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
                         source=source,
                         session_key=session_key,
+                        session_id=session_entry.session_id,
                         user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                     )
                     _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
@@ -16731,6 +16990,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
                             source=source,
                             session_key=session_key,
+                            session_id=session_entry.session_id,
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
                         if _hyg_runtime.get("api_key"):
@@ -17545,13 +17805,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Mattermost requires explicit per-platform opt-in because this is
             # scratch text, not ordinary final-answer content.
             try:
-                _show_reasoning_effective = _resolve_gateway_display_bool(
+                _show_reasoning_effective = _resolve_gateway_show_reasoning(
                     _load_gateway_config(),
-                    _platform_config_key(source.platform),
-                    "show_reasoning",
+                    source,
                     default=bool(getattr(self, "_show_reasoning", False)),
-                    platform=source.platform,
-                    require_platform_override_for={Platform.MATTERMOST},
                 )
             except Exception:
                 _show_reasoning_effective = (
@@ -18129,7 +18386,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
-    def _reset_notice_session_info(self, source: SessionSource) -> str:
+    def _reset_notice_session_info(
+        self,
+        source: SessionSource,
+        session_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+    ) -> str:
         """Session-info block for the auto-reset notice, profile-scoped.
 
         When multiplexing, resolve model/provider/context inside the profile
@@ -18146,10 +18408,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(
+                    source=source,
+                    session_key=session_key or self._session_key_for_source(source),
+                    session_id=session_id,
+                )
+        return self._format_session_info(
+            source=source,
+            session_key=session_key or self._session_key_for_source(source),
+            session_id=session_id,
+        )
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -18201,6 +18477,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             api_key = runtime.get("api_key")
         except Exception:
             pass
+
+        persisted_route = self._load_persisted_session_runtime(
+            session_id=session_id,
+            session_key=session_key or (
+                self._session_key_for_source(source) if source is not None else None
+            ),
+        )
+        if persisted_route:
+            model = persisted_route.get("model") or model
+            provider = persisted_route.get("provider") or provider
+            base_url = persisted_route.get("base_url") or base_url
 
         if config_context_length is not None:
             try:
@@ -19244,13 +19531,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        session_key = self._session_key_for_source(source)
+        session_entry = None
+        if getattr(self, "session_store", None) is not None:
+            try:
+                session_entry = self.session_store.get_or_create_session(source)
+            except Exception:
+                session_entry = None
 
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
+                session_key=session_key,
+                session_id=getattr(session_entry, "session_id", None),
                 user_config=user_config,
             )
+            fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
+            if fallback_notice:
+                await self._send_provider_fallback_session_error(
+                    source=source,
+                    from_provider=str(fallback_notice.get("from_provider") or ""),
+                    to_provider=str(fallback_notice.get("to_provider") or runtime_kwargs.get("provider") or ""),
+                    from_model=str(fallback_notice.get("from_model") or ""),
+                    to_model=str(fallback_notice.get("to_model") or model or ""),
+                )
+                await self._send_provider_fallback_notification(
+                    source=source,
+                    from_provider=str(fallback_notice.get("from_provider") or ""),
+                    to_provider=str(fallback_notice.get("to_provider") or runtime_kwargs.get("provider") or ""),
+                    from_model=str(fallback_notice.get("from_model") or ""),
+                    to_model=str(fallback_notice.get("to_model") or model or ""),
+                )
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
@@ -21074,6 +21386,144 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
+    async def _send_provider_fallback_notification(
+        self,
+        *,
+        source: SessionSource,
+        from_provider: str,
+        to_provider: str,
+        from_model: str = "",
+        to_model: str = "",
+    ) -> bool:
+        """Notify the platform home channel that runtime provider fallback happened."""
+        platform_cfg = self.config.platforms.get(source.platform) if getattr(self, "config", None) else None
+        if platform_cfg is None or not getattr(platform_cfg, "gateway_fallback_notification", False):
+            return False
+
+        home = self.config.get_home_channel(source.platform) if getattr(self, "config", None) else None
+        if not home or not home.chat_id:
+            logger.info(
+                "Provider fallback notification skipped for %s: no home channel configured",
+                source.platform.value if source.platform else "unknown",
+            )
+            return False
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return False
+
+        parts = [
+            "⚠️ Provider fallback",
+            f"{from_provider or '(unknown)'} -> {to_provider or '(unknown)'}",
+        ]
+        if from_model or to_model:
+            parts.append(f"model {from_model or '(unknown)'} -> {to_model or '(unknown)'}")
+        message = " | ".join(parts)
+
+        try:
+            metadata = self._thread_metadata_for_target(
+                source.platform,
+                home.chat_id,
+                home.thread_id,
+                adapter=adapter,
+            )
+            if metadata:
+                result = await adapter.send(
+                    str(home.chat_id),
+                    message,
+                    metadata=_non_conversational_metadata(metadata, platform=source.platform),
+                )
+            else:
+                _meta = _non_conversational_metadata(platform=source.platform)
+                if _meta:
+                    result = await adapter.send(str(home.chat_id), message, metadata=_meta)
+                else:
+                    result = await adapter.send(str(home.chat_id), message)
+            if result is not None and getattr(result, "success", True) is False:
+                logger.warning(
+                    "Provider fallback notification failed for %s:%s: %s",
+                    source.platform.value if source.platform else "unknown",
+                    home.chat_id,
+                    getattr(result, "error", "send returned success=False"),
+                )
+                return False
+            logger.info(
+                "Sent provider fallback notification to %s:%s (%s -> %s)",
+                source.platform.value if source.platform else "unknown",
+                home.chat_id,
+                from_provider or "(unknown)",
+                to_provider or "(unknown)",
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Provider fallback notification failed for %s:%s: %s",
+                source.platform.value if source.platform else "unknown",
+                home.chat_id,
+                exc,
+            )
+            return False
+
+    async def _send_provider_fallback_session_error(
+        self,
+        *,
+        source: SessionSource,
+        from_provider: str,
+        to_provider: str,
+        from_model: str = "",
+        to_model: str = "",
+    ) -> bool:
+        """Emit a non-conversational fallback error into the active Discord session."""
+        if _gateway_platform_value(getattr(source, "platform", None)) != "discord":
+            return False
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return False
+
+        parts = [
+            "❌ Provider fallback in this session",
+            f"{from_provider or '(unknown)'} -> {to_provider or '(unknown)'}",
+        ]
+        if from_model or to_model:
+            parts.append(f"model {from_model or '(unknown)'} -> {to_model or '(unknown)'}")
+        message = " | ".join(parts)
+        reply_to = str(getattr(source, "message_id", "") or "").strip() or None
+
+        try:
+            metadata = self._thread_metadata_for_source(source, reply_to)
+            metadata = _non_conversational_metadata(metadata, platform=source.platform)
+            result = await adapter.send(
+                str(source.chat_id),
+                message,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            if result is not None and getattr(result, "success", True) is False:
+                logger.warning(
+                    "Provider fallback session error failed for %s:%s: %s",
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id,
+                    getattr(result, "error", "send returned success=False"),
+                )
+                return False
+            logger.info(
+                "Sent provider fallback session error to %s:%s (%s -> %s)",
+                source.platform.value if source.platform else "unknown",
+                source.chat_id,
+                from_provider or "(unknown)",
+                to_provider or "(unknown)",
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Provider fallback session error failed for %s:%s: %s",
+                source.platform.value if source.platform else "unknown",
+                source.chat_id,
+                exc,
+            )
+            return False
+
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -22500,10 +22950,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
+        for key in ("provider", "api_key", "base_url", "api_mode", "command", "args", "credential_pool"):
             val = override.get(key)
             if val is not None:
-                runtime_kwargs[key] = val
+                runtime_kwargs[key] = list(val) if key == "args" else val
         if (
             runtime_kwargs.get("api_key")
             and runtime_kwargs.get("credential_pool") is None
@@ -24071,7 +24521,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-platform display settings — resolve via display_config module
         # which checks display.platforms.<platform>.<key> first, then
         # display.<key> global, then built-in platform defaults.
-        from gateway.display_config import resolve_display_setting
+        from gateway.display_config import (
+            is_thread_only_display_channel,
+            resolve_display_setting,
+        )
+        thread_only_parent = is_thread_only_display_channel(
+            user_config,
+            channel_id=getattr(source, "chat_id", None),
+            thread_id=getattr(source, "thread_id", None),
+            parent_channel_id=getattr(source, "parent_chat_id", None),
+        )
 
         # Apply tool preview length config (0 = no limit)
         try:
@@ -24112,6 +24571,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
+        if thread_only_parent:
+            progress_mode = "off"
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
@@ -24186,6 +24647,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=True,
             require_platform_override_for={Platform.MATTERMOST},
         )
+        if thread_only_parent:
+            interim_assistant_messages_mode = "off"
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
             and interim_assistant_messages_mode != "off"
@@ -24199,6 +24662,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=False,
             require_platform_override_for={Platform.MATTERMOST},
         )
+        if thread_only_parent:
+            _thinking_mode = "off"
         _thinking_enabled = _thinking_mode != "off"
         needs_progress_queue = tool_progress_enabled or _thinking_enabled
 
@@ -24524,6 +24989,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _status_thread_metadata = {
                     "reply_to_message_id": event_message_id
                 }
+
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the

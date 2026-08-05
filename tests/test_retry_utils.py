@@ -5,7 +5,14 @@ import threading
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import (
+    adaptive_rate_limit_backoff,
+    is_zai_coding_overload_error,
+    jittered_backoff,
+    overloaded_backoff,
+    overloaded_backoff_max_delay,
+    overloaded_retry_ceiling,
+)
 
 
 def test_backoff_is_exponential():
@@ -168,6 +175,30 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     assert long_waits, "long-backoff tier never reached within the retry ceiling"
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
 
+
+def test_overloaded_backoff_uses_first_power_of_two_strictly_above_eight_hours():
+    """Generic overloads use exact doubling through the first >8h interval."""
+    assert overloaded_backoff_max_delay() == 32768.0  # 9h 6m 8s
+    assert [overloaded_backoff(attempt) for attempt in (1, 2, 3, 14, 15, 16)] == [
+        2.0,
+        4.0,
+        8.0,
+        16384.0,
+        32768.0,
+        32768.0,
+    ]
+
+
+def test_overloaded_backoff_threshold_and_ceiling_are_strict():
+    """The schedule includes the first unit above, not equal to, the threshold."""
+    assert overloaded_backoff_max_delay(base_delay=1.0, threshold=8.0) == 16.0
+    assert overloaded_retry_ceiling(base_delay=1.0, threshold=8.0) == 6
+
+
+def test_overloaded_retry_ceiling_leaves_room_for_final_wait():
+    """The loop's pre-backoff exhaustion check must not skip the final unit."""
+    ceiling = overloaded_retry_ceiling()
+    assert ceiling - 1 == 15  # attempts 1..15 compute waits; 15 is 32768s
 
 # ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser

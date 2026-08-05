@@ -96,6 +96,8 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_DEVIN_ACP_BASE_URL = "acp://devin"
+DEFAULT_CLAUDE_ACP_BASE_URL = "acp://claude"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -106,7 +108,7 @@ try:  # Version tag for the Codex token-endpoint User-Agent; fall back if unavai
 except Exception:  # pragma: no cover - version import should always succeed
     _HERMES_CLI_VERSION = "unknown"
 CODEX_OAUTH_USER_AGENT = f"hermes-cli/{_HERMES_CLI_VERSION}"
-CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
+CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
 XAI_OAUTH_ISSUER = "https://auth.x.ai"
 XAI_OAUTH_DISCOVERY_URL = f"{XAI_OAUTH_ISSUER}/.well-known/openid-configuration"
 XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -231,6 +233,41 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+        extra={
+            "command_env_vars": ("HERMES_COPILOT_ACP_COMMAND", "COPILOT_CLI_PATH"),
+            "default_command": "copilot",
+            "args_env_var": "HERMES_COPILOT_ACP_ARGS",
+            "default_args": ["--acp", "--stdio"],
+            "api_key_placeholder": "copilot-acp",
+        },
+    ),
+    "devin-acp": ProviderConfig(
+        id="devin-acp",
+        name="Devin ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_DEVIN_ACP_BASE_URL,
+        base_url_env_var="DEVIN_ACP_BASE_URL",
+        extra={
+            "command_env_vars": ("HERMES_DEVIN_ACP_COMMAND", "DEVIN_CLI_PATH"),
+            "default_command": "devin",
+            "args_env_var": "HERMES_DEVIN_ACP_ARGS",
+            "default_args": ["acp"],
+            "api_key_placeholder": "devin-acp",
+        },
+    ),
+    "claude-acp": ProviderConfig(
+        id="claude-acp",
+        name="Claude ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CLAUDE_ACP_BASE_URL,
+        base_url_env_var="CLAUDE_ACP_BASE_URL",
+        extra={
+            "command_env_vars": ("HERMES_CLAUDE_ACP_COMMAND", "CLAUDE_AGENT_ACP_PATH"),
+            "default_command": "npx",
+            "args_env_var": "HERMES_CLAUDE_ACP_ARGS",
+            "default_args": ["-y", "@agentclientprotocol/claude-agent-acp"],
+            "api_key_placeholder": "claude-acp",
+        },
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -1973,6 +2010,7 @@ def resolve_provider(
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
         "alibaba_coding_plan": "alibaba-coding-plan",
         "claude": "anthropic", "claude-code": "anthropic",
+        "claude-agent-acp": "claude-acp", "anthropic-acp": "claude-acp",
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
@@ -3893,16 +3931,24 @@ def _refresh_codex_auth_tokens(
     return updated_tokens
 
 
-def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
+def _codex_cli_auth_path(codex_home: Optional[str] = None) -> Path:
+    home = str(codex_home or "").strip() or os.getenv("CODEX_HOME", "").strip()
+    if not home:
+        home = str(Path.home() / ".codex")
+    return Path(home).expanduser() / "auth.json"
+
+
+def _import_codex_cli_tokens(
+    *,
+    codex_home: Optional[str] = None,
+    require_fresh: bool = True,
+) -> Optional[Dict[str, str]]:
     """Try to read tokens from ~/.codex/auth.json (Codex CLI shared file).
     
     Returns tokens dict if valid and not expired, None otherwise.
     Does NOT write to the shared file.
     """
-    codex_home = os.getenv("CODEX_HOME", "").strip()
-    if not codex_home:
-        codex_home = str(Path.home() / ".codex")
-    auth_path = Path(codex_home).expanduser() / "auth.json"
+    auth_path = _codex_cli_auth_path(codex_home)
     if not auth_path.is_file():
         return None
     try:
@@ -3917,7 +3963,7 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         # Reject expired tokens — importing stale tokens from ~/.codex/
         # that can't be refreshed leaves the user stuck with "Login successful!"
         # but no working credentials.
-        if _codex_access_token_is_expiring(access_token, 0):
+        if require_fresh and _codex_access_token_is_expiring(access_token, 0):
             logger.debug(
                 "Codex CLI tokens at %s are expired — skipping import.", auth_path,
             )
@@ -3925,6 +3971,37 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return dict(tokens)
     except Exception:
         return None
+
+
+def _write_codex_cli_tokens(codex_home: str, tokens: Dict[str, str]) -> None:
+    """Persist refreshed Codex tokens back into a specific Codex CLI home."""
+    auth_path = _codex_cli_auth_path(codex_home)
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        secure_parent_dir(auth_path)
+    except Exception:
+        pass
+    payload: Dict[str, Any] = {}
+    if auth_path.is_file():
+        try:
+            loaded = json.loads(auth_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except Exception:
+            payload = {}
+    payload["tokens"] = dict(tokens)
+    tmp_path = auth_path.with_name(f"{auth_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.write("\n")
+        atomic_replace(tmp_path, auth_path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def resolve_codex_runtime_credentials(
@@ -6953,27 +7030,21 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
+    command = _resolve_external_process_command(pconfig)
+    args = _resolve_external_process_args(pconfig)
+    base_url = _resolve_external_process_base_url(pconfig)
 
     resolved_command = shutil.which(command) if command else None
+    acp_marker = base_url.startswith(("acp://", "acp+tcp://"))
     return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "configured": bool(resolved_command or acp_marker),
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "logged_in": bool(resolved_command or acp_marker),
     }
 
 
@@ -6994,7 +7065,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "devin-acp", "claude-acp"}:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -7163,6 +7234,31 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _resolve_external_process_base_url(pconfig: ProviderConfig) -> str:
+    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    return (base_url or pconfig.inference_base_url).rstrip("/")
+
+
+def _resolve_external_process_command(pconfig: ProviderConfig) -> str:
+    extra = pconfig.extra if isinstance(pconfig.extra, dict) else {}
+    for env_var in extra.get("command_env_vars") or ():
+        value = os.getenv(str(env_var), "").strip()
+        if value:
+            return value
+    return str(extra.get("default_command") or "copilot")
+
+
+def _resolve_external_process_args(pconfig: ProviderConfig) -> List[str]:
+    extra = pconfig.extra if isinstance(pconfig.extra, dict) else {}
+    raw = os.getenv(str(extra.get("args_env_var") or ""), "").strip()
+    if raw:
+        return shlex.split(raw)
+    default_args = extra.get("default_args")
+    if isinstance(default_args, list):
+        return [str(arg) for arg in default_args]
+    return ["--acp", "--stdio"]
+
+
 def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
     """Resolve runtime details for local subprocess-backed providers."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
@@ -7173,30 +7269,29 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             code="invalid_provider",
         )
 
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    base_url = _resolve_external_process_base_url(pconfig)
+    command = _resolve_external_process_command(pconfig)
+    args = _resolve_external_process_args(pconfig)
     resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
+    if not resolved_command and not base_url.startswith(("acp://", "acp+tcp://")):
+        missing_name = {
+            "copilot-acp": "GitHub Copilot CLI",
+            "devin-acp": "Devin CLI",
+            "claude-acp": "Claude ACP adapter",
+        }.get(provider_id, command or provider_id)
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find the {missing_name} command '{command}'. "
+            "Install it or set the provider-specific command env vars.",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="missing_external_process_command",
         )
 
+    extra = pconfig.extra if isinstance(pconfig.extra, dict) else {}
+    api_key_placeholder = str(extra.get("api_key_placeholder") or provider_id)
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
-        "base_url": base_url.rstrip("/"),
+        "api_key": api_key_placeholder,
+        "base_url": base_url,
         "command": resolved_command or command,
         "args": args,
         "source": "process",

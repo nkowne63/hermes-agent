@@ -50,6 +50,56 @@ class TestResolveDisplaySetting:
         assert resolve_display_setting(config, "slack", "tool_progress") == "off"
         assert resolve_display_setting(config, "telegram", "tool_progress") == "all"
 
+    def test_thread_only_display_channels_match_parent_but_not_thread(self):
+        """A configured parent channel suppresses transient output only outside threads."""
+        from gateway.display_config import is_thread_only_display_channel
+
+        config = {
+            "display": {
+                "thread_only_channels": ["1509077323490791515"],
+            }
+        }
+
+        assert is_thread_only_display_channel(
+            config,
+            channel_id="1509077323490791515",
+            thread_id=None,
+            parent_channel_id=None,
+        ) is True
+        assert is_thread_only_display_channel(
+            config,
+            channel_id="1533727118754840576",
+            thread_id="1533727118754840576",
+            parent_channel_id="1509077323490791515",
+        ) is False
+        assert is_thread_only_display_channel(
+            config,
+            channel_id="other-channel",
+            thread_id=None,
+            parent_channel_id=None,
+        ) is False
+
+    def test_gateway_reasoning_resolution_handles_thread_only_parent(self):
+        """Final-response display resolution must not leak parent-only state."""
+        from gateway.config import Platform
+        from gateway.run import _resolve_gateway_show_reasoning
+        from gateway.session import SessionSource
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1509077323490791515",
+            chat_type="group",
+            thread_id=None,
+        )
+        config = {
+            "display": {
+                "show_reasoning": True,
+                "thread_only_channels": ["1509077323490791515"],
+            }
+        }
+
+        assert _resolve_gateway_show_reasoning(config, source, default=True) is False
+
 
 # ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides

@@ -1330,6 +1330,27 @@ def _build_child_agent(
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
     )
+    # If the parent has an active agmsg identity, give the child a stable
+    # runtime identity before it starts.  The sender-side agmsg script can
+    # then discover this child through the team's live runtime roster and push
+    # messages directly into its safe AIAgent.steer boundary.
+    _agmsg_team = getattr(parent_agent, "_agmsg_team", None)
+    _agmsg_parent_name = getattr(parent_agent, "_agmsg_agent", None)
+    _agmsg_child_name = (
+        f"{_agmsg_parent_name}-{subagent_id}"
+        if _agmsg_team and _agmsg_parent_name
+        else None
+    )
+    if _agmsg_child_name:
+        child_prompt += (
+            "\n\n## agmsg Runtime Identity\n"
+            f"You are `{_agmsg_child_name}` in team `{_agmsg_team}`.\n"
+            f"Your parent identity is `{_agmsg_parent_name}`.\n"
+            "Messages sent to this identity are pushed into your next safe "
+            "agent iteration; you do not need to poll inbox.sh for live push. "
+            "Use the agmsg scripts with these explicit team/identity values "
+            "when replying."
+        )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -1565,6 +1586,17 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    try:
+        from tools.agmsg_bridge import register_child_agent
+
+        register_child_agent(
+            child,
+            parent_agent,
+            subagent_id=subagent_id,
+            project=workspace_hint or "",
+        )
+    except Exception:
+        logger.debug("agmsg child registration failed", exc_info=True)
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see

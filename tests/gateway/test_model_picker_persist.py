@@ -20,6 +20,7 @@ closure the PR changed, against a real temp ``HERMES_HOME``.
 """
 
 import types
+from pathlib import Path
 
 import yaml
 import pytest
@@ -56,11 +57,11 @@ def _make_runner(adapter):
     return runner
 
 
-def _make_event(text):
+def _make_event(text, *, platform=Platform.TELEGRAM):
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
+        source=SessionSource(platform=platform, chat_id="12345", chat_type="dm"),
     )
 
 
@@ -199,6 +200,135 @@ async def test_picker_tap_global_flag_persists(tmp_path, monkeypatch, seed_model
     assert "api_key" not in written["model"]
     assert "api_mode" not in written["model"]
     assert "context_length" not in written["model"]
+
+@pytest.mark.asyncio
+async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
+    """``/model --session`` then a picker tap stays in-memory only — config
+    untouched, but the in-memory session override must still be applied (the
+    switch worked, it just wasn't persisted)."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    runner = _make_runner(adapter)
+
+    confirmation = await _drive_picker(runner, _make_event("/model --session"))
+
+    assert confirmation is not None
+    assert "gpt-5.5" in confirmation
+    # The session override IS applied in-memory (proves the path didn't no-op).
+    assert runner._session_model_overrides, "session override should be set"
+    assert any(
+        ov.get("model") == "gpt-5.5"
+        for ov in runner._session_model_overrides.values()
+    )
+    # But config.yaml is untouched — the override is in-memory only.
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "old-model"
+    assert written["model"]["provider"] == "openai-codex"
+
+
+@pytest.mark.asyncio
+async def test_picker_tap_session_override_keeps_acp_launch_args(tmp_path, monkeypatch):
+    """Session-only ACP model switches must preserve command/args for the next turn."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openrouter"}
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **kw: types.SimpleNamespace(
+            success=True,
+            new_model="swe-1.6",
+            target_provider="devin-acp",
+            provider_changed=True,
+            api_key="devin-acp",
+            base_url="acp://devin",
+            api_mode="chat_completions",
+            provider_label="Devin ACP",
+            is_global=False,
+            warning_message="",
+            capabilities=None,
+            model_info=None,
+        ),
+    )
+
+    runner = _make_runner(adapter)
+
+    confirmation = await _drive_picker(runner, _make_event("/model --session"))
+
+    assert confirmation is not None
+    override = next(iter(runner._session_model_overrides.values()))
+    assert override["provider"] == "devin-acp"
+    assert Path(override["command"]).name == "devin"
+    assert override["args"] == ["acp"]
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "old-model"
+    assert written["model"]["provider"] == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_discord_picker_tap_is_session_only(tmp_path, monkeypatch):
+    """Discord picker taps must not rewrite the shared default model."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, {"default": "old-model", "provider": "openrouter"})
+    runner = _make_runner(adapter)
+    runner.adapters[Platform.DISCORD] = adapter
+
+    confirmation = await _drive_picker(runner, _make_event("/model", platform=Platform.DISCORD))
+
+    assert confirmation is not None
+    assert "gpt-5.5" in confirmation
+    assert runner._session_model_overrides, "discord picker should still update the session override"
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "old-model"
+    assert written["model"]["provider"] == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_multiplex_picker_keeps_profile_adapter_and_callback_scope(
+    tmp_path, monkeypatch
+):
+    """A named profile must present and execute its picker under one identity."""
+    from agent.secret_scope import get_secret, set_multiplex_active
+
+    default_adapter = _FakePickerAdapter()
+    named_adapter = _FakePickerAdapter()
+    named_home = tmp_path / "profiles" / "named"
+    named_home.mkdir(parents=True)
+    (named_home / ".env").write_text("PROFILE_MODEL_KEY=named-secret\n", encoding="utf-8")
+    runner = _make_named_runner(monkeypatch, default_adapter, named_adapter, named_home)
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+    resolved = []
+
+    def _profile_switch(**kwargs):
+        resolved.append(get_secret("PROFILE_MODEL_KEY"))
+        return _fake_switch_result()
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _profile_switch)
+    event = _named_event("--session")
+
+    set_multiplex_active(True)
+    try:
+        sent = await runner._handle_model_command(event)
+
+        assert sent is None
+        assert default_adapter.captured_callback is None
+        assert named_adapter.captured_callback is not None
+        assert resolved == []
+
+        confirmation = await named_adapter.captured_callback(
+            "named-chat", "gpt-5.5", "openrouter"
+        )
+    finally:
+        set_multiplex_active(False)
+
+    assert "gpt-5.5" in confirmation
+    assert resolved == ["named-secret"]
 
 
 @pytest.mark.asyncio

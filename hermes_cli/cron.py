@@ -152,6 +152,9 @@ def cron_list(show_all: bool = False):
         print(f"    Schedule:  {schedule}")
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
+        active_run = job.get("active_run")
+        if isinstance(active_run, dict):
+            print(f"    Active:    pid={active_run.get('pid')} started={active_run.get('started_at')} owner={active_run.get('owner')}")
         print(f"    Deliver:   {deliver_str}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")

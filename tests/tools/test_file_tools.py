@@ -572,6 +572,42 @@ class TestSessionCwdSurvivesEnvRecreation:
     @patch("tools.file_tools._file_ops_cache", new_callable=dict)
     @patch("tools.terminal_tool._get_env_config")
     @patch("tools.terminal_tool._create_environment")
+    def test_falls_back_to_config_default_when_no_record(
+        self, mock_create_env, mock_config, mock_cache, mock_active
+    ):
+        import tools.terminal_tool as tt
+        from tools.file_tools import _get_file_ops
+
+        mock_env = MagicMock()
+        mock_env.cwd = "/default/path"
+        mock_create_env.return_value = mock_env
+        mock_config.return_value = {
+            "env_type": "local",
+            "cwd": "/config/default/path",
+            "timeout": 30,
+        }
+
+        task_id = "default"
+        tt.clear_session_cwd(task_id)
+
+        _get_file_ops(task_id)
+
+        create_call = mock_create_env.call_args
+        assert create_call is not None, "_create_environment was not called"
+        kwargs = create_call.kwargs if create_call.kwargs else {}
+        cwd_passed = kwargs.get("cwd", None)
+        if cwd_passed is None:
+            args = create_call.args if create_call.args else []
+            if len(args) >= 3:
+                cwd_passed = args[2]
+
+        assert cwd_passed == "/config/default/path", \
+            f"Expected cwd='/config/default/path', got {cwd_passed!r}"
+
+    @patch("tools.terminal_tool._active_environments", new_callable=dict)
+    @patch("tools.file_tools._file_ops_cache", new_callable=dict)
+    @patch("tools.terminal_tool._get_env_config")
+    @patch("tools.terminal_tool._create_environment")
     def test_stale_cache_cwd_rescued_into_record_on_cleanup_detection(
         self, mock_create_env, mock_config, mock_cache, mock_active
     ):

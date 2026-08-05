@@ -199,6 +199,19 @@ class TestJobCRUD:
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
 
+    def test_active_loop_injection_flag_round_trips(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Hourly checkpoint",
+            schedule="every 1h",
+            deliver="local",
+            inject_to_active_loop=True,
+        )
+        assert job["inject_to_active_loop"] is True
+        assert get_job(job["id"])["inject_to_active_loop"] is True
+
+        updated = update_job(job["id"], {"inject_to_active_loop": False})
+        assert updated["inject_to_active_loop"] is False
+        assert get_job(job["id"])["inject_to_active_loop"] is False
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
         create_job(prompt="Job 2", schedule="every 2h")

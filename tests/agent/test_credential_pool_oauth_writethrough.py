@@ -76,6 +76,55 @@ def profile_and_root(tmp_path, monkeypatch):
 
 
 
+@pytest.mark.parametrize("provider", ["openai-codex", "xai-oauth"])
+def test_pool_refresh_does_not_touch_root_when_profile_shadows(
+    profile_and_root, provider
+):
+    """A profile that genuinely shadows root must NOT clobber the root grant."""
+    profile_path, root_path = profile_and_root
+    _write_store(
+        profile_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "profile-old",
+                        "refresh_token": "profile-old-refresh",
+                    }
+                }
+            },
+        },
+    )
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "root-untouched",
+                        "refresh_token": "root-untouched-refresh",
+                    }
+                }
+            },
+        },
+    )
+    pool = CredentialPool(provider, [])
+    pool._sync_device_code_entry_to_auth_store(
+        _entry(
+            provider,
+            id="e2",
+            access_token="profile-new",
+            refresh_token="profile-new-refresh",
+        )
+    )
+    profile = _read_store(profile_path)
+    assert profile["providers"][provider]["tokens"]["refresh_token"] == "profile-new-refresh"
+    root = _read_store(root_path)
+    assert root["providers"][provider]["tokens"]["refresh_token"] == "root-untouched-refresh"
+
+
 def test_global_write_through_preserves_concurrent_root_update(
     profile_and_root, monkeypatch
 ):

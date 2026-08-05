@@ -28,6 +28,7 @@ Usage:
 import os
 import re
 import difflib
+import shutil
 import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -2543,7 +2544,13 @@ class ShellFileOperations(FileOperations):
     def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Search using ripgrep."""
-        cmd_parts = ["rg", "--line-number", "--no-heading", "--with-filename"]
+        rg_cmd = "rg"
+        if not self._has_command("rg") and self.env.__class__.__name__ == "LocalEnvironment":
+            host_rg = shutil.which("rg")
+            if host_rg:
+                rg_cmd = self._escape_shell_arg(host_rg)
+
+        cmd_parts = [rg_cmd, "--line-number", "--no-heading", "--with-filename"]
 
         # Auto-multiline: a regex `\n` (or a literal newline in the pattern)
         # cannot match in rg's default line-oriented mode — it used to hard
@@ -2553,7 +2560,6 @@ class ShellFileOperations(FileOperations):
         multiline = _pattern_has_regex_newline(pattern)
         if multiline:
             cmd_parts.append("--multiline")
-
         # Add context if requested
         if context > 0:
             cmd_parts.extend(["-C", str(context)])

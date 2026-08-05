@@ -1791,6 +1791,132 @@ class TestRetryAfterCap:
 
 
 
+class TestGenericOverloadBackoff:
+    """Generic provider overloads retry instead of eagerly failing over."""
+
+    def test_run_conversation_uses_overload_backoff_and_retries(self, agent):
+        class _OverloadedError(Exception):
+            status_code = 503
+
+            def __str__(self):
+                return "Our servers are currently overloaded. Please try again later."
+
+        calls = []
+
+        def _fake_api_call(api_kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise _OverloadedError()
+            return _mock_response(content="Recovered after overload")
+
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        captured = []
+        original_buffer = agent._buffer_status
+        agent._buffer_status = lambda msg, *args, **kwargs: (captured.append(msg), original_buffer(msg, *args, **kwargs))[1]
+
+        clock = [0.0]
+
+        def _fake_time():
+            return clock[0]
+
+        def _fake_sleep(seconds):
+            clock[0] += seconds
+
+        with (
+            patch("agent.conversation_loop.time.time", side_effect=_fake_time),
+            patch("agent.conversation_loop.time.sleep", side_effect=_fake_sleep),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after overload"
+        assert len(calls) == 2
+        assert any("Provider overloaded. Waiting 2.0s" in msg for msg in captured)
+
+    def test_retries_through_first_interval_above_eight_hours(self, agent):
+        class _OverloadedError(Exception):
+            status_code = 503
+
+            def __str__(self):
+                return "Our servers are currently overloaded. Please try again later."
+
+        calls = []
+
+        def _fake_api_call(api_kwargs):
+            calls.append(1)
+            if len(calls) <= 15:
+                raise _OverloadedError()
+            return _mock_response(content="Recovered after long overload")
+
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        captured = []
+        original_emit = agent._emit_status
+        agent._emit_status = lambda msg, *args, **kwargs: (captured.append(msg), original_emit(msg, *args, **kwargs))[1]
+
+        clock = [0.0]
+
+        def _fake_time():
+            return clock[0]
+
+        def _fake_sleep(seconds):
+            clock[0] += seconds
+
+        with (
+            patch("agent.conversation_loop.time.time", side_effect=_fake_time),
+            patch("agent.conversation_loop.time.sleep", side_effect=_fake_sleep),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after long overload"
+        assert len(calls) == 16
+        assert any("Waiting 32768.0s" in msg for msg in captured)
+
+    def test_generic_overload_does_not_eagerly_activate_fallback(self, agent):
+        class _OverloadedError(Exception):
+            status_code = 503
+
+            def __str__(self):
+                return "Our servers are currently overloaded. Please try again later."
+
+        agent._fallback_chain = [{"provider": "openrouter", "model": "fallback/model"}]
+        agent._fallback_index = 0
+        agent._try_activate_fallback = MagicMock(return_value=False)
+        calls = []
+
+        def _fake_api_call(api_kwargs):
+            calls.append(1)
+            if len(calls) <= 3:
+                raise _OverloadedError()
+            return _mock_response(content="Recovered without fallback")
+
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        clock = [0.0]
+
+        def _fake_time():
+            return clock[0]
+
+        def _fake_sleep(seconds):
+            clock[0] += seconds
+
+        with (
+            patch("agent.conversation_loop.time.time", side_effect=_fake_time),
+            patch("agent.conversation_loop.time.sleep", side_effect=_fake_sleep),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered without fallback"
+        assert len(calls) == 4
+        agent._try_activate_fallback.assert_not_called()
+
+
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 
@@ -2913,6 +3039,88 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_copilot_acp_intermediate_ack_after_tools_is_not_final(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "copilot-acp"
+        agent.base_url = "acp://copilot"
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_turn = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        contaminated = _mock_response(
+            content=(
+                "`session_store_sql` が使えない環境なので、`session_search` と "
+                "`search_files` で情報を取得します。並行して取得します。"
+            ),
+            finish_reason="stop",
+        )
+        final = _mock_response(
+            content="読んだ範囲での要約です。Nuxt3移行は最終e2e待ちです。",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [tool_turn, contaminated, final]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("nuxt3移行を要約して")
+
+        assert result["final_response"] == "読んだ範囲での要約です。Nuxt3移行は最終e2e待ちです。"
+        assert result["api_calls"] == 3
+        assert any(m.get("_acp_intermediate_ack") for m in result["messages"])
+
+    def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
+        self._setup_agent(agent)
+        agent.verbose_logging = True
+        tc = _mock_tool_call(name="web_search", arguments=None, call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Done searching", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == "Done searching"
+        assert mock_handle_function_call.call_args.args[:2] == ("web_search", {})
+
+    def test_copilot_acp_initial_planning_ack_executes_tools(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "copilot-acp"
+        agent.base_url = "acp://copilot"
+        planning = _mock_response(
+            content="Let me load the relevant skills and check the session history simultaneously.",
+            finish_reason="stop",
+        )
+        tc = _mock_tool_call(name="session_search", arguments='{"query":"nuxt3"}', call_id="c1")
+        tool_turn = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        final = _mock_response(
+            content="現状要約です。総トークン使用量は286,197,091 tokensです。",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [planning, tool_turn, final]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="session result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("nuxt3移行関連のファイルとorchestoratorを読んで要約して")
+
+        assert result["final_response"] == "現状要約です。総トークン使用量は286,197,091 tokensです。"
+        assert result["api_calls"] == 3
+        assert any(m.get("role") == "tool" for m in result["messages"])
+        continuation = next(
+            m for m in result["messages"]
+            if isinstance(m, dict) and m.get("_acp_intermediate_ack") and m.get("role") == "user"
+        )
+        assert "Execute the required Hermes tool calls now" in continuation["content"]
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)

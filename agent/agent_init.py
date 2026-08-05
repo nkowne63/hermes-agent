@@ -591,6 +591,24 @@ def init_agent(
     agent.quiet_mode = quiet_mode
     agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
+    # Explicit operator opt-in for skills that must be present in every
+    # top-level and delegated agent.  Loading here covers CLI, gateway, TUI,
+    # and delegate_task uniformly without mutating a live system prompt.
+    try:
+        from agent.skill_commands import build_always_loaded_skills_prompt
+
+        _always_prompt, _always_loaded, _always_missing = build_always_loaded_skills_prompt(
+            task_id=session_id,
+        )
+        if _always_prompt:
+            agent.ephemeral_system_prompt = (
+                f"{_always_prompt}\n\n{agent.ephemeral_system_prompt}"
+                if agent.ephemeral_system_prompt
+                else _always_prompt
+            )
+    except Exception:
+        # A malformed optional skill must never prevent an agent from starting.
+        pass
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
@@ -715,8 +733,8 @@ def init_agent(
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
-        and agent.provider != "copilot-acp"
-        and not str(agent.base_url or "").lower().startswith("acp://copilot")
+        and agent.provider not in {"copilot-acp", "devin-acp", "claude-acp"}
+        and not str(agent.base_url or "").lower().startswith("acp://")
         and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
         and (
@@ -1166,7 +1184,7 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
+            if agent.provider in {"copilot-acp", "devin-acp", "claude-acp"}:
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url
@@ -2798,6 +2816,17 @@ def init_agent(
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
+
+    # Register only top-level agents.  delegate_tool registers children after
+    # assigning their stable subagent_id, so a child never briefly claims the
+    # parent's logical agmsg identity.
+    if parent_session_id is None:
+        try:
+            from tools.agmsg_bridge import register_top_level_agent
+
+            register_top_level_agent(agent)
+        except Exception:
+            pass
 
 
 

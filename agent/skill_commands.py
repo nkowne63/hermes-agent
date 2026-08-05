@@ -810,3 +810,37 @@ def build_preloaded_skills_prompt(
         loaded_names.append(skill_name)
 
     return "\n\n".join(prompt_parts), loaded_names, missing
+
+
+def get_always_loaded_skill_names() -> list[str]:
+    """Return the user-configured skills that must load for every agent.
+
+    ``skills.always_loaded`` is intentionally a small explicit list rather
+    than an ``auto_load: true`` frontmatter flag.  A frontmatter flag would
+    make arbitrary skills execute in every conversation, while this config
+    keeps the operator's opt-in visible and profile-scoped.
+    """
+    cfg = _load_skills_config()
+    raw = cfg.get("always_loaded", []) if isinstance(cfg, dict) else []
+    if isinstance(raw, str):
+        raw = raw.replace("\n", ",").split(",")
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in seen:
+            out.append(name)
+            seen.add(name)
+    return out
+
+
+def build_always_loaded_skills_prompt(
+    *, task_id: str | None = None,
+) -> tuple[str, list[str], list[str]]:
+    """Build the full prompt payload for ``skills.always_loaded``."""
+    return build_preloaded_skills_prompt(
+        get_always_loaded_skill_names(),
+        task_id=task_id,
+    )

@@ -198,4 +198,12 @@ class TestWecomCallbackBodySizeLimit:
         response = await adapter._handle_callback(self._request(oversized))
         assert response.status == 413
 
-
+    @pytest.mark.asyncio
+    async def test_normal_sized_body_not_rejected_for_size(self):
+        adapter = WecomCallbackAdapter(_config())
+        # A small body passes the size guard and proceeds to decrypt, which
+        # fails signature verification (400), NOT 413 — proving the guard
+        # doesn't reject legitimate-sized payloads.
+        small = b"<xml><Encrypt>not-real</Encrypt></xml>"
+        response = await adapter._handle_callback(self._request(small))
+        assert response.status != 413

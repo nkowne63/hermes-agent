@@ -492,7 +492,6 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
             return "nix"
     except OSError:
         pass
-
     # detect git repo installs (normal installer, development env)
     git_path = root / ".git"
     if git_path.is_dir():

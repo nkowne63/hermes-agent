@@ -34,6 +34,11 @@ _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 # the two from silently desyncing if the short-retry count is ever tuned.
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
 
+# Generic provider overloads use the existing normal retry unit as their base,
+# then keep doubling until the first interval strictly above eight hours.
+_OVERLOADED_BACKOFF_BASE_SECONDS = 2.0
+_OVERLOADED_BACKOFF_THRESHOLD_SECONDS = 8 * 60 * 60
+
 
 def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
     """Parse a ``Retry-After`` value into non-negative seconds.
@@ -126,6 +131,78 @@ def jittered_backoff(
     jitter = rng.uniform(0, jitter_ratio * delay)
 
     return delay + jitter
+
+
+def overloaded_backoff_max_delay(
+    *,
+    base_delay: float = _OVERLOADED_BACKOFF_BASE_SECONDS,
+    threshold: float = _OVERLOADED_BACKOFF_THRESHOLD_SECONDS,
+) -> float:
+    """Return the first doubling interval strictly greater than ``threshold``.
+
+    Generic provider overloads need a much longer recovery window than the
+    normal interactive retry cap.  The returned value is deliberately the
+    first power-of-two interval *above* the threshold, so an 8-hour threshold
+    with the existing 2-second base ends at 32,768 seconds (9h 6m 8s).
+    """
+    if base_delay <= 0:
+        raise ValueError("base_delay must be greater than zero")
+    max_delay = float(base_delay)
+    while max_delay <= threshold:
+        max_delay *= 2.0
+    return max_delay
+
+
+def overloaded_backoff(
+    attempt: int,
+    *,
+    base_delay: float = _OVERLOADED_BACKOFF_BASE_SECONDS,
+    threshold: float = _OVERLOADED_BACKOFF_THRESHOLD_SECONDS,
+) -> float:
+    """Compute the exact doubling schedule for a generic overload.
+
+    Unlike the normal jittered policy, overload waits are deterministic: the
+    requested contract is exact 2x growth, and the cap is the first unit above
+    the threshold.  Determinism also makes the long-wait policy auditable.
+    """
+    return jittered_backoff(
+        attempt,
+        base_delay=base_delay,
+        max_delay=overloaded_backoff_max_delay(
+            base_delay=base_delay,
+            threshold=threshold,
+        ),
+        jitter_ratio=0.0,
+    )
+
+
+def overloaded_retry_ceiling(
+    *,
+    base_delay: float = _OVERLOADED_BACKOFF_BASE_SECONDS,
+    threshold: float = _OVERLOADED_BACKOFF_THRESHOLD_SECONDS,
+) -> int:
+    """Return a retry-loop ceiling that includes the final overload wait.
+
+    The conversation loop checks ``retry_count >= ceiling`` before computing
+    the next wait.  One extra slot is therefore required after the last
+    scheduled wait, otherwise the first interval above the threshold would be
+    unreachable.
+    """
+    max_delay = overloaded_backoff_max_delay(
+        base_delay=base_delay,
+        threshold=threshold,
+    )
+    delay = float(base_delay)
+    scheduled_attempts = 1
+    while delay < max_delay:
+        delay *= 2.0
+        scheduled_attempts += 1
+    return scheduled_attempts + 1
+
+
+# Keep overload-specific constants and helpers above provider-specific
+# classifiers so callers can share the schedule without importing provider
+# detection internals.
 
 
 def _error_text(error: Any) -> str:

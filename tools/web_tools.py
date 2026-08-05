@@ -169,7 +169,7 @@ def _load_web_config() -> dict:
 # WebSearchProvider. Keep the two sets aligned by hand: if xai ever ships as
 # a registered provider, drop it here so the registry path takes over.
 _LEGACY_WEB_BACKENDS = frozenset(
-    {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}
+    {"parallel", "firecrawl", "tavily", "exa", "native", "searxng", "brave-free", "ddgs", "xai"}
 )
 
 
@@ -333,6 +333,14 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "native":
+        # Native extraction uses Hermes' existing httpx dependency and the
+        # standard-library HTML parser; no vendor credential is required.
+        try:
+            import httpx  # noqa: F401
+            return True
+        except ImportError:
+            return False
     if backend == "searxng":
         return _has_env("SEARXNG_URL")
     if backend == "brave-free":
@@ -885,7 +893,7 @@ async def web_extract_tool(
                             "error": (
                                 f"{provider.display_name} is a search-only "
                                 "backend and cannot extract URL content. "
-                                "Set web.extract_backend to firecrawl, "
+                                "Set web.extract_backend to native, firecrawl, "
                                 "tavily, exa, or parallel."
                             ),
                         },
@@ -919,7 +927,7 @@ async def web_extract_tool(
                             "success": False,
                             "error": (
                                 "No web extract provider configured. "
-                                "Set web.extract_backend to firecrawl, "
+                                "Set web.extract_backend to native, firecrawl, "
                                 "tavily, exa, or parallel."
                             ),
                         },
@@ -1056,14 +1064,25 @@ def check_web_api_key() -> bool:
     :func:`_is_backend_available`, which delegates non-legacy names to the
     registry.
     """
-    # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
-    # ``None.lower()`` would raise. Mirrors ``_get_backend``.
-    configured = (_load_web_config().get("backend") or "").lower().strip()
+    cfg = _load_web_config()
+    configured = (cfg.get("backend") or "").lower().strip()
+    explicit_native = any(
+        (cfg.get(key) or "").lower().strip() == "native"
+        for key in ("backend", "search_backend", "extract_backend")
+    )
     if configured and _is_backend_available(configured):
         return True
-    # Any built-in backend with credentials present. This is a boolean OR, so
-    # unlike _get_backend() the probe order is irrelevant.
-    if any(_is_backend_available(backend) for backend in _LEGACY_WEB_BACKENDS):
+    if explicit_native and _is_backend_available("native"):
+        return True
+    # Any built-in backend with credentials present. Native is intentionally
+    # excluded here: it must not make the web tools appear configured merely
+    # because the local stdlib extractor is available when no native backend
+    # was explicitly selected.
+    if any(
+        _is_backend_available(backend)
+        for backend in _LEGACY_WEB_BACKENDS
+        if backend != "native"
+    ):
         return True
     # Any plugin-registered provider the registry considers active for either
     # capability. Delegating to the registry's own availability-filtered
@@ -1075,9 +1094,14 @@ def check_web_api_key() -> bool:
             get_active_extract_provider,
         )
 
+        search_provider = get_active_search_provider()
+        extract_provider = get_active_extract_provider()
         return (
-            get_active_search_provider() is not None
-            or get_active_extract_provider() is not None
+            (search_provider is not None and search_provider.name != "native")
+            or (
+                extract_provider is not None
+                and (extract_provider.name != "native" or explicit_native)
+            )
         )
     except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
         logger.debug("web provider registry availability check failed: %s", exc)

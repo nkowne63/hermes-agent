@@ -298,6 +298,22 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "copilot-acp": [
         "copilot-acp",
     ],
+    "devin-acp": [
+        "swe-1.6",
+        "glm-5.2",
+        "gpt-5.4-mini",
+        "gpt-5.4",
+        "claude-sonnet-4.5",
+        "adaptive",
+        "devin-acp",
+    ],
+    "claude-acp": [
+        "claude-fable-5",
+        "claude-sonnet-4.6",
+        "claude-opus-4.6",
+        "claude-opus-4.8",
+        "claude-haiku-4.5",
+    ],
     "copilot": [
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -1127,6 +1143,8 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
+    ProviderEntry("devin-acp",      "Devin ACP",                "Devin ACP (Spawns devin acp)"),
+    ProviderEntry("claude-acp",     "Claude ACP",               "Claude ACP (Spawns claude-agent-acp)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
     ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
@@ -1206,6 +1224,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go or Go subscription",            ["opencode-zen", "opencode-go"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
+    "acp":      ("ACP CLIs",        "Local ACP-compatible coding agents",              ["devin-acp", "claude-acp"]),
 }
 
 # Reverse index: member slug -> group_id. Built once at import.
@@ -1290,6 +1309,10 @@ _PROVIDER_ALIASES = {
     "github-model": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "devin": "devin-acp",
+    "devin-acp": "devin-acp",
+    "claude-agent-acp": "claude-acp",
+    "anthropic-acp": "claude-acp",
     "google": "gemini",
     "google-gemini": "gemini",
     "google-ai-studio": "gemini",
@@ -2195,6 +2218,11 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
     provider from the input or *current_provider* if none was specified.
     """
     stripped = raw.strip()
+    if "/" in stripped:
+        provider_part, model_part = stripped.split("/", 1)
+        provider_norm = normalize_provider(provider_part)
+        if provider_norm in {"devin-acp", "claude-acp", "copilot-acp"} and model_part.strip():
+            return (provider_norm, model_part.strip())
     colon = stripped.find(":")
     if colon > 0:
         provider_part = stripped[:colon].strip().lower()
@@ -2303,6 +2331,7 @@ def _model_in_provider_catalog(name_lower: str, providers: set[str]) -> bool:
 _AGGREGATOR_PROVIDERS = frozenset(
     {"nous", "openrouter", "ai-gateway", "copilot", "kilocode"}
 )
+_ACP_PROCESS_PROVIDERS = frozenset({"devin-acp", "claude-acp"})
 
 # Subscription/OAuth providers whose catalogs RE-EXPOSE other vendors' models
 # would be listed here (tried only as a last resort for bare short-alias
@@ -2362,6 +2391,7 @@ def _resolve_static_model_alias(
             provider in current_keys
             or provider in _AGGREGATOR_PROVIDERS
             or provider in _BORROWED_MODEL_PROVIDERS
+            or provider in _ACP_PROCESS_PROVIDERS
         ):
             continue
         if matched := _match(provider):
@@ -2447,6 +2477,7 @@ def detect_static_provider_for_model(
             pid in current_keys
             or pid in _AGGREGATOR_PROVIDERS
             or pid in _BORROWED_MODEL_PROVIDERS
+            or pid in _ACP_PROCESS_PROVIDERS
         ):
             continue
         if _is_custom_current:
@@ -2842,15 +2873,17 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return get_codex_model_ids(access_token=access_token)
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
+    if normalized in {"devin-acp", "claude-acp"}:
+        return _normalize_acp_model_ids(normalized, _PROVIDER_MODELS.get(normalized, []))
     if normalized in {"copilot", "copilot-acp"}:
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
             if live:
-                return live
+                return _normalize_acp_model_ids(normalized, live)
         except Exception:
             pass
         if normalized == "copilot-acp":
-            return list(_PROVIDER_MODELS.get("copilot", []))
+            return _normalize_acp_model_ids(normalized, _PROVIDER_MODELS.get("copilot", []))
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
         try:
@@ -3061,6 +3094,24 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized in _MODELS_DEV_PREFERRED:
         return _merge_with_models_dev(normalized, curated_static)
     return curated_static
+
+
+def _normalize_acp_model_ids(provider: Optional[str], model_ids_list: list[str] | tuple[str, ...]) -> list[str]:
+    """Strip accidental ``provider/`` prefixes from ACP model candidates."""
+    normalized = normalize_provider(provider)
+    if normalized not in {"devin-acp", "claude-acp", "copilot-acp"}:
+        return list(model_ids_list)
+
+    prefix = f"{normalized}/"
+    result: list[str] = []
+    for raw in model_ids_list:
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):].strip()
+        result.append(value)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3277,13 +3328,13 @@ def cached_provider_model_ids(
     ):
         age = now - float(entry.get("at", 0))
         if age < ttl_seconds:
-            return list(entry["models"])
+            return _normalize_acp_model_ids(normalized, entry["models"])
         if age < _PROVIDER_MODELS_STALE_SERVE_MAX:
             # Stale-while-revalidate: serve the expired entry immediately so
             # interactive picker opens never block on serial /v1/models
             # round-trips; refresh the cache off-thread for the next open.
             _spawn_swr_refresh(normalized)
-            return list(entry["models"])
+            return _normalize_acp_model_ids(normalized, entry["models"])
 
     # Cache miss / stale / forced refresh — call the live path.
     live = provider_model_ids(normalized, force_refresh=force_refresh)
@@ -3294,7 +3345,7 @@ def cached_provider_model_ids(
             "models": list(live),
         }
         _save_provider_models_cache(cache)
-        return list(live)
+        return _normalize_acp_model_ids(normalized, live)
 
     # Live fetch returned nothing. If we have a stale entry with the
     # SAME fingerprint, prefer it over an empty result — stale data
@@ -3305,7 +3356,7 @@ def cached_provider_model_ids(
         and isinstance(entry.get("models"), list)
         and entry["models"]
     ):
-        return list(entry["models"])
+        return _normalize_acp_model_ids(normalized, entry["models"])
     return list(live or [])
 
 

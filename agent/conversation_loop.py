@@ -83,6 +83,8 @@ from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
     jittered_backoff,
+    overloaded_backoff,
+    overloaded_retry_ceiling,
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
@@ -98,6 +100,19 @@ logger = logging.getLogger(__name__)
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
+
+_ACP_PROCESS_PROVIDERS = {"copilot-acp", "devin-acp", "claude-acp"}
+
+
+def _is_acp_session_prompt_timeout(error: Exception, provider: str) -> bool:
+    if (provider or "").strip().lower() not in _ACP_PROCESS_PROVIDERS:
+        return False
+    if not isinstance(error, TimeoutError):
+        return False
+    method = getattr(error, "method", None)
+    if method == "session/prompt":
+        return True
+    return "response to session/prompt" in str(error).lower()
 
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
@@ -1354,6 +1369,7 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    acp_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -2356,8 +2372,8 @@ def run_conversation(
                 # stream.  Mirror the ACP exclusion used for Responses
                 # API upgrade (lines ~1083-1085).
                 elif (
-                    agent.provider in {"copilot-acp"}
-                    or str(agent.base_url or "").lower().startswith("acp://copilot")
+                    agent.provider in {"copilot-acp", "devin-acp", "claude-acp"}
+                    or str(agent.base_url or "").lower().startswith("acp://")
                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
                 ):
                     _use_streaming = False
@@ -3819,6 +3835,8 @@ def run_conversation(
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
                 )
+                if _is_acp_session_prompt_timeout(api_error, getattr(agent, "provider", "") or ""):
+                    max_retries = min(max_retries, 2)
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
@@ -4442,11 +4460,24 @@ def run_conversation(
                 _is_zai_coding_overload = is_zai_coding_overload_error(
                     base_url=str(_base), model=_model, error=api_error
                 )
+                _is_generic_overload = (
+                    classified.reason == FailoverReason.overloaded
+                    and not _is_zai_coding_overload
+                )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                elif _is_generic_overload:
+                    # Generic overloads get the long exact-doubling policy;
+                    # otherwise the default ceiling of 3 makes the first
+                    # provider-busy window look like a failover condition.
+                    max_retries = max(max_retries, overloaded_retry_ceiling())
                 _should_fallback = (
                     is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    or (
+                        _is_transport_failure
+                        and not _is_generic_overload
+                        and retry_count >= 2
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -5544,9 +5575,17 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                if _is_generic_overload:
+                    # Do not honor the short generic cap for provider overloads:
+                    # keep the exact doubling schedule through the first
+                    # interval strictly above eight hours.
+                    wait_time = overloaded_backoff(retry_count)
+                else:
+                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
-                if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
+                if _is_generic_overload:
+                    _backoff_policy = "generic_overloaded_exponential"
+                elif (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
                         base_url=str(_base),
@@ -5554,7 +5593,18 @@ def run_conversation(
                         error=api_error,
                         default_wait=wait_time,
                     )
-                if is_rate_limited or _is_zai_coding_overload:
+                if _is_generic_overload:
+                    _overload_status = (
+                        f"⏱️ Provider overloaded. Waiting {wait_time:.1f}s "
+                        f"(attempt {retry_count + 1}/{max_retries})..."
+                    )
+                    # Surface long waits immediately so a multi-hour retry is
+                    # distinguishable from a stalled gateway session.
+                    if wait_time >= 120.0:
+                        agent._emit_status(_overload_status)
+                    else:
+                        agent._buffer_status(_overload_status)
+                elif is_rate_limited or _is_zai_coding_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
@@ -6951,6 +7001,61 @@ def run_conversation(
                     continue
 
                 codex_ack_continuations = 0
+
+                if (
+                    acp_ack_continuations < 2
+                    and agent._looks_like_acp_intermediate_ack(
+                        assistant_content=final_response,
+                        messages=messages,
+                    )
+                ):
+                    acp_ack_continuations += 1
+                    logger.info(
+                        "ACP intermediate planning text detected after tool results; "
+                        "continuing instead of surfacing as final response "
+                        "(%d/2, provider=%s, model=%s)",
+                        acp_ack_continuations,
+                        agent.provider,
+                        agent.model,
+                    )
+                    agent._buffer_status(
+                        "↻ ACP returned planning text after tool results — "
+                        f"requesting final answer ({acp_ack_continuations}/2)"
+                    )
+                    interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
+                    interim_msg["_acp_intermediate_ack"] = True
+                    messages.append(interim_msg)
+                    has_recent_tool = any(
+                        isinstance(m, dict) and m.get("role") == "tool"
+                        for m in messages[-8:]
+                    )
+                    if has_recent_tool:
+                        continuation_text = (
+                            "[System: The previous assistant text was an "
+                            "intermediate plan, not a final answer. Do not "
+                            "call more tools unless strictly necessary. Read "
+                            "the tool results already in the transcript and "
+                            "provide the concise final answer now.]"
+                        )
+                    else:
+                        continuation_text = (
+                            "[System: The previous assistant text was an "
+                            "intermediate plan, not a final answer. Execute "
+                            "the required Hermes tool calls now. Only provide "
+                            "the final answer after the requested reading or "
+                            "searching has actually completed.]"
+                        )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": continuation_text,
+                            "_acp_intermediate_ack": True,
+                        }
+                    )
+                    agent._session_messages = messages
+                    continue
+
+                acp_ack_continuations = 0
 
                 if truncated_response_parts:
                     final_response = "".join(truncated_response_parts) + final_response

@@ -1369,7 +1369,8 @@ class AIAgent:
           1. ``providers.<id>.models.<model>.timeout_seconds`` (per-model override)
           2. ``providers.<id>.request_timeout_seconds`` (provider-wide)
           3. ``HERMES_API_TIMEOUT`` env var (legacy escape hatch)
-          4. 1800.0s default
+          4. provider-specific default for subprocess ACP providers
+          5. 1800.0s default
 
         Used by OpenAI-wire chat completions (streaming and non-streaming) so
         the per-provider config knob wins over the 1800s default.  Without this
@@ -1380,7 +1381,12 @@ class AIAgent:
         cfg = get_provider_request_timeout(self.provider, self.model)
         if cfg is not None:
             return cfg
-        return env_float("HERMES_API_TIMEOUT", 1800.0)
+        env_timeout = os.getenv("HERMES_API_TIMEOUT")
+        if env_timeout is not None:
+            return env_float("HERMES_API_TIMEOUT", 1800.0)
+        if str(self.provider or "").strip().lower() == "copilot-acp":
+            return 180.0
+        return 1800.0
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Resolve the base non-stream stale timeout and whether it is implicit.
@@ -1407,6 +1413,9 @@ class AIAgent:
         env_timeout = os.getenv("HERMES_API_CALL_STALE_TIMEOUT")
         if env_timeout is not None:
             return float(env_timeout), False
+
+        if str(self.provider or "").strip().lower() == "claude-acp":
+            return 240.0, False
 
         # Reasoning-model floor: auto-mitigation for known reasoning models
         # (Nemotron 3 Ultra, OpenAI o1/o3, Anthropic Opus 4.x thinking,
@@ -1754,6 +1763,20 @@ class AIAgent:
         from agent.agent_runtime_helpers import looks_like_codex_intermediate_ack
         return looks_like_codex_intermediate_ack(
             self, user_message, assistant_content, messages, require_workspace
+        )
+
+    def _looks_like_acp_intermediate_ack(
+        self,
+        *,
+        assistant_content: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Forwarder — see ``agent.agent_runtime_helpers.looks_like_acp_intermediate_ack``."""
+        from agent.agent_runtime_helpers import looks_like_acp_intermediate_ack
+        return looks_like_acp_intermediate_ack(
+            self,
+            assistant_content=assistant_content,
+            messages=messages,
         )
 
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
@@ -4214,6 +4237,13 @@ class AIAgent:
         """
         task_id = getattr(self, "session_id", None) or ""
 
+        try:
+            from tools.agmsg_bridge import unregister_agent
+
+            unregister_agent(self)
+        except Exception:
+            pass
+
         # 1. Kill background processes for this task
         try:
             from tools.process_registry import process_registry
@@ -6158,9 +6188,15 @@ class AIAgent:
         while tools are still pending; treating top-level content as progress
         in that shape leaks the answer before the tool call runs.
 
+        The helper is also used when comparing the message preceding a new
+        assistant turn. That preceding message may be a multimodal ``tool`` or
+        ``user`` message whose ``content`` is a list of typed parts; those are
+        not assistant text and must not be passed to the reasoning-tag regex.
         Content may be a string or a structured parts list (e.g. after vision
         turns or context compaction), so flatten it before stripping reasoning.
         """
+        if not isinstance(assistant_msg, dict) or assistant_msg.get("role") != "assistant":
+            return ""
         visible = self._extract_codex_interim_visible_text(assistant_msg)
         if visible:
             return visible
@@ -6214,6 +6250,18 @@ class AIAgent:
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
             return
+        provider = str(getattr(self, "provider", "") or "").strip().lower()
+        base_url = str(getattr(self, "base_url", "") or "").strip().lower()
+        if assistant_msg.get("tool_calls") and (
+            provider in {"copilot-acp", "devin-acp", "claude-acp"}
+            or base_url.startswith("acp://")
+        ):
+            return
+
+        # Codex Responses may carry visible mid-turn narration in structured
+        # commentary items. Preserve the ACP guard above, while allowing the
+        # shared Codex commentary extraction/deduplication path for other
+        # providers and for non-tool interim messages.
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
         undelivered_parts: List[str] = []
         pending_keys: set[str] = set()

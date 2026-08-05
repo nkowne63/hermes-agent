@@ -1901,3 +1901,71 @@ class TestSetCronSessionTitle:
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
 
 
+    def test_returns_none_for_blank_base(self):
+        from cron.scheduler import _set_cron_session_title
+        db = MagicMock()
+        assert _set_cron_session_title(db, "sess-1", "   ") is None
+        db.set_session_title.assert_not_called()
+
+    def test_returns_none_without_db_or_session(self):
+        from cron.scheduler import _set_cron_session_title
+        assert _set_cron_session_title(None, "sess-1", "X") is None
+        assert _set_cron_session_title(MagicMock(), "", "X") is None
+
+
+class TestCronActiveLoopInjection:
+    """Opt-in cron steering into the live origin session."""
+
+    def test_gate_defaults_off_and_per_job_flag_overrides_config(self):
+        from cron.scheduler import _cron_active_loop_injection_enabled
+
+        assert _cron_active_loop_injection_enabled({}, {}) is False
+        assert _cron_active_loop_injection_enabled(
+            {}, {"cron": {"inject_to_active_loop": True}}
+        ) is True
+        assert _cron_active_loop_injection_enabled(
+            {"inject_to_active_loop": False},
+            {"cron": {"inject_to_active_loop": True}},
+        ) is False
+        assert _cron_active_loop_injection_enabled(
+            {"inject_to_active_loop": True},
+            {"cron": {"inject_to_active_loop": False}},
+        ) is True
+
+    def test_injection_steers_origin_without_requiring_delivery_target(self):
+        from cron.scheduler import _maybe_inject_cron_delivery
+
+        job = {
+            "id": "j1",
+            "name": "Hourly checkpoint",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "channel-1",
+                "thread_id": "thread-1",
+            },
+        }
+        with patch(
+            "gateway.run.steer_active_agent_for_origin", return_value=True
+        ) as steer:
+            accepted = _maybe_inject_cron_delivery(
+                job, "Plan and acceptance criteria", enabled=True
+            )
+
+        assert accepted is True
+        steer.assert_called_once_with(
+            job["origin"],
+            "[Cron injection: Hourly checkpoint]\nPlan and acceptance criteria",
+        )
+
+    def test_injection_is_best_effort_and_does_not_raise(self):
+        from cron.scheduler import _maybe_inject_cron_delivery
+
+        with patch(
+            "gateway.run.steer_active_agent_for_origin",
+            side_effect=RuntimeError("gateway unavailable"),
+        ):
+            assert _maybe_inject_cron_delivery(
+                {"id": "j1", "origin": {"platform": "discord", "chat_id": "c1"}},
+                "brief",
+                enabled=True,
+            ) is False

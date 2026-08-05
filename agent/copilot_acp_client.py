@@ -1,7 +1,7 @@
-"""OpenAI-compatible shim that forwards Hermes requests to `copilot --acp`.
+"""OpenAI-compatible shim that forwards Hermes requests to subprocess ACP CLIs.
 
-This adapter lets Hermes treat the GitHub Copilot ACP server as a chat-style
-backend. Each request starts a short-lived ACP session, sends the formatted
+This adapter lets Hermes treat subprocess ACP servers as chat-style
+backends. Each request starts a short-lived ACP session, sends the formatted
 conversation as a single prompt, collects text chunks, and converts the result
 back into the minimal shape Hermes expects from an OpenAI client.
 """
@@ -9,13 +9,20 @@ back into the minimal shape Hermes expects from an OpenAI client.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
+import signal
 import shlex
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
+import sys
+import uuid
+from html import unescape
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,8 +34,12 @@ from openai.types.chat.chat_completion_message_tool_call import (
 )
 
 from agent.file_safety import get_read_block_error, get_write_denied_error
+from agent.anthropic_adapter import normalize_model_name
 from agent.redact import redact_sensitive_text
+from acp_adapter.tools import normalize_hermes_tool_name
 from tools.environments.local import hermes_subprocess_env
+
+logger = logging.getLogger(__name__)
 
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
@@ -50,6 +61,15 @@ _DEPRECATION_MARKERS = (
 )
 
 
+class ACPProviderTimeoutError(TimeoutError):
+    """Timeout raised by subprocess ACP providers for one JSON-RPC method."""
+
+    def __init__(self, provider_name: str, method: str) -> None:
+        self.provider_name = provider_name
+        self.method = method
+        super().__init__(f"Timed out waiting for {provider_name} response to {method}.")
+
+
 def _is_gh_copilot_deprecation_message(stderr_text: str) -> bool:
     """True iff stderr looks like the deprecated gh-copilot extension's banner."""
 
@@ -59,15 +79,37 @@ def _is_gh_copilot_deprecation_message(stderr_text: str) -> bool:
     return any(marker in lower for marker in _DEPRECATION_MARKERS)
 
 
-def _resolve_command() -> str:
+def _resolve_command(base_url: str | None = None) -> str:
+    marker = (base_url or "").strip().lower()
+    if marker.startswith("acp://devin"):
+        return (
+            os.getenv("HERMES_DEVIN_ACP_COMMAND", "").strip()
+            or os.getenv("DEVIN_CLI_PATH", "").strip()
+            or "devin"
+        )
+    if marker.startswith("acp://claude"):
+        return (
+            os.getenv("HERMES_CLAUDE_ACP_COMMAND", "").strip()
+            or os.getenv("CLAUDE_AGENT_ACP_PATH", "").strip()
+            or "npx"
+        )
     return (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
         or "copilot"
     )
 
+def _resolve_args(base_url: str | None = None) -> list[str]:
+    marker = (base_url or "").strip().lower()
+    if marker.startswith("acp://devin"):
+        raw = os.getenv("HERMES_DEVIN_ACP_ARGS", "").strip()
+        return shlex.split(raw) if raw else ["acp"]
+    if marker.startswith("acp://claude"):
+        raw = os.getenv("HERMES_CLAUDE_ACP_ARGS", "").strip()
+        if raw:
+            return shlex.split(raw)
+        return ["@agentclientprotocol/claude-agent-acp"]
 
-def _resolve_args() -> list[str]:
     raw = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
     if not raw:
         return ["--acp", "--stdio"]
@@ -111,6 +153,1128 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _load_acp_settings(provider_key: str, legacy_key: str) -> dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    acp_cfg = cfg.get("acp") if isinstance(cfg, dict) else {}
+    provider_cfg = acp_cfg.get(provider_key) if isinstance(acp_cfg, dict) else {}
+    legacy_cfg = cfg.get(legacy_key) if isinstance(cfg, dict) else {}
+    merged: dict[str, Any] = {}
+    if isinstance(legacy_cfg, dict):
+        merged.update(legacy_cfg)
+    if isinstance(provider_cfg, dict):
+        merged.update(provider_cfg)
+    return merged
+
+
+def _load_json_file(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _platform_tool_definitions(platform: str) -> list[dict[str, Any]]:
+    platform = (platform or "").strip()
+    if not platform:
+        return []
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import get_tool_definitions
+
+        cfg = load_config()
+        enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
+        agent_cfg = cfg.get("agent") or {}
+        disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+        return get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+        )
+    except Exception:
+        return []
+
+
+def _hermes_mcp_tool_definitions(platform: str = "discord") -> list[dict[str, Any]]:
+    """Return the Hermes tool schema surface exposed through the injected MCP server.
+
+    ACP providers should see the same Hermes-side tool surface that the
+    target platform would normally expose. Devin's prompt-facing tool names
+    are prefixed so the model asks for the MCP server namespace explicitly;
+    the Hermes MCP shim accepts both raw and prefixed aliases.
+    """
+    try:
+        from model_tools import get_tool_definitions
+    except Exception:
+        return []
+
+    platform_defs = _platform_tool_definitions(platform)
+    tool_defs = {
+        td["function"]["name"]: td["function"]
+        for td in platform_defs
+        if isinstance(td, dict)
+        and td.get("type") == "function"
+        and isinstance(td.get("function"), dict)
+    }
+
+    resolved: list[dict[str, Any]] = []
+    for name in tool_defs:
+        spec = tool_defs.get(name)
+        if not spec:
+            continue
+        tool_name = normalize_hermes_tool_name(str(spec.get("name") or name).strip())
+        if not tool_name:
+            tool_name = name
+        tool_name = f"mcp__hermes__{tool_name}"
+        resolved.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "description": spec.get("description") or f"Hermes MCP tool {name}",
+                    "parameters": spec.get("parameters") or {"type": "object", "properties": {}},
+                },
+            }
+        )
+    return resolved
+
+
+def _build_hermes_mcp_server(*, platform: str, session_prefix: str, cwd: str) -> dict[str, Any]:
+    """Build the injected Hermes MCP server entry for ACP subprocesses."""
+    session_id = f"{session_prefix}-{uuid.uuid4().hex}"
+    repo_root = Path(__file__).resolve().parent.parent
+    server_path = repo_root / "mcp_hermes_tools.py"
+
+    env_names = [
+        "HOME",
+        "HERMES_HOME",
+        "HERMES_REAL_HOME",
+        "PATH",
+        "PYTHONPATH",
+    ]
+    env = [
+        {"name": name, "value": value}
+        for name in env_names
+        if (value := os.environ.get(name))
+    ]
+    env.extend(
+        [
+            {"name": "HERMES_MCP_TOOL_PLATFORM", "value": platform},
+            {"name": "HERMES_MCP_SESSION_ID", "value": session_id},
+            {"name": "HERMES_MCP_TASK_ID", "value": session_id},
+            {"name": "HERMES_MCP_CWD", "value": cwd},
+        ]
+    )
+
+    return {
+        "name": "hermes",
+        "command": sys.executable,
+        "args": [
+            str(server_path),
+            "--platform",
+            platform,
+            "--session-id",
+            session_id,
+            "--task-id",
+            session_id,
+            "--cwd",
+            cwd,
+        ],
+        "env": env,
+    }
+
+
+class ACPProviderAdapter:
+    """Provider-specific behavior for subprocess-backed ACP CLIs."""
+
+    display_name = "ACP"
+    default_model = "acp"
+    marker_prefixes: tuple[str, ...] = ()
+    command_names: tuple[str, ...] = ()
+
+    def matches(self, *, base_url: str, command: str) -> bool:
+        marker = (base_url or "").strip().lower()
+        if any(marker.startswith(prefix) for prefix in self.marker_prefixes):
+            return True
+        command_name = Path(command or "").name.lower()
+        return command_name in self.command_names
+
+    def subprocess_env(
+        self,
+        env: dict[str, str],
+        *,
+        model: str | None,
+    ) -> dict[str, str]:
+        return env
+
+    def subprocess_args(
+        self,
+        args: list[str],
+        *,
+        model: str | None,
+    ) -> tuple[list[str], list[Path]]:
+        return list(args), []
+
+    def subprocess_cwd(self, cwd: str) -> tuple[str, list[Path]]:
+        return cwd, []
+
+    def client_capabilities(self) -> dict[str, Any]:
+        return {
+            "fs": {
+                "readTextFile": True,
+                "writeTextFile": True,
+            }
+        }
+
+    def supports_client_method(self, method: str) -> bool:
+        return True
+
+    def exposes_reasoning(self) -> bool:
+        return True
+
+    def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        return tools
+
+    def initial_session_mode(self) -> str | None:
+        return None
+
+    def format_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+    ) -> str:
+        return _format_messages_as_prompt(
+            messages,
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+
+    def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
+        del model
+        return params
+
+    def missing_command_error(self, command: str) -> str:
+        return (
+            f"Could not start {self.display_name} command '{command}'. "
+            "Install the provider CLI or set the provider-specific command env vars."
+        )
+
+    def early_exit_error(self, stderr_text: str) -> RuntimeError:
+        return RuntimeError(f"{self.display_name} process exited early: {stderr_text}")
+
+    def timeout_error(self, method: str) -> TimeoutError:
+        return ACPProviderTimeoutError(self.display_name, method)
+
+    def method_error(self, method: str, error: Any) -> RuntimeError:
+        message = error.get("message") if isinstance(error, dict) else None
+        return RuntimeError(f"{self.display_name} {method} failed: {message or error}")
+
+
+class CopilotACPProviderAdapter(ACPProviderAdapter):
+    display_name = "Copilot ACP"
+    default_model = "copilot-acp"
+    marker_prefixes = ("acp://copilot",)
+    command_names = ("copilot", "copilot.exe")
+    _DEFAULT_DENIED_TOOLS = [
+        "bash",
+        "create",
+        "edit",
+        "glob",
+        "grep",
+        "list_agents",
+        "list_bash",
+        "read_agent",
+        "read_bash",
+        "session_store_sql",
+        "skill",
+        "sql",
+        "stop_bash",
+        "task",
+        "view",
+        "web_fetch",
+    ]
+
+    def _settings(self) -> dict[str, Any]:
+        return _load_acp_settings("copilot", "copilot_acp")
+
+    def _hermes_tools_only(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_tools_only", settings.get("tools_only", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _use_hermes_mcp_bridge(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_mcp_bridge", settings.get("mcp_bridge", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _tool_platform(self) -> str:
+        settings = self._settings()
+        return str(settings.get("tool_platform") or "discord").strip()
+
+    def _available_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("available_tools")
+        if isinstance(raw, list):
+            tools = [str(item).strip() for item in raw if str(item).strip()]
+            if tools:
+                return tools
+        return []
+
+    def _deny_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("deny_tools")
+        if isinstance(raw, list):
+            return [str(item).strip() for item in raw if str(item).strip()]
+        return list(self._DEFAULT_DENIED_TOOLS)
+
+    def _restricts_native_tools(self) -> bool:
+        return self._hermes_tools_only() and self._use_hermes_mcp_bridge()
+
+    @staticmethod
+    def _has_option(args: list[str], *names: str) -> bool:
+        return any(arg == name or arg.startswith(f"{name}=") for arg in args for name in names)
+
+    def subprocess_args(
+        self,
+        args: list[str],
+        *,
+        model: str | None,
+    ) -> tuple[list[str], list[Path]]:
+        resolved = list(args)
+        model_value = str(model or "").strip()
+        if (
+            model_value
+            and model_value.lower() != self.default_model
+            and not self._has_option(resolved, "--model")
+        ):
+            resolved.append(f"--model={model_value}")
+        if not self._restricts_native_tools():
+            return resolved, []
+
+        # Keep Copilot's GitHub MCP off by default and restrict the model-visible
+        # tool surface to the Hermes MCP namespace. This prevents native Copilot
+        # file/shell tools from satisfying requests outside Hermes' auditable
+        # tool loop.
+        if not self._has_option(resolved, "--disable-builtin-mcps"):
+            resolved.append("--disable-builtin-mcps")
+        if not self._has_option(resolved, "--no-ask-user"):
+            resolved.append("--no-ask-user")
+        if not self._has_option(resolved, "--available-tools"):
+            for tool_name in self._available_tools():
+                resolved.append(f"--available-tools={tool_name}")
+        if not self._has_option(resolved, "--excluded-tools"):
+            for tool_name in self._deny_tools():
+                resolved.append(f"--excluded-tools={tool_name}")
+        return resolved, []
+
+    def client_capabilities(self) -> dict[str, Any]:
+        if self._restricts_native_tools():
+            return {}
+        return super().client_capabilities()
+
+    def supports_client_method(self, method: str) -> bool:
+        if self._restricts_native_tools() and method.startswith("fs/"):
+            return False
+        return True
+
+    def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        if not self._hermes_tools_only():
+            return tools
+        hermes_tools = _hermes_mcp_tool_definitions(self._tool_platform())
+        logger.debug(
+            "Copilot ACP prompt tools: hermes_mcp=%d fallback=%d",
+            len(hermes_tools),
+            len(tools or []),
+        )
+        return hermes_tools or tools
+
+    def format_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+    ) -> str:
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return super().format_prompt(
+                messages,
+                model=model,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+
+        sections: list[str] = [
+            "You are being used as the active Copilot ACP agent backend for Hermes.",
+            "Use the conversation transcript below as the source of truth.",
+            "Hermes tools are exposed through the MCP server named `hermes`.",
+            "When a tool is needed, call the MCP tool named `mcp__hermes__<tool_name>`.",
+            "Do not use Copilot-native file, shell, grep, search, edit, browser, or GitHub tools when a Hermes MCP tool can satisfy the request.",
+            "For Hermes skills, use `mcp__hermes__skill_view` or `mcp__hermes__skills_list`.",
+            "If the user explicitly asks to read files, search files, inspect paths, or uses words like `file`, `files`, `ファイル`, or `ファイル検索`, include `mcp__hermes__search_files` and/or `mcp__hermes__read_file` in the first relevant tool batch.",
+            "For `mcp__hermes__search_files`, use `pattern` as the required search argument, not `query`.",
+            "Do not say you searched or read files unless you actually called a Hermes file tool.",
+            "When you call tools, emit only the tool calls for that assistant turn; do not include a draft answer or a final answer alongside the tool calls.",
+            "After tool results appear in the transcript, answer from those results; do not announce that you will call the same tools again unless you are actually calling them again.",
+            "Do not print XML, JSON function calls, MCP protocol messages, or tool transcripts in the final answer.",
+        ]
+        if model:
+            sections.append(f"Hermes requested model hint: {model}")
+        if tool_choice is not None:
+            sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
+
+        if isinstance(tools, list) and tools:
+            tool_specs: list[dict[str, Any]] = []
+            for t in tools:
+                if not isinstance(t, dict):
+                    continue
+                fn = t.get("function") or {}
+                if not isinstance(fn, dict):
+                    continue
+                name = fn.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                tool_specs.append(
+                    {
+                        "name": name.strip(),
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters", {}),
+                    }
+                )
+            if tool_specs:
+                sections.append(
+                    "Available Hermes MCP tools:\n"
+                    + json.dumps(tool_specs, ensure_ascii=False)
+                )
+
+        transcript: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "unknown").strip().lower()
+            content = _render_message_content(message.get("content"))
+            if not content:
+                continue
+            if role == "tool":
+                tool_name = str(message.get("name") or "tool").strip() or "tool"
+                transcript.append(f"Tool result ({tool_name}):\n{content}")
+            elif role in {"system", "user", "assistant"}:
+                transcript.append(f"{role.title()}:\n{content}")
+            else:
+                transcript.append(f"Context:\n{content}")
+
+        if transcript:
+            sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+        sections.append("Continue from the latest user request. Return only the final answer.")
+        return "\n\n".join(section.strip() for section in sections if section and section.strip())
+
+    def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
+        del model
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return params
+
+        merged = dict(params)
+        existing_raw = merged.get("mcpServers") or []
+        if isinstance(existing_raw, dict):
+            existing = [
+                {"name": str(name), **dict(server)}
+                for name, server in existing_raw.items()
+                if isinstance(server, dict) and str(name).strip()
+            ]
+        elif isinstance(existing_raw, list):
+            existing = [
+                dict(server)
+                for server in existing_raw
+                if isinstance(server, dict)
+            ]
+        else:
+            existing = []
+
+        hermes_server = _build_hermes_mcp_server(
+            platform=self._tool_platform(),
+            session_prefix="copilot-acp",
+            cwd=str(merged.get("cwd") or os.getcwd()),
+        )
+        if not any(
+            isinstance(server, dict) and server.get("name") == "hermes"
+            for server in existing
+        ):
+            existing.append(hermes_server)
+        merged["mcpServers"] = existing
+        logger.debug(
+            "Copilot ACP session new params: platform=%s mcp_servers=%d cwd=%s",
+            self._tool_platform(),
+            len(existing),
+            str(merged.get("cwd") or os.getcwd()),
+        )
+        return merged
+
+    def missing_command_error(self, command: str) -> str:
+        return (
+            f"Could not start Copilot ACP command '{command}'. "
+            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+        )
+
+    def early_exit_error(self, stderr_text: str) -> RuntimeError:
+        if _is_gh_copilot_deprecation_message(stderr_text):
+            return RuntimeError(
+                "Hermes ACP mode requires the NEW GitHub Copilot CLI "
+                "(github.com/github/copilot-cli), but the binary it just "
+                "spawned is the deprecated `gh copilot` extension.\n\n"
+                "Install the new CLI:\n"
+                "  npm install -g @github/copilot\n"
+                "  # then verify with: copilot --help\n\n"
+                "If `copilot` already resolves to the new CLI but you still see this,\n"
+                "point Hermes at it explicitly:\n"
+                "  export HERMES_COPILOT_ACP_COMMAND=/path/to/new/copilot\n\n"
+                "Alternative: use the `copilot` provider (no ACP, hits the Copilot API\n"
+                "directly with a Copilot subscription token) via `hermes setup`.\n\n"
+                f"Original error:\n{stderr_text}"
+            )
+        return super().early_exit_error(stderr_text)
+
+
+class DevinACPProviderAdapter(ACPProviderAdapter):
+    display_name = "Devin ACP"
+    default_model = "swe-1.6"
+    marker_prefixes = ("acp://devin",)
+    command_names = ("devin", "devin.exe")
+    _DEFAULT_DENIED_TOOLS = [
+        "read",
+        "edit",
+        "grep",
+        "glob",
+        "exec",
+        "fetch",
+        "skill",
+        "mcp_list_tools",
+        "mcp_list_servers",
+        "mcp_list_resources",
+        "mcp_list_prompts",
+    ]
+
+    def _settings(self) -> dict[str, Any]:
+        return _load_acp_settings("devin", "devin_acp")
+
+    def _hermes_tools_only(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_tools_only", settings.get("tools_only", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _agent_config_path(self) -> str:
+        settings = self._settings()
+        return str(settings.get("agent_config") or settings.get("agent_config_path") or "").strip()
+
+    def _allowed_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("allowed_tools")
+        if isinstance(raw, list):
+            tools = [str(item).strip() for item in raw if str(item).strip()]
+            if tools:
+                return tools
+        return ["mcp__hermes__*"]
+
+    def _deny_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("deny_tools")
+        if isinstance(raw, list):
+            return [str(item).strip() for item in raw if str(item).strip()]
+        if self._use_hermes_mcp_bridge():
+            return list(self._DEFAULT_DENIED_TOOLS)
+        # Without the Hermes MCP bridge, default-denying every native Devin tool
+        # would leave the ACP session with no usable tools.
+        return []
+
+    def _tool_platform(self) -> str:
+        settings = self._settings()
+        return str(settings.get("tool_platform") or "discord").strip()
+
+    def _use_hermes_mcp_bridge(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_mcp_bridge", settings.get("mcp_bridge", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _restricts_native_tools(self) -> bool:
+        if not self._hermes_tools_only():
+            return False
+        if self._use_hermes_mcp_bridge():
+            return True
+        if self._agent_config_path():
+            return True
+        allowed_tools = self._allowed_tools()
+        deny_tools = self._deny_tools()
+        return bool(deny_tools) or allowed_tools != ["mcp__hermes__*"]
+
+    def _reasoning_effort(self) -> str:
+        settings = self._settings()
+        return str(settings.get("reasoning_effort") or settings.get("thinking_level") or "").strip()
+
+    def subprocess_env(
+        self,
+        env: dict[str, str],
+        *,
+        model: str | None,
+    ) -> dict[str, str]:
+        model_value = (model or self.default_model).strip()
+        if model_value and model_value.lower() not in {"devin", "devin-acp"}:
+            env["DEVIN_MODEL"] = model_value
+        reasoning_effort = self._reasoning_effort()
+        if reasoning_effort:
+            env["DEVIN_REASONING_EFFORT"] = reasoning_effort
+        return env
+
+    def subprocess_args(
+        self,
+        args: list[str],
+        *,
+        model: str | None,
+    ) -> tuple[list[str], list[Path]]:
+        del model
+        resolved = list(args)
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return resolved, []
+        if "--config" in resolved:
+            return resolved, []
+        if "--permission-mode" in resolved:
+            permission_mode_args: list[str] = []
+        elif self._restricts_native_tools():
+            # Let the generated allow/deny config do the gating. Bypass/dangerous
+            # mode can auto-run native Devin tools that the Hermes MCP bridge is
+            # trying to keep off the surface.
+            permission_mode_args = []
+        else:
+            permission_mode_args = ["--permission-mode", "dangerous"]
+
+        cleanup_paths: list[Path] = []
+        devin_config_path, config_cleanup = _build_devin_config_path(
+            cwd=getattr(self, "_acp_cwd", os.getcwd()),
+            session_prefix="devin-acp",
+        )
+        cleanup_paths.extend(config_cleanup)
+
+        if "--agent-config" in resolved:
+            return ["--config", str(devin_config_path), *resolved], cleanup_paths
+
+        configured = self._agent_config_path()
+        if configured:
+            return ["--config", str(devin_config_path), "--agent-config", configured, *permission_mode_args, *resolved], cleanup_paths
+        if not self._restricts_native_tools():
+            return ["--config", str(devin_config_path), *permission_mode_args, *resolved], cleanup_paths
+        deny_tools = self._deny_tools()
+        cfg = {
+            "permissions": {
+                "allow": ["mcp__hermes__*"],
+            },
+        }
+        if deny_tools:
+            cfg["permissions"]["deny"] = deny_tools
+
+        tmp = tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            prefix="hermes-devin-acp-",
+            suffix=".json",
+            delete=False,
+        )
+        with tmp:
+            tmp.write(json.dumps(cfg, ensure_ascii=False, indent=2))
+            tmp.write("\n")
+        path = Path(tmp.name)
+        cleanup_paths.append(path)
+        return ["--config", str(devin_config_path), "--agent-config", str(path), *permission_mode_args, *resolved], cleanup_paths
+
+    def subprocess_cwd(self, cwd: str) -> tuple[str, list[Path]]:
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return cwd, []
+
+        process_cwd = Path(tempfile.mkdtemp(prefix="hermes-devin-project-"))
+        devin_dir = process_cwd / ".devin"
+        devin_dir.mkdir(parents=True, exist_ok=True)
+        hermes_server = _build_hermes_mcp_server(
+            platform=self._tool_platform(),
+            session_prefix="devin-acp",
+            cwd=cwd,
+        )
+        server_config = {
+            key: value
+            for key, value in hermes_server.items()
+            if key != "name"
+        }
+        env_items = server_config.get("env")
+        if isinstance(env_items, list):
+            server_config["env"] = {
+                str(item.get("name")): item.get("value")
+                for item in env_items
+                if isinstance(item, dict)
+                and str(item.get("name") or "").strip()
+            }
+        server_config["transport"] = "stdio"
+        (devin_dir / "config.local.json").write_text(
+            json.dumps({"mcpServers": {"hermes": server_config}}, ensure_ascii=False, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        return str(process_cwd), [process_cwd]
+
+    def client_capabilities(self) -> dict[str, Any]:
+        if self._restricts_native_tools():
+            return {}
+        return super().client_capabilities()
+
+    def supports_client_method(self, method: str) -> bool:
+        if self._restricts_native_tools() and method.startswith("fs/"):
+            return False
+        return True
+
+    def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        if not self._hermes_tools_only():
+            return tools
+        hermes_tools = _hermes_mcp_tool_definitions(self._tool_platform())
+        resolved_tools = hermes_tools or tools
+        logger.debug(
+            "Devin ACP prompt tools: hermes_mcp=%d fallback=%d",
+            len(hermes_tools),
+            len(tools or []),
+        )
+        if not resolved_tools:
+            logger.warning(
+                "Devin ACP hermes MCP tool surface is empty; falling back to the provided tool list"
+            )
+        return resolved_tools
+
+    def initial_session_mode(self) -> str | None:
+        if self._hermes_tools_only() and self._use_hermes_mcp_bridge():
+            return "bypass"
+        return None
+
+    def exposes_reasoning(self) -> bool:
+        return False
+
+    def format_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+    ) -> str:
+        structured_messages: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "unknown").strip().lower()
+            entry: dict[str, Any] = {
+                "role": role,
+                "content": _render_message_content(message.get("content")),
+            }
+            if role == "tool":
+                tool_call_id = message.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id.strip():
+                    entry["tool_call_id"] = tool_call_id.strip()
+                tool_name = message.get("name")
+                if isinstance(tool_name, str) and tool_name.strip():
+                    entry["name"] = tool_name.strip()
+            structured_messages.append(entry)
+
+        payload: dict[str, Any] = {
+            "type": "hermes-conversation",
+            "model_hint": model,
+            "tool_choice": tool_choice,
+            "messages": structured_messages,
+        }
+        if isinstance(tools, list) and tools:
+            payload["tools"] = tools
+
+        return "\n".join(
+            [
+                "You are being used as the active ACP agent backend for Hermes.",
+                "Use the structured JSON conversation payload below as the source of truth.",
+                "The tools listed in the payload are Hermes MCP tools exposed by the MCP server named `hermes`.",
+                "When you need one of those tools, call the MCP tool `mcp__hermes__<tool_name>`.",
+                "Do not use Devin-native tools such as skill, read, grep, glob, find_file_by_name, or exec when a Hermes MCP tool can satisfy the request.",
+                "For Hermes skills, use mcp__hermes__skill_view or mcp__hermes__skills_list; do not use Devin's native skill tool.",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                "Continue from the latest user request.",
+                "Return only the final answer. Start directly with the answer.",
+                "Do not narrate tool use, planning, reasoning, or intermediate checks.",
+                "Do not echo tool transcripts verbatim.",
+            ]
+        )
+
+    def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
+        del model
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return params
+
+        merged = dict(params)
+        cwd = str(merged.get("cwd") or os.getcwd())
+        session_id = f"devin-acp-{uuid.uuid4().hex}"
+        repo_root = Path(__file__).resolve().parent.parent
+        server_path = repo_root / "mcp_hermes_tools.py"
+
+        env_names = [
+            "HOME",
+            "HERMES_HOME",
+            "HERMES_REAL_HOME",
+            "PATH",
+            "PYTHONPATH",
+        ]
+        env = [
+            {"name": name, "value": value}
+            for name in env_names
+            if (value := os.environ.get(name))
+        ]
+        env.extend(
+            [
+                {"name": "HERMES_MCP_TOOL_PLATFORM", "value": self._tool_platform()},
+                {"name": "HERMES_MCP_SESSION_ID", "value": session_id},
+                {"name": "HERMES_MCP_TASK_ID", "value": session_id},
+                {"name": "HERMES_MCP_CWD", "value": cwd},
+            ]
+        )
+
+        hermes_server = {
+            "name": "hermes",
+            "command": sys.executable,
+            "args": [
+                str(server_path),
+                "--platform",
+                self._tool_platform(),
+                "--session-id",
+                session_id,
+                "--task-id",
+                session_id,
+                "--cwd",
+                cwd,
+            ],
+            "env": env,
+        }
+        existing_raw = merged.get("mcpServers") or []
+        if isinstance(existing_raw, dict):
+            existing = [
+                dict(server)
+                for server in existing_raw.values()
+                if isinstance(server, dict)
+            ]
+        elif isinstance(existing_raw, list):
+            existing = [
+                dict(server)
+                for server in existing_raw
+                if isinstance(server, dict)
+            ]
+        else:
+            existing = []
+        if not any(isinstance(server, dict) and server.get("name") == "hermes" for server in existing):
+            existing.append(hermes_server)
+        merged["mcpServers"] = existing
+        logger.debug(
+            "Devin ACP session new params: platform=%s mcp_servers=%d cwd=%s",
+            self._tool_platform(),
+            len(existing),
+            cwd,
+        )
+        return merged
+
+    def missing_command_error(self, command: str) -> str:
+        return (
+            f"Could not start Devin ACP command '{command}'. "
+            "Install Devin CLI or set HERMES_DEVIN_ACP_COMMAND/DEVIN_CLI_PATH."
+        )
+
+
+class ClaudeACPProviderAdapter(ACPProviderAdapter):
+    display_name = "Claude ACP"
+    default_model = "claude-acp"
+    marker_prefixes = ("acp://claude",)
+    command_names = ("claude-agent-acp", "claude-agent-acp.exe", "npx", "npx.cmd")
+
+    _DISALLOWED_BUILTIN_TOOLS = [
+        "Agent",
+        "Bash",
+        "BashOutput",
+        "Edit",
+        "Glob",
+        "Grep",
+        "KillBash",
+        "LS",
+        "MultiEdit",
+        "NotebookEdit",
+        "Read",
+        "Task",
+        "TodoWrite",
+        "WebFetch",
+        "WebSearch",
+        "Write",
+    ]
+
+    def _settings(self) -> dict[str, Any]:
+        return _load_acp_settings("claude", "claude_acp")
+
+    def _agent_config_path(self) -> str:
+        settings = self._settings()
+        return str(settings.get("agent_config") or settings.get("agent_config_path") or "").strip()
+
+    def _allowed_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("allowed_tools")
+        if isinstance(raw, list):
+            tools = [str(item).strip() for item in raw if str(item).strip()]
+            if tools:
+                return tools
+        return ["mcp__hermes__*"]
+
+    def _deny_tools(self) -> list[str]:
+        settings = self._settings()
+        raw = settings.get("deny_tools")
+        if isinstance(raw, list):
+            return [str(item).strip() for item in raw if str(item).strip()]
+        if self._use_hermes_mcp_bridge():
+            return ["*"]
+        return []
+
+    def _use_hermes_mcp_bridge(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_mcp_bridge", settings.get("mcp_bridge", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _restricts_native_tools(self) -> bool:
+        if not self._hermes_tools_only():
+            return False
+        if self._use_hermes_mcp_bridge():
+            return True
+        if self._agent_config_path():
+            return True
+        allowed_tools = self._allowed_tools()
+        deny_tools = self._deny_tools()
+        return bool(deny_tools) or allowed_tools != ["mcp__hermes__*"]
+
+    def _hermes_tools_only(self) -> bool:
+        settings = self._settings()
+        raw = settings.get("hermes_tools_only", settings.get("tools_only", True))
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _tool_platform(self) -> str:
+        settings = self._settings()
+        return str(settings.get("tool_platform") or "discord").strip()
+
+    def _normalize_model_for_cli(self, model: str | None) -> str:
+        model_value = (model or "").strip()
+        if not model_value or model_value.lower() in {"claude", "claude-acp"}:
+            return model_value
+        return normalize_model_name(model_value)
+
+    def subprocess_env(
+        self,
+        env: dict[str, str],
+        *,
+        model: str | None,
+    ) -> dict[str, str]:
+        model_value = self._normalize_model_for_cli(model)
+        if model_value and model_value.lower() not in {"claude", "claude-acp"}:
+            env["ANTHROPIC_MODEL"] = model_value
+        return env
+
+    def client_capabilities(self) -> dict[str, Any]:
+        if self._restricts_native_tools():
+            return {}
+        return super().client_capabilities()
+
+    def supports_client_method(self, method: str) -> bool:
+        if self._restricts_native_tools() and method.startswith("fs/"):
+            return False
+        return True
+
+    def prompt_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        if not self._hermes_tools_only():
+            return tools
+        logger.debug(
+            "Claude ACP prompt tools: using native MCP surface, suppressing prompt schemas (fallback=%d)",
+            len(tools or []),
+        )
+        return None
+
+    def initial_session_mode(self) -> str | None:
+        if self._hermes_tools_only() and self._use_hermes_mcp_bridge():
+            return "bypass"
+        return None
+
+    def format_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+    ) -> str:
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return super().format_prompt(
+                messages,
+                model=model,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+
+        sections: list[str] = [
+            "You are being used as the active Claude ACP agent backend for Hermes.",
+            "Use the conversation transcript below as the source of truth.",
+            "Hermes tools are exposed natively through the MCP server named `hermes`.",
+            "When a tool is needed, call the native MCP tool named `mcp__hermes__<tool_name>`.",
+            "For documentation lookup tasks, do not ask for clarification first; start with one or two focused Hermes tools such as `mcp__hermes__session_search` or `mcp__hermes__skill_view`.",
+            "Avoid broad filesystem searches unless the focused Hermes tools fail to find relevant context.",
+            "If the user explicitly asks to read files, search files, inspect paths, or uses words like `file`, `files`, `ファイル`, or `ファイル検索`, include `mcp__hermes__search_files` and/or `mcp__hermes__read_file` in the first relevant tool batch.",
+            "For `mcp__hermes__search_files`, use `pattern` as the required search argument, not `query`.",
+            "Do not say you searched or read files unless you actually called a file tool.",
+            "When you call tools, emit only the tool calls for that assistant turn; do not include a draft answer or a final answer alongside the tool calls.",
+            "After tool results appear in the transcript, answer from those results; do not announce that you will call the same tools again unless you are actually calling them again.",
+            "Do not print XML, JSON function calls, MCP protocol messages, or tool transcripts in the final answer.",
+        ]
+        if model:
+            sections.append(f"Hermes requested model hint: {model}")
+        if tool_choice is not None:
+            sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
+
+        transcript: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "unknown").strip().lower()
+            content = _render_message_content(message.get("content"))
+            if not content:
+                continue
+            if role == "tool":
+                tool_name = str(message.get("name") or "tool").strip() or "tool"
+                transcript.append(f"Tool result ({tool_name}):\n{content}")
+            elif role in {"system", "user", "assistant"}:
+                transcript.append(f"{role.title()}:\n{content}")
+            else:
+                transcript.append(f"Context:\n{content}")
+
+        if transcript:
+            sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+        sections.append("Continue from the latest user request. Return only the final answer.")
+        return "\n\n".join(section.strip() for section in sections if section and section.strip())
+
+    def session_new_params(self, params: dict[str, Any], *, model: str | None) -> dict[str, Any]:
+        if not self._hermes_tools_only() or not self._use_hermes_mcp_bridge():
+            return params
+
+        model_value = self._normalize_model_for_cli(model)
+        options: dict[str, Any] = {
+            "tools": [],
+            "allowedTools": self._allowed_tools(),
+            "disallowedTools": list(self._DISALLOWED_BUILTIN_TOOLS),
+        }
+        if model_value and model_value.lower() not in {"claude", "claude-acp"}:
+            options["env"] = {"ANTHROPIC_MODEL": model_value}
+            options["settings"] = {"availableModels": [model_value]}
+
+        merged = dict(params)
+        meta = dict(merged.get("_meta") or {})
+        claude_code = dict(meta.get("claudeCode") or {})
+        existing_options = dict(claude_code.get("options") or {})
+        existing_raw = merged.get("mcpServers") or []
+        if isinstance(existing_raw, dict):
+            existing_servers = [
+                {"name": str(name), **dict(server)}
+                for name, server in existing_raw.items()
+                if isinstance(server, dict) and str(name).strip()
+            ]
+        elif isinstance(existing_raw, list):
+            existing_servers = [
+                dict(server)
+                for server in existing_raw
+                if isinstance(server, dict)
+            ]
+        else:
+            existing_servers = []
+
+        hermes_server = _build_hermes_mcp_server(
+            platform=self._tool_platform(),
+            session_prefix="claude-acp",
+            cwd=str(merged.get("cwd") or os.getcwd()),
+        )
+        if not any(
+            isinstance(server, dict) and server.get("name") == "hermes"
+            for server in existing_servers
+        ):
+            existing_servers.append(hermes_server)
+        merged["mcpServers"] = existing_servers
+
+        merged_options = dict(existing_options)
+        merged_options.update(options)
+        claude_code["options"] = merged_options
+        meta["claudeCode"] = claude_code
+        merged["_meta"] = meta
+        logger.debug(
+            "Claude ACP session new params: platform=%s mcp_servers=%d cwd=%s",
+            self._tool_platform(),
+            len(existing_servers),
+            str(merged.get("cwd") or os.getcwd()),
+        )
+        return merged
+
+    def missing_command_error(self, command: str) -> str:
+        return (
+            f"Could not start Claude ACP command '{command}'. "
+            "Install with `npm install -g @agentclientprotocol/claude-agent-acp`, "
+            "or set HERMES_CLAUDE_ACP_COMMAND/HERMES_CLAUDE_ACP_ARGS."
+        )
+
+
+_ACP_PROVIDER_ADAPTERS: tuple[ACPProviderAdapter, ...] = (
+    ClaudeACPProviderAdapter(),
+    DevinACPProviderAdapter(),
+    CopilotACPProviderAdapter(),
+)
+
+
+def _resolve_acp_provider_adapter(*, base_url: str, command: str) -> ACPProviderAdapter:
+    for adapter in _ACP_PROVIDER_ADAPTERS:
+        if adapter.matches(base_url=base_url, command=command):
+            return adapter
+    return CopilotACPProviderAdapter()
+
+
 def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -120,6 +1284,68 @@ def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
             "message": message,
         },
     }
+
+
+def _build_devin_config_path(*, cwd: str, session_prefix: str) -> tuple[Path, list[Path]]:
+    """Create a temporary Devin config that injects the Hermes MCP server."""
+    base_config = _load_json_file(Path.home() / ".config" / "devin" / "config.json")
+    merged = dict(base_config)
+    existing = merged.get("mcpServers")
+    if isinstance(existing, dict):
+        servers = {name: dict(cfg) for name, cfg in existing.items() if isinstance(cfg, dict)}
+    elif isinstance(existing, list):
+        servers = {
+            str(cfg.get("name")): dict(cfg)
+            for cfg in existing
+            if isinstance(cfg, dict) and str(cfg.get("name") or "").strip()
+        }
+    else:
+        servers = {}
+
+    hermes_server = _build_hermes_mcp_server(
+        platform="discord",
+        session_prefix=session_prefix,
+        cwd=cwd,
+    )
+    hermes_server_config = {
+        key: value
+        for key, value in hermes_server.items()
+        if key != "name"
+    }
+    hermes_server_config["transport"] = "stdio"
+    env_items = hermes_server_config.get("env")
+    if isinstance(env_items, list):
+        hermes_server_config["env"] = {
+            str(item.get("name")): item.get("value")
+            for item in env_items
+            if isinstance(item, dict)
+            and str(item.get("name") or "").strip()
+        }
+    servers.setdefault("hermes", hermes_server_config)
+    merged["mcpServers"] = servers
+    permissions = dict(merged.get("permissions") or {})
+    allow = list(permissions.get("allow") or [])
+    deny = list(permissions.get("deny") or [])
+    if "mcp__hermes__*" not in allow:
+        allow.append("mcp__hermes__*")
+    for tool_name in DevinACPProviderAdapter._DEFAULT_DENIED_TOOLS:
+        if tool_name not in deny:
+            deny.append(tool_name)
+    permissions["allow"] = allow
+    permissions["deny"] = deny
+    merged["permissions"] = permissions
+
+    tmp = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        prefix="hermes-devin-config-",
+        suffix=".json",
+        delete=False,
+    )
+    with tmp:
+        json.dump(merged, tmp, ensure_ascii=False, indent=2)
+        tmp.write("\n")
+    return Path(tmp.name), [Path(tmp.name)]
 
 
 def _permission_denied(message_id: Any) -> dict[str, Any]:
@@ -145,6 +1371,8 @@ def _format_messages_as_prompt(
         "Use ACP capabilities to complete tasks.",
         "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
         "If no tool is needed, answer normally.",
+        "After tool results are present in the transcript, answer from those results. Do not return planning text such as 'I will search/read/fetch now' as the final answer.",
+        "If you still need another tool after seeing tool results, emit the tool call only; do not mix the tool call with a draft or final answer.",
     ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")
@@ -209,6 +1437,28 @@ def _format_messages_as_prompt(
     return "\n\n".join(section.strip() for section in sections if section and section.strip())
 
 
+def _strip_devin_artifacts(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+    cleaned = re.sub(r"\s*<ref_[^>]+/>\s*", " ", text)
+    cleaned = re.sub(r"\s*<ref_[^>]+>.*?</ref_[^>]+>\s*", " ", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(
+        r"^\s*(?:Info:\s*Disabled tools:\s*.*?web_fetch\s*)+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^\s*(?:Info:\s*Unknown tool name in the tool allowlist:\s*\"[^\"]+\"\s*)+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _render_message_content(content: Any) -> str:
     if content is None:
         return ""
@@ -219,6 +1469,10 @@ def _render_message_content(content: Any) -> str:
             return str(content.get("text") or "").strip()
         if "content" in content and isinstance(content.get("content"), str):
             return str(content.get("content") or "").strip()
+        if "content" in content:
+            nested = _render_message_content(content.get("content"))
+            if nested:
+                return nested
         return json.dumps(content, ensure_ascii=True)
     if isinstance(content, list):
         parts: list[str] = []
@@ -229,6 +1483,10 @@ def _render_message_content(content: Any) -> str:
                 text = item.get("text")
                 if isinstance(text, str) and text.strip():
                     parts.append(text.strip())
+                elif "content" in item:
+                    nested = _render_message_content(item.get("content"))
+                    if nested:
+                        parts.append(nested)
         return "\n".join(parts).strip()
     return str(content).strip()
 
@@ -325,10 +1583,64 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
         extracted.append(
             _build_openai_tool_call(
                 call_id=call_id,
-                name=fn_name.strip(),
+                name=normalize_hermes_tool_name(fn_name),
                 arguments=fn_args,
             )
         )
+
+    def _try_add_invoke(name: str, raw_args: str = "") -> None:
+        if not isinstance(name, str) or not name.strip():
+            return
+        normalized_name = normalize_hermes_tool_name(name)
+        args_text = raw_args.strip()
+        if not args_text:
+            fn_args = "{}"
+        else:
+            parameter_args = _extract_invoke_parameter_arguments(args_text)
+            if parameter_args is not None:
+                fn_args = json.dumps(
+                    _normalize_extracted_tool_arguments(normalized_name, parameter_args),
+                    ensure_ascii=False,
+                )
+            else:
+                try:
+                    parsed_args = json.loads(args_text)
+                    fn_args = json.dumps(
+                        _normalize_extracted_tool_arguments(normalized_name, parsed_args),
+                        ensure_ascii=False,
+                    )
+                except Exception:
+                    fn_args = json.dumps({"text": args_text}, ensure_ascii=False)
+        call_id = f"acp_call_{len(extracted)+1}"
+        extracted.append(
+            SimpleNamespace(
+                id=call_id,
+                call_id=call_id,
+                response_item_id=None,
+                type="function",
+                function=SimpleNamespace(name=normalized_name, arguments=fn_args),
+            )
+        )
+
+    def _try_add_function_call_item(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            raw_args = fn.get("arguments", "{}")
+        else:
+            name = item.get("tool_name") or item.get("name")
+            raw_args = item.get("parameters", item.get("arguments", {}))
+        if not isinstance(name, str) or not name.strip():
+            return False
+        if isinstance(raw_args, str):
+            args_text = raw_args
+        else:
+            args_text = json.dumps(raw_args, ensure_ascii=False)
+        before = len(extracted)
+        _try_add_invoke(name, args_text)
+        return len(extracted) > before
 
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
         raw = m.group(1)
@@ -341,6 +1653,73 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
             raw = m.group(0)
             _try_add_tool_call(raw)
             consumed_spans.append((m.start(), m.end()))
+
+    function_calls_pattern = re.compile(
+        r"<function_calls\b[^>]*>(.*?)</function_calls>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    invoke_pattern = re.compile(
+        r"<invoke\b([^>]*)>(.*?)</invoke>|<invoke\b([^>]*)/>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    direct_mcp_pattern = re.compile(
+        r"<(?P<name>mcp__hermes__[A-Za-z0-9_]+)\b(?P<attrs>[^>]*)>"
+        r"(?P<body>.*?)</(?P=name)>"
+        r"|<(?P<self_name>mcp__hermes__[A-Za-z0-9_]+)\b(?P<self_attrs>[^>]*)/>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    bracket_call_pattern = re.compile(
+        r"\b(?P<name>mcp__hermes__[A-Za-z0-9_]+)\s*\((?P<args>[^()]*)\)",
+        re.DOTALL | re.IGNORECASE,
+    )
+    for m in function_calls_pattern.finditer(text):
+        block = m.group(1) or ""
+        matched_invoke = False
+        for invoke in invoke_pattern.finditer(block):
+            attrs = invoke.group(1) or invoke.group(3) or ""
+            body = invoke.group(2) or ""
+            name_match = re.search(
+                r'name\s*=\s*["\']([^"\']+)["\']',
+                attrs,
+                flags=re.IGNORECASE,
+            )
+            if not name_match:
+                continue
+            _try_add_invoke(name_match.group(1), body)
+            matched_invoke = True
+        if not matched_invoke:
+            try:
+                parsed_block = json.loads(block.strip())
+            except Exception:
+                parsed_block = None
+            items = parsed_block if isinstance(parsed_block, list) else [parsed_block]
+            for item in items:
+                if _try_add_function_call_item(item):
+                    matched_invoke = True
+        if not matched_invoke:
+            for call in bracket_call_pattern.finditer(block):
+                args = _extract_call_expression_arguments(call.group("args") or "")
+                _try_add_invoke(
+                    call.group("name") or "",
+                    json.dumps(args, ensure_ascii=False) if args else "{}",
+                )
+                matched_invoke = True
+        if matched_invoke:
+            consumed_spans.append((m.start(), m.end()))
+
+    for m in direct_mcp_pattern.finditer(text):
+        name = m.group("name") or m.group("self_name") or ""
+        attrs = m.group("attrs") or m.group("self_attrs") or ""
+        body = m.group("body") or ""
+        attr_args = _extract_xml_attribute_arguments(attrs)
+        param_args = _extract_invoke_parameter_arguments(body)
+        args: dict[str, str] = {}
+        if attr_args:
+            args.update(attr_args)
+        if param_args:
+            args.update(param_args)
+        _try_add_invoke(name, json.dumps(args, ensure_ascii=False) if args else body)
+        consumed_spans.append((m.start(), m.end()))
 
     if not consumed_spans:
         return extracted, text.strip()
@@ -364,6 +1743,89 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
 
     cleaned = "\n".join(p.strip() for p in parts if p and p.strip()).strip()
     return extracted, cleaned
+
+
+def _extract_invoke_parameter_arguments(raw_args: str) -> dict[str, str] | None:
+    """Parse Claude-style invoke parameter XML into OpenAI JSON arguments."""
+    if not isinstance(raw_args, str) or "<parameter" not in raw_args.lower():
+        return None
+
+    params: dict[str, str] = {}
+    parameter_re = re.compile(
+        r"<parameter\b([^>]*)>(.*?)</parameter>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    for match in parameter_re.finditer(raw_args):
+        attrs = match.group(1) or ""
+        name_match = re.search(
+            r'name\s*=\s*["\']([^"\']+)["\']',
+            attrs,
+            flags=re.IGNORECASE,
+        )
+        if not name_match:
+            continue
+        name = unescape(name_match.group(1)).strip()
+        if not name:
+            continue
+        params[name] = unescape(match.group(2) or "").strip()
+
+    return params or None
+
+
+def _extract_xml_attribute_arguments(raw_attrs: str) -> dict[str, str] | None:
+    """Parse simple XML-style tool attributes into JSON arguments."""
+    if not isinstance(raw_attrs, str) or not raw_attrs.strip():
+        return None
+
+    args: dict[str, str] = {}
+    attr_re = re.compile(
+        r"([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*([\"'])(.*?)\2",
+        re.DOTALL,
+    )
+    for match in attr_re.finditer(raw_attrs):
+        name = unescape(match.group(1)).strip()
+        if not name:
+            continue
+        args[name] = unescape(match.group(3) or "").strip()
+
+    return args or None
+
+
+def _extract_call_expression_arguments(raw_args: str) -> dict[str, Any] | None:
+    """Parse simple Claude-style `tool(key="value")` argument lists."""
+    if not isinstance(raw_args, str) or not raw_args.strip():
+        return None
+
+    args: dict[str, Any] = {}
+    arg_re = re.compile(
+        r"([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*"
+        r"(?:(['\"])(.*?)\2|([^,\s]+))",
+        re.DOTALL,
+    )
+    for match in arg_re.finditer(raw_args):
+        name = match.group(1).strip()
+        if not name:
+            continue
+        if match.group(2):
+            value: Any = unescape(match.group(3) or "").strip()
+        else:
+            raw_value = (match.group(4) or "").strip()
+            try:
+                value = json.loads(raw_value)
+            except Exception:
+                value = raw_value
+        args[name] = value
+
+    return args or None
+
+
+def _normalize_extracted_tool_arguments(tool_name: str, args: Any) -> Any:
+    if tool_name != "search_files" or not isinstance(args, dict):
+        return args
+    if "pattern" not in args and isinstance(args.get("query"), str):
+        args = dict(args)
+        args["pattern"] = args["query"]
+    return args
 
 
 
@@ -394,7 +1856,7 @@ class _ACPChatNamespace:
 
 
 class CopilotACPClient:
-    """Minimal OpenAI-client-compatible facade for Copilot ACP."""
+    """Minimal OpenAI-client-compatible facade for subprocess ACP providers."""
 
     def __init__(
         self,
@@ -407,18 +1869,40 @@ class CopilotACPClient:
         acp_cwd: str | None = None,
         command: str | None = None,
         args: list[str] | None = None,
+        tool_progress_callback: Any = None,
+        activity_callback: Any = None,
         **_: Any,
     ):
         self.api_key = api_key or "copilot-acp"
         self.base_url = base_url or ACP_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
-        self._acp_command = acp_command or command or _resolve_command()
-        self._acp_args = list(acp_args or args or _resolve_args())
+        self._acp_command = acp_command or command or _resolve_command(base_url)
+        self._acp_args = list(acp_args or args or _resolve_args(base_url))
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self._provider_adapter = _resolve_acp_provider_adapter(
+            base_url=self.base_url,
+            command=self._acp_command,
+        )
+        setattr(self._provider_adapter, "_acp_cwd", self._acp_cwd)
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self._tool_progress_callback = tool_progress_callback
+        self._activity_callback = activity_callback
+        self._last_acp_session_updates: list[dict[str, Any]] = []
+        self._last_acp_tool_trace: list[dict[str, Any]] = []
+        self._last_acp_reasoning_trace: list[str] = []
+        self._completed_acp_tool_call_ids: set[str] = set()
+
+    def _record_provider_activity(self, desc: str) -> None:
+        callback = self._activity_callback
+        if callback is None:
+            return
+        try:
+            callback(desc)
+        except Exception:
+            logger.debug("ACP activity_callback failed", exc_info=True)
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -428,12 +1912,24 @@ class CopilotACPClient:
         self.is_closed = True
         if proc is None:
             return
+        pgid: int | None = None
+        if os.name != "nt":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:
+                pgid = None
         try:
-            proc.terminate()
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok
+            else:
+                proc.terminate()
             proc.wait(timeout=2)
         except Exception:
             try:
-                proc.kill()
+                if pgid is not None:
+                    os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))  # windows-footgun: ok
+                else:
+                    proc.kill()
             except Exception:
                 pass
 
@@ -448,10 +1944,11 @@ class CopilotACPClient:
         stream: bool = False,
         **_: Any,
     ) -> Any:
-        prompt_text = _format_messages_as_prompt(
+        effective_tools = self._provider_adapter.prompt_tools(tools)
+        prompt_text = self._provider_adapter.format_prompt(
             messages or [],
             model=model,
-            tools=tools,
+            tools=effective_tools,
             tool_choice=tool_choice,
         )
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
@@ -472,10 +1969,15 @@ class CopilotACPClient:
 
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
+            model=model,
             timeout_seconds=_effective_timeout,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        if not tool_calls and reasoning_text:
+            tool_calls, cleaned_reasoning = _extract_tool_calls_from_text(reasoning_text)
+            if tool_calls:
+                reasoning_text = cleaned_reasoning
 
         usage = SimpleNamespace(
             prompt_tokens=0,
@@ -483,50 +1985,99 @@ class CopilotACPClient:
             total_tokens=0,
             prompt_tokens_details=SimpleNamespace(cached_tokens=0),
         )
+        if self._provider_adapter.exposes_reasoning():
+            exposed_reasoning = reasoning_text or None
+        else:
+            exposed_reasoning = None
         assistant_message = SimpleNamespace(
-            content=cleaned_text,
+            content=_strip_devin_artifacts(cleaned_text),
             tool_calls=tool_calls,
-            reasoning=reasoning_text or None,
-            reasoning_content=reasoning_text or None,
+            reasoning=exposed_reasoning,
+            reasoning_content=exposed_reasoning,
             reasoning_details=None,
+            provider_data={
+                "acp_session_updates": self._last_acp_session_updates or None,
+                "acp_tool_trace": self._last_acp_tool_trace or None,
+                "acp_reasoning_trace": self._last_acp_reasoning_trace or None,
+            },
         )
         finish_reason = "tool_calls" if tool_calls else "stop"
         choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
         completion = SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or "copilot-acp",
+            model=model or self._provider_adapter.default_model,
         )
         if stream:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        model: str | None = None,
+        timeout_seconds: float,
+    ) -> tuple[str, str]:
+        env = self._provider_adapter.subprocess_env(
+            _build_subprocess_env(),
+            model=model,
+        )
+        acp_args, cleanup_paths = self._provider_adapter.subprocess_args(
+            self._acp_args,
+            model=model,
+        )
+        process_cwd, cwd_cleanup_paths = self._provider_adapter.subprocess_cwd(self._acp_cwd)
+        cleanup_paths.extend(cwd_cleanup_paths)
+
+        def _cleanup_generated_files() -> None:
+            for path in cleanup_paths:
+                try:
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+
         try:
             # Hide the console the CLI child would otherwise flash on Windows
             # (#56747). Hide-only — stdio pipes stay intact for the ACP wire.
             from hermes_cli._subprocess_compat import windows_hide_flags
 
+            popen_kwargs: dict[str, Any] = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "bufsize": 1,
+                "cwd": process_cwd,
+                "env": env,
+                "creationflags": windows_hide_flags(),
+            }
+            if os.name != "nt":
+                popen_kwargs["start_new_session"] = True
             proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
+                [self._acp_command] + acp_args,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True, encoding='utf-8', errors='replace',
-                bufsize=1,
-                cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
-                creationflags=windows_hide_flags(),
+                **popen_kwargs,
+
             )
         except FileNotFoundError as exc:
+            _cleanup_generated_files()
             raise RuntimeError(
-                f"Could not start Copilot ACP command '{self._acp_command}'. "
-                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+                self._provider_adapter.missing_command_error(self._acp_command)
             ) from exc
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
-            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
+            _cleanup_generated_files()
+            raise RuntimeError(
+                f"{self._provider_adapter.display_name} process did not expose stdin/stdout pipes."
+            )
 
         self.is_closed = False
         with self._active_process_lock:
@@ -534,6 +2085,9 @@ class CopilotACPClient:
 
         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)
+        session_updates: list[dict[str, Any]] = []
+        tool_trace: list[dict[str, Any]] = []
+        self._completed_acp_tool_call_ids = set()
 
         def _stdout_reader() -> None:
             if proc.stdout is None:
@@ -579,12 +2133,18 @@ class CopilotACPClient:
                 except queue.Empty:
                     continue
 
+                self._record_provider_activity(
+                    f"{self._provider_adapter.display_name} ACP event received"
+                )
                 if self._handle_server_message(
                     msg,
                     process=proc,
                     cwd=self._acp_cwd,
                     text_parts=text_parts,
                     reasoning_parts=reasoning_parts,
+                    session_updates=session_updates,
+                    tool_trace=tool_trace,
+                    tool_progress_callback=self._tool_progress_callback,
                 ):
                     continue
 
@@ -592,42 +2152,20 @@ class CopilotACPClient:
                     continue
                 if "error" in msg:
                     err = msg.get("error") or {}
-                    raise RuntimeError(
-                        f"Copilot ACP {method} failed: {err.get('message') or err}"
-                    )
+                    raise self._provider_adapter.method_error(method, err)
                 return msg.get("result")
 
             stderr_text = "\n".join(stderr_tail).strip()
             if proc.poll() is not None and stderr_text:
-                if _is_gh_copilot_deprecation_message(stderr_text):
-                    raise RuntimeError(
-                        "Hermes ACP mode requires the NEW GitHub Copilot CLI "
-                        "(github.com/github/copilot-cli), but the binary it just "
-                        "spawned is the deprecated `gh copilot` extension.\n\n"
-                        "Install the new CLI:\n"
-                        "  npm install -g @github/copilot\n"
-                        "  # then verify with: copilot --help\n\n"
-                        "If `copilot` already resolves to the new CLI but you still see this,\n"
-                        "point Hermes at it explicitly:\n"
-                        "  export HERMES_COPILOT_ACP_COMMAND=/path/to/new/copilot\n\n"
-                        "Alternative: use the `copilot` provider (no ACP, hits the Copilot API\n"
-                        "directly with a Copilot subscription token) via `hermes setup`.\n\n"
-                        f"Original error:\n{stderr_text}"
-                    )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
+                raise self._provider_adapter.early_exit_error(stderr_text)
+            raise self._provider_adapter.timeout_error(method)
 
         try:
             _request(
                 "initialize",
                 {
                     "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": {
-                            "readTextFile": True,
-                            "writeTextFile": True,
-                        }
-                    },
+                    "clientCapabilities": self._provider_adapter.client_capabilities(),
                     "clientInfo": {
                         "name": "hermes-agent",
                         "title": "Hermes Agent",
@@ -637,14 +2175,37 @@ class CopilotACPClient:
             )
             session = _request(
                 "session/new",
-                {
-                    "cwd": self._acp_cwd,
-                    "mcpServers": [],
-                },
+                self._provider_adapter.session_new_params(
+                    {
+                        "cwd": self._acp_cwd,
+                        "mcpServers": [],
+                    },
+                    model=model,
+                ),
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
             if not session_id:
-                raise RuntimeError("Copilot ACP did not return a sessionId.")
+                raise RuntimeError(
+                    f"{self._provider_adapter.display_name} did not return a sessionId."
+                )
+
+            initial_mode = self._provider_adapter.initial_session_mode()
+            if initial_mode:
+                try:
+                    _request(
+                        "session/set_mode",
+                        {
+                            "sessionId": session_id,
+                            "modeId": initial_mode,
+                        },
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "%s session/set_mode(%s) failed; continuing anyway: %s",
+                        self._provider_adapter.display_name,
+                        initial_mode,
+                        exc,
+                    )
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
@@ -662,9 +2223,13 @@ class CopilotACPClient:
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
             )
+            self._last_acp_session_updates = session_updates
+            self._last_acp_tool_trace = tool_trace
+            self._last_acp_reasoning_trace = reasoning_parts
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
             self.close()
+            _cleanup_generated_files()
 
     def _handle_server_message(
         self,
@@ -674,6 +2239,9 @@ class CopilotACPClient:
         cwd: str,
         text_parts: list[str] | None,
         reasoning_parts: list[str] | None,
+        session_updates: list[dict[str, Any]] | None = None,
+        tool_trace: list[dict[str, Any]] | None = None,
+        tool_progress_callback: Any = None,
     ) -> bool:
         method = msg.get("method")
         if not isinstance(method, str):
@@ -687,6 +2255,78 @@ class CopilotACPClient:
             chunk_text = ""
             if isinstance(content, dict):
                 chunk_text = str(content.get("text") or "")
+            if session_updates is not None:
+                session_updates.append(
+                    {
+                        "session_id": params.get("sessionId"),
+                        "kind": kind,
+                        "update": update,
+                    }
+                )
+            if tool_trace is not None:
+                if kind == "tool_call":
+                    tool_trace.append(
+                        {
+                            "event": "tool_call",
+                            "session_id": params.get("sessionId"),
+                            "tool_call_id": update.get("toolCallId"),
+                            "title": update.get("title"),
+                            "tool_kind": update.get("kind"),
+                            "raw_input": update.get("rawInput"),
+                            "content": update.get("content"),
+                            "_meta": update.get("_meta"),
+                        }
+                    )
+                elif kind == "tool_call_update":
+                    tool_trace.append(
+                        {
+                            "event": "tool_call_update",
+                            "session_id": params.get("sessionId"),
+                            "tool_call_id": update.get("toolCallId"),
+                            "status": update.get("status"),
+                            "content": update.get("content"),
+                            "_meta": update.get("_meta"),
+                        }
+                    )
+            if tool_progress_callback is not None and kind in {"tool_call", "tool_call_update"}:
+                tool_name = self._acp_tool_trace_name(update)
+                preview = self._acp_tool_trace_preview(update, kind=kind, chunk_text=chunk_text)
+                args = self._acp_tool_trace_args(update)
+                try:
+                    tool_call_id = str(update.get("toolCallId") or "").strip()
+                    if kind == "tool_call":
+                        tool_progress_callback(
+                            "tool.started",
+                            tool_name,
+                            preview,
+                            args,
+                            session_id=params.get("sessionId"),
+                            tool_call_id=update.get("toolCallId"),
+                            status=update.get("status"),
+                            kind=kind,
+                        )
+                    else:
+                        terminal = self._acp_tool_update_terminal_state(update)
+                        if terminal and (
+                            not tool_call_id
+                            or tool_call_id not in self._completed_acp_tool_call_ids
+                        ):
+                            if tool_call_id:
+                                self._completed_acp_tool_call_ids.add(tool_call_id)
+                            tool_progress_callback(
+                                "tool.completed",
+                                tool_name,
+                                None,
+                                None,
+                                session_id=params.get("sessionId"),
+                                tool_call_id=update.get("toolCallId"),
+                                status=update.get("status"),
+                                kind=kind,
+                                is_error=terminal == "failed",
+                                result=_render_message_content(update.get("content")),
+                            )
+                except Exception:
+                    logger.debug("ACP tool_progress_callback failed", exc_info=True)
             if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
                 text_parts.append(chunk_text)
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
@@ -699,7 +2339,13 @@ class CopilotACPClient:
         message_id = msg.get("id")
         params = msg.get("params") or {}
 
-        if method == "session/request_permission":
+        if not self._provider_adapter.supports_client_method(method):
+            response = _jsonrpc_error(
+                message_id,
+                -32601,
+                f"{self._provider_adapter.display_name} client method '{method}' is disabled by Hermes configuration.",
+            )
+        elif method == "session/request_permission":
             response = _permission_denied(message_id)
         elif method == "fs/read_text_file":
             try:
@@ -754,3 +2400,94 @@ class CopilotACPClient:
         process.stdin.write(json.dumps(response) + "\n")
         process.stdin.flush()
         return True
+
+    @staticmethod
+    def _acp_tool_trace_name(update: dict[str, Any]) -> str:
+        meta = update.get("_meta")
+        if isinstance(meta, dict):
+            for key in ("cognition.ai/inferenceToolName", "inferenceToolName"):
+                value = meta.get(key)
+                if isinstance(value, str) and value.strip():
+                    return normalize_hermes_tool_name(value)
+        for key in ("toolName", "tool_name", "name", "title"):
+            value = update.get(key)
+            if isinstance(value, str) and value.strip():
+                return normalize_hermes_tool_name(value)
+        kind = update.get("kind")
+        if isinstance(kind, str) and kind.strip():
+            return normalize_hermes_tool_name(kind)
+        return "acp_tool"
+
+    @staticmethod
+    def _acp_tool_trace_args(update: dict[str, Any]) -> dict[str, Any] | None:
+        raw = update.get("rawInput")
+        if isinstance(raw, dict):
+            return raw
+        if raw is None:
+            return None
+        return {"rawInput": raw}
+
+    @staticmethod
+    def _acp_tool_trace_preview(
+        update: dict[str, Any],
+        *,
+        kind: str,
+        chunk_text: str = "",
+    ) -> str | None:
+        candidates: list[str] = []
+        raw_input = update.get("rawInput")
+        if isinstance(raw_input, dict):
+            for key in ("path", "query", "command", "url", "text", "name", "goal", "pattern"):
+                value = raw_input.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidates.append(value.strip())
+                    break
+            else:
+                try:
+                    candidates.append(json.dumps(raw_input, ensure_ascii=False))
+                except Exception:
+                    pass
+        elif raw_input is not None:
+            candidates.append(str(raw_input))
+
+        title = update.get("title")
+        if isinstance(title, str) and title.strip():
+            title_text = title.strip()
+            # Devin MCP titles are often generic ("Calling search_files from
+            # hermes"). Prefer rawInput details for Discord progress when
+            # available, but keep the title as a fallback for tools without
+            # structured arguments.
+            if candidates:
+                lowered = title_text.lower()
+                if not (lowered.startswith("calling ") and " from hermes" in lowered):
+                    candidates.append(title_text)
+            else:
+                candidates.append(title_text)
+
+        rendered = _render_message_content(update.get("content"))
+        if rendered:
+            candidates.append(rendered)
+        if chunk_text.strip():
+            candidates.append(chunk_text.strip())
+        if kind == "tool_call_update":
+            status = update.get("status")
+            if isinstance(status, str) and status.strip():
+                candidates.append(status.strip())
+
+        for candidate in candidates:
+            candidate = " ".join(str(candidate).split()).strip()
+            if candidate:
+                return candidate[:177] + "..." if len(candidate) > 180 else candidate
+        return None
+
+    @staticmethod
+    def _acp_tool_update_terminal_state(update: dict[str, Any]) -> str | None:
+        status = update.get("status")
+        if not isinstance(status, str):
+            return None
+        normalized = status.strip().lower().replace("-", "_")
+        if normalized in {"completed", "complete", "succeeded", "success", "done"}:
+            return "completed"
+        if normalized in {"failed", "failure", "error", "errored", "cancelled", "canceled"}:
+            return "failed"
+        return None

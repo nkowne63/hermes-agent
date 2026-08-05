@@ -19,3 +19,31 @@ def test_cronjob_schema_action_description_flags_create_requirements():
     assert "REQUIRED" in action_desc
 
 
+def test_cronjob_schema_schedule_description_flags_required_for_create():
+    """`schedule` description must explicitly state REQUIRED for action=create."""
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    schedule_desc = CRONJOB_SCHEMA["parameters"]["properties"]["schedule"]["description"]
+    assert "REQUIRED" in schedule_desc
+    assert "action=create" in schedule_desc
+
+
+def test_cronjob_schema_required_array_unchanged():
+    """`required[]` stays minimal — `action` only.
+
+    The schema intentionally does NOT promote schedule/prompt into the
+    top-level required array because they're only mandatory for
+    action=create, not for list/remove/pause/etc. The description text
+    carries the conditional requirement instead.
+    """
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    assert CRONJOB_SCHEMA["parameters"]["required"] == ["action"]
+
+
+def test_cronjob_schema_exposes_active_loop_injection_opt_in():
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    prop = CRONJOB_SCHEMA["parameters"]["properties"]["inject_to_active_loop"]
+    assert prop["type"] == "boolean"
+    assert "safe /steer" in prop["description"]

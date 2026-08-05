@@ -282,7 +282,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, advance_next_runs, claim_dispatch, heartbeat_run_claim, set_active_run_claim, clear_active_run_claim
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -639,6 +639,65 @@ def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool
             cfg = load_config() or {}
         return bool((cfg.get("cron", {}) or {}).get("mirror_delivery", False))
     except Exception:
+        return False
+
+
+def _cron_active_loop_injection_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
+    """Whether cron output may steer the currently running origin agent.
+
+    Default OFF. The per-job ``inject_to_active_loop`` flag takes precedence over
+    the optional global ``cron.inject_to_active_loop`` setting, so existing cron
+    jobs retain their current delivery-only behaviour.
+    """
+    per_job = job.get("inject_to_active_loop")
+    if isinstance(per_job, bool):
+        return per_job
+    try:
+        if cfg is None:
+            cfg = load_config() or {}
+        return bool((cfg.get("cron", {}) or {}).get("inject_to_active_loop", False))
+    except Exception:
+        return False
+
+
+def _maybe_inject_cron_delivery(
+    job: dict,
+    content: str,
+    *,
+    enabled: bool = False,
+) -> bool:
+    """Best-effort steer of clean cron output into the active origin agent.
+
+    ``AIAgent.steer`` is deliberately used instead of transcript mutation or a
+    hard interrupt. It appends at the existing safe turn boundary and is safe to
+    call from the scheduler thread. A cold gateway, stale origin, or any error
+    is a silent false result because the normal cron delivery remains valid.
+    """
+    if not enabled:
+        return False
+    origin = _resolve_origin(job)
+    if not origin:
+        return False
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+        _, clean_text = BasePlatformAdapter.extract_media(content or "")
+        clean_text = (clean_text or "").strip()
+        if not clean_text:
+            return False
+        text = f"[Cron injection: {job.get('name') or job.get('id', 'cron')}]\n{clean_text}"
+        from gateway.run import steer_active_agent_for_origin
+        accepted = bool(steer_active_agent_for_origin(origin, text))
+        if accepted:
+            logger.info(
+                "Job '%s': steered delivery into active origin agent (%s:%s)",
+                job.get("id", "?"), origin.get("platform"), origin.get("chat_id"),
+            )
+        return accepted
+    except Exception as e:
+        logger.debug(
+            "Job '%s': active-loop injection failed: %s",
+            job.get("id", "?"), e,
+        )
         return False
 
 
@@ -1469,6 +1528,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    from gateway.config import load_gateway_config, Platform
+
+    # Load user config before resolving targets so local-only injection jobs can
+    # steer the live origin agent even when they intentionally have no outbound
+    # delivery target.
+    user_cfg = None
+    try:
+        user_cfg = load_config()
+    except Exception:
+        pass
+    _maybe_inject_cron_delivery(
+        job,
+        content,
+        enabled=_cron_active_loop_injection_enabled(job, user_cfg),
+    )
+
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -1492,18 +1567,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         return msg
 
     from tools.send_message_tool import _send_to_platform
-    from gateway.config import load_gateway_config, Platform
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
     wrap_response = True
-    user_cfg = None
-    try:
-        user_cfg = load_config()
+    if isinstance(user_cfg, dict):
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
-    except Exception:
-        pass
 
     if wrap_response:
         task_name = job.get("name", job["id"])
@@ -4255,16 +4325,27 @@ def tick(
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
+            owner = f"{os.getpid()}:{threading.get_ident()}:{time.time_ns()}"
+            try:
+                _stat = Path(f"/proc/{os.getpid()}/stat").read_text(encoding="utf-8")
+                _pid_start_time = _stat.rsplit(") ", 1)[1].split()[19]
+            except (OSError, IndexError):
+                _pid_start_time = None
+            if not set_active_run_claim(job_id, owner=owner, pid=os.getpid(), pid_start_time=_pid_start_time):
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             execution = create_execution(job_id, source="builtin")
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 
-            def _run_and_release(j=dispatched_job, ctx=_ctx):
+            def _run_and_release(j=dispatched_job, ctx=_ctx, claim_owner=owner):
                 try:
                     return ctx.run(_process_job, j)
                 finally:
+                    clear_active_run_claim(j["id"], owner=claim_owner)
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
 
@@ -4280,7 +4361,8 @@ def tick(
                 )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
-                if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):
+                if _interpreter_shutting_down(submit_err):
+                    clear_active_run_claim(job_id, owner=owner)
                     logger.warning(
                         "Job '%s' not dispatched — interpreter is shutting down",
                         job.get("name", job_id),

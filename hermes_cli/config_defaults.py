@@ -1789,6 +1789,10 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Full SKILL.md payloads listed here are prepended to every new agent's
+        # ephemeral system prompt, including delegate_task children.  This is
+        # explicit operator opt-in; an installed skill is not auto-executed.
+        "always_loaded": [],
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled

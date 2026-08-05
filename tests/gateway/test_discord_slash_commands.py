@@ -511,6 +511,74 @@ def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza
 # ------------------------------------------------------------------
 
 
+def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
+    """discord.auto_thread in config.yaml should be bridged to DISCORD_AUTO_THREAD env var."""
+    import yaml
+    from pathlib import Path
+
+    # Write a config.yaml the loader will find
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    config_path = hermes_dir / "config.yaml"
+    config_path.write_text(yaml.dump({
+        "discord": {"auto_thread": True},
+    }))
+
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from gateway.config import load_gateway_config
+    load_gateway_config()
+
+    import os
+    assert os.getenv("DISCORD_AUTO_THREAD") == "true"
+
+
+def test_discord_category_defaults_config_bridge(monkeypatch, tmp_path):
+    """discord.category_defaults / channel_defaults should reach the adapter config."""
+    import yaml
+    from pathlib import Path
+
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    config_path = hermes_dir / "config.yaml"
+    config_path.write_text(yaml.dump({
+        "discord": {
+            "category_defaults": {
+                "1501180412385558690": {
+                    "require_mention": False,
+                    "thread_response": True,
+                }
+            },
+            "channel_defaults": {
+                "1501181227359539401": {
+                    "require_mention": True,
+                }
+            },
+            "guild_defaults": {
+                "828550767811493920": {
+                    "require_mention": True,
+                    "thread_response": True,
+                }
+            },
+        },
+    }))
+
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from gateway.config import Platform, load_gateway_config
+
+    config = load_gateway_config()
+    extra = config.platforms[Platform.DISCORD].extra
+
+    assert extra["category_defaults"]["1501180412385558690"]["thread_response"] is True
+    assert extra["channel_defaults"]["1501181227359539401"]["require_mention"] is True
+    assert extra["guild_defaults"]["828550767811493920"]["require_mention"] is True
+
+
 # ------------------------------------------------------------------
 # /skill command registration (flat + autocomplete)
 # ------------------------------------------------------------------
