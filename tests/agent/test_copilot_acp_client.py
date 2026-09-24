@@ -515,8 +515,8 @@ def _recording_client(tmp_path, spawned):
     client = CopilotACPClient(command=sys.executable, args=[str(server)], acp_cwd=str(tmp_path))
     real_spawn = client._spawn
 
-    def record_spawn():
-        proc = real_spawn()
+    def record_spawn(*args, **kwargs):
+        proc = real_spawn(*args, **kwargs)
         spawned.append(proc)
         return proc
 

@@ -173,6 +173,12 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "openai-codex": _codex_curated_models(),
     "xai-oauth": list(_XAI_MODELS),
     "copilot-acp": ["copilot-acp"],
+    "devin-acp": [
+        "swe-1.6", "glm-5.2", "gpt-5.4-mini", "gpt-5.4", "claude-sonnet-4.5", "adaptive", "devin-acp",
+    ],
+    "claude-acp": [
+        "claude-fable-5", "claude-sonnet-4.6", "claude-opus-4.6", "claude-opus-4.8", "claude-haiku-4.5",
+    ],
     "copilot": _OPENAI_CHAT_MODELS + [
         "claude-sonnet-4.6", "claude-sonnet-5", "claude-sonnet-4", "claude-sonnet-4.5", "claude-haiku-4.5",
         "gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro",
@@ -329,6 +335,8 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [ProviderEntry(*row) for row in (
     ("nvidia", "NVIDIA NIM", "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ("copilot", "GitHub Copilot", "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ("copilot-acp", "GitHub Copilot ACP", "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
+    ("devin-acp", "Devin ACP", "Devin ACP (Spawns devin acp)"),
+    ("claude-acp", "Claude ACP", "Claude ACP (Spawns claude-agent-acp)"),
     ("huggingface", "Hugging Face", "Hugging Face Inference Providers"),
     ("gemini", "Google AI Studio", "Google AI Studio (Native Gemini API)"),
     ("vertex", "Google Vertex AI", "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
@@ -419,6 +427,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan, Token Plan & Qwen CLI OAuth", ["alibaba", "alibaba-cn", "alibaba-coding-plan", "alibaba-coding-plan-cn", "alibaba-token-plan", "alibaba-token-plan-cn", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go or Go subscription", ["opencode-zen", "opencode-go"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
+    "acp":      ("ACP CLIs",        "Local ACP-compatible coding agents",              ["devin-acp", "claude-acp"]),
     "tencent":  ("Tencent Hy",      "Hy4 / Hy3 via TokenHub & TokenPlan", ["tencent-tokenhub", "tencent-tokenplan"]),
 }
 
@@ -473,7 +482,9 @@ def group_providers(slugs):
 _PROVIDER_ALIASES = dict((
     ("glm", "zai"), ("z-ai", "zai"), ("z.ai", "zai"), ("zhipu", "zai"), ("github", "copilot"),
     ("github-copilot", "copilot"), ("github-models", "copilot"), ("github-model", "copilot"),
-    ("github-copilot-acp", "copilot-acp"), ("copilot-acp-agent", "copilot-acp"), ("google", "gemini"),
+    ("github-copilot-acp", "copilot-acp"), ("copilot-acp-agent", "copilot-acp"),
+    ("devin", "devin-acp"), ("devin-acp", "devin-acp"), ("devin-acp-agent", "devin-acp"),
+    ("claude-agent-acp", "claude-acp"), ("anthropic-acp", "claude-acp"), ("google", "gemini"),
     ("google-gemini", "gemini"), ("google-ai-studio", "gemini"), ("google-vertex", "vertex"), ("vertex-ai", "vertex"),
     ("gcp-vertex", "vertex"), ("vertexai", "vertex"), ("kimi", "kimi-coding"), ("moonshot", "kimi-coding"),
     ("kimi-cn", "kimi-coding-cn"), ("moonshot-cn", "kimi-coding-cn"), ("step", "stepfun"),
