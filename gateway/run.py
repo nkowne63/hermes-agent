@@ -2324,12 +2324,19 @@ def _resolve_runtime_agent_kwargs() -> dict:
     if fallback_entry is not None:
         # The entry's model is the one this agent must send (#112600). Carry the fallback notice so the
         # gateway can surface a user-visible provider switch (#74349); the caller must pop
-        # ``_fallback_notice`` before forwarding kwargs to AIAgent.
+        # ``_fallback_notice`` before forwarding kwargs to AIAgent. ``_fallback_notice_detail`` carries
+        # the structured route for the out-of-band home-channel/session notifications.
         return {**_runtime_agent_kwargs(runtime), "model": fallback_entry["model"],
                 "_fallback_notice": pre_agent_fallback_notice(
                     _primary_provider, _primary_model,
                     runtime.get("provider") or fallback_entry.get("provider") or "unknown",
-                    fallback_entry.get("model") or "default")}
+                    fallback_entry.get("model") or "default"),
+                "_fallback_notice_detail": {
+                    "from_provider": _primary_provider,
+                    "to_provider": runtime.get("provider") or fallback_entry.get("provider") or "unknown",
+                    "from_model": _primary_model,
+                    "to_model": fallback_entry.get("model") or "default",
+                }}
 
     capabilities = runtime.get("capabilities")
     capabilities = (
@@ -3098,6 +3105,81 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
 # Weak ref to the active GatewayRunner; tools like send_message route through its live adapters.
 import weakref as _weakref
 _gateway_runner_ref: _weakref.ref = lambda: None
+
+def _origin_matches_live_source(origin: dict, source) -> bool:
+    """Return True when a cron origin identifies a cached live session source."""
+    if not isinstance(origin, dict) or source is None:
+        return False
+    platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+    if str(origin.get("platform", "")).lower() != str(platform).lower():
+        return False
+    if str(origin.get("chat_id", "")) != str(getattr(source, "chat_id", "")):
+        return False
+
+    # Thread/topic and server/profile scopes must match exactly when the cron
+    # origin carries them. A missing live scope is a fail-closed mismatch rather
+    # than a reason to steer a similarly named channel.
+    source_scope = getattr(source, "scope_id", None) or getattr(source, "guild_id", None)
+    origin_scope = origin.get("scope_id") or origin.get("guild_id")
+    if origin_scope is not None and str(origin_scope) != str(source_scope or ""):
+        return False
+    for field in ("thread_id", "parent_chat_id", "profile"):
+        origin_value = origin.get(field)
+        if origin_value is not None and str(origin_value) != str(getattr(source, field, None) or ""):
+            return False
+
+    # Thread sessions are shared by default; threadless group sessions may be
+    # per-user isolated. If the origin identifies a participant, require the
+    # cached source to identify the same participant too.
+    origin_user = origin.get("user_id") or origin.get("user_id_alt")
+    if origin_user is not None and str(origin_user) != str(
+        getattr(source, "user_id", None) or getattr(source, "user_id_alt", None) or ""
+    ):
+        return False
+    return True
+
+
+def steer_active_agent_for_origin(origin: dict, text: str) -> bool:
+    """Steer one active gateway agent matching a cron origin.
+
+    This is deliberately best-effort and fail-closed. It reuses ``AIAgent.steer``
+    so the message is consumed at the existing safe turn boundary; it never
+    interrupts an in-flight tool/API call and never appends directly to the
+    transcript. A missing gateway, pending startup sentinel, stale origin, or
+    ambiguous match returns ``False``.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+    if runner is None:
+        return False
+
+    running_agents = getattr(runner, "_running_agents", None) or {}
+    cached_sources = getattr(runner, "_session_sources", None) or {}
+    matches = []
+    for session_key, agent in list(running_agents.items()):
+        if agent is _AGENT_PENDING_SENTINEL:
+            continue
+        source = cached_sources.get(session_key)
+        if _origin_matches_live_source(origin, source):
+            matches.append(agent)
+
+    # Never guess if multiple active sessions happen to share incomplete origin
+    # metadata. The next ordinary delivery can still handle the result.
+    if len(matches) != 1:
+        return False
+    steer = getattr(matches[0], "steer", None)
+    if not callable(steer):
+        return False
+    try:
+        return bool(steer(text.strip()))
+    except Exception:
+        logger.debug("Cron active-loop steer failed", exc_info=True)
+        return False
+
 
 
 def _normalize_empty_agent_response(
@@ -4254,6 +4336,145 @@ class GatewayRunner(
                 else:
                     return isinstance(topic_info, dict)
         return False
+
+    async def _send_provider_fallback_notification(
+        self,
+        *,
+        source: SessionSource,
+        from_provider: str,
+        to_provider: str,
+        from_model: str = "",
+        to_model: str = "",
+    ) -> bool:
+        """Notify the platform home channel that runtime provider fallback happened."""
+        platform_cfg = self.config.platforms.get(source.platform) if getattr(self, "config", None) else None
+        if platform_cfg is None or not getattr(platform_cfg, "gateway_fallback_notification", False):
+            return False
+
+        home = self.config.get_home_channel(source.platform) if getattr(self, "config", None) else None
+        if not home or not home.chat_id:
+            logger.info(
+                "Provider fallback notification skipped for %s: no home channel configured",
+                source.platform.value if source.platform else "unknown",
+            )
+            return False
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return False
+
+        parts = [
+            "⚠️ Provider fallback",
+            f"{from_provider or '(unknown)'} -> {to_provider or '(unknown)'}",
+        ]
+        if from_model or to_model:
+            parts.append(f"model {from_model or '(unknown)'} -> {to_model or '(unknown)'}")
+        message = " | ".join(parts)
+
+        try:
+            metadata = self._thread_metadata_for_target(
+                source.platform,
+                home.chat_id,
+                home.thread_id,
+                adapter=adapter,
+            )
+            if metadata:
+                result = await adapter.send(
+                    str(home.chat_id),
+                    message,
+                    metadata=_non_conversational_metadata(metadata, platform=source.platform),
+                )
+            else:
+                _meta = _non_conversational_metadata(platform=source.platform)
+                if _meta:
+                    result = await adapter.send(str(home.chat_id), message, metadata=_meta)
+                else:
+                    result = await adapter.send(str(home.chat_id), message)
+            if result is not None and getattr(result, "success", True) is False:
+                logger.warning(
+                    "Provider fallback notification failed for %s:%s: %s",
+                    source.platform.value if source.platform else "unknown",
+                    home.chat_id,
+                    getattr(result, "error", "send returned success=False"),
+                )
+                return False
+            logger.info(
+                "Sent provider fallback notification to %s:%s (%s -> %s)",
+                source.platform.value if source.platform else "unknown",
+                home.chat_id,
+                from_provider or "(unknown)",
+                to_provider or "(unknown)",
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Provider fallback notification failed for %s:%s: %s",
+                source.platform.value if source.platform else "unknown",
+                home.chat_id,
+                exc,
+            )
+            return False
+
+    async def _send_provider_fallback_session_error(
+        self,
+        *,
+        source: SessionSource,
+        from_provider: str,
+        to_provider: str,
+        from_model: str = "",
+        to_model: str = "",
+    ) -> bool:
+        """Emit a non-conversational fallback error into the active Discord session."""
+        if _gateway_platform_value(getattr(source, "platform", None)) != "discord":
+            return False
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return False
+
+        parts = [
+            "❌ Provider fallback in this session",
+            f"{from_provider or '(unknown)'} -> {to_provider or '(unknown)'}",
+        ]
+        if from_model or to_model:
+            parts.append(f"model {from_model or '(unknown)'} -> {to_model or '(unknown)'}")
+        message = " | ".join(parts)
+        reply_to = str(getattr(source, "message_id", "") or "").strip() or None
+
+        try:
+            metadata = self._thread_metadata_for_source(source, reply_to)
+            metadata = _non_conversational_metadata(metadata, platform=source.platform)
+            result = await adapter.send(
+                str(source.chat_id),
+                message,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            if result is not None and getattr(result, "success", True) is False:
+                logger.warning(
+                    "Provider fallback session error failed for %s:%s: %s",
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id,
+                    getattr(result, "error", "send returned success=False"),
+                )
+                return False
+            logger.info(
+                "Sent provider fallback session error to %s:%s (%s -> %s)",
+                source.platform.value if source.platform else "unknown",
+                source.chat_id,
+                from_provider or "(unknown)",
+                to_provider or "(unknown)",
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Provider fallback session error failed for %s:%s: %s",
+                source.platform.value if source.platform else "unknown",
+                source.chat_id,
+                exc,
+            )
+            return False
+
 
     _reply_anchor_for_event = staticmethod(_reply_anchor_for_event)
 

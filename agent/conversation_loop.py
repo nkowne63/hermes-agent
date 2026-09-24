@@ -206,6 +206,20 @@ _COMPRESSION_TIMEOUT_FINAL_RESPONSE = (
 # Stable prefix ACP/TUI match on to treat the text as cancellation metadata, not assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+_ACP_PROCESS_PROVIDERS = {"copilot-acp", "devin-acp", "claude-acp"}
+
+
+def _is_acp_session_prompt_timeout(error: Exception, provider: str) -> bool:
+    if (provider or "").strip().lower() not in _ACP_PROCESS_PROVIDERS:
+        return False
+    if not isinstance(error, TimeoutError):
+        return False
+    method = getattr(error, "method", None)
+    if method == "session/prompt":
+        return True
+    return "response to session/prompt" in str(error).lower()
+
+
 
 def _should_rearm_compression_budget(
     compression_attempts: int, *, completed_compaction_pending: bool, prompt_tokens: int, threshold_tokens: int

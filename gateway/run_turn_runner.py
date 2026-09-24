@@ -1915,6 +1915,32 @@ class TurnRunner:
             # fallback was resolved before any agent exists (#74349); one-shot per turn.
             pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)
             runner._pre_agent_fallback_notice = None
+            pending_fallback_detail = getattr(runner, "_pre_agent_fallback_notice_detail", None)
+            runner._pre_agent_fallback_notice_detail = None
+            if pending_fallback_detail:
+                # Out-of-band notifications: a session-scoped error reply plus the
+                # opt-in home-channel ping (platforms.<name>.gateway_fallback_notification).
+                _detail = pending_fallback_detail
+                self._schedule(
+                    runner._send_provider_fallback_session_error(
+                        source=ctx.source,
+                        from_provider=str(_detail.get("from_provider") or ""),
+                        to_provider=str(_detail.get("to_provider") or runtime_kwargs.get("provider") or ""),
+                        from_model=str(_detail.get("from_model") or ""),
+                        to_model=str(_detail.get("to_model") or model or ""),
+                    ),
+                    "provider fallback session error notification failed",
+                )
+                self._schedule(
+                    runner._send_provider_fallback_notification(
+                        source=ctx.source,
+                        from_provider=str(_detail.get("from_provider") or ""),
+                        to_provider=str(_detail.get("to_provider") or runtime_kwargs.get("provider") or ""),
+                        from_model=str(_detail.get("from_model") or ""),
+                        to_model=str(_detail.get("to_model") or model or ""),
+                    ),
+                    "provider fallback home-channel notification failed",
+                )
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",

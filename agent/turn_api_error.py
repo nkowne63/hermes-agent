@@ -119,6 +119,13 @@ def handle_api_error(
         classified.retryable, classified.should_compress,
         classified.should_rotate_credential, classified.should_fallback,
     )
+    # ACP subprocess providers surface a hung ``session/prompt`` as a TimeoutError;
+    # cap retries so a dead provider process fails fast instead of burning the
+    # full retry budget on an identically-doomed call.
+    from agent.conversation_loop import _is_acp_session_prompt_timeout
+    if _is_acp_session_prompt_timeout(api_error, getattr(agent, "provider", "") or ""):
+        max_retries = min(max_retries, 2)
+
     agent._invoke_api_request_error_hook(
         task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
         api_call_count=api_call_count, api_start_time=api_start_time, api_kwargs=api_kwargs,

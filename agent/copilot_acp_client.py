@@ -65,6 +65,15 @@ _DEPRECATED_CLI_ERROR = (
     "token) via `hermes setup`.\n\nOriginal error:\n"
 )
 
+class ACPProviderTimeoutError(TimeoutError):
+    """Timeout raised by subprocess ACP providers for one JSON-RPC method."""
+
+    def __init__(self, provider_name: str, method: str) -> None:
+        self.provider_name = provider_name
+        self.method = method
+        super().__init__(f"Timed out waiting for {provider_name} response to {method}.")
+
+
 
 def _is_gh_copilot_deprecation_message(stderr_text: str) -> bool:
     """True iff stderr looks like the deprecated gh-copilot extension's banner."""
@@ -424,7 +433,7 @@ class CopilotACPClient:
                 if _is_gh_copilot_deprecation_message(stderr_text):
                     raise RuntimeError(_DEPRECATED_CLI_ERROR + stderr_text)
                 raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
+            raise ACPProviderTimeoutError("Copilot ACP", method)
 
         try:
             _request("initialize", _INITIALIZE_PARAMS)
