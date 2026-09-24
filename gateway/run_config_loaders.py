@@ -106,6 +106,19 @@ class GatewayConfigLoadersMixin:
             return None
         return _get_channel_override(config, platform, chat_id, thread_id=thread_id, parent_id=parent_id)
 
+    def _channel_silence_allowed(self, source) -> bool:
+        """True when this channel's ``channel_overrides`` entry sets ``allow_silence: true`` —
+        a human turn may then end on a bare silence marker without the ⚠️ fallback notice."""
+        if source is None:
+            return False
+        override = self._channel_override(
+            source.platform,
+            str(source.chat_id or ""),
+            str(source.thread_id) if getattr(source, "thread_id", None) else None,
+            str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
+        )
+        return bool(override and override.allow_silence)
+
     def _resolve_model_for_channel(
         self, platform: Platform, chat_id: str, *, user_config: Optional[dict] = None,
         thread_id: Optional[str] = None, parent_id: Optional[str] = None,

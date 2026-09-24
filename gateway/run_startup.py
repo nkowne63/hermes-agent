@@ -785,7 +785,7 @@ class GatewayStartupMixin:
                 if diagnostic_turn_muted(prompt.get("display_metadata"), origin.platform):
                     return ""
         if is_intentional_silence_response(last["content"]):
-            return "" if machinery else _UNEXPECTED_SILENCE_REPLY
+            return "" if machinery or self._channel_silence_allowed(origin) else _UNEXPECTED_SILENCE_REPLY
         return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
 
     @staticmethod

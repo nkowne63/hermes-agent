@@ -154,6 +154,8 @@ user: next message
 
 Failed turns still surface as errors; Hermes does not hide failures just because the text resembles a silence token.
 
+On a normal user-facing turn the marker is treated as a mistake — the model was expected to answer — so Hermes delivers a short ⚠️ fallback notice instead of staying quiet. Channels where the agent may legitimately choose not to reply can opt out per channel with `allow_silence: true` under [`channel_overrides`](#per-channel-model--system-prompt-overrides); the marker then suppresses delivery exactly like an internal turn.
+
 ## Quick Setup
 
 The easiest way to configure messaging platforms is the interactive wizard:
@@ -331,13 +333,14 @@ platforms:
         model: anthropic/claude-sonnet-4.6
         provider: anthropic
         system_prompt: "You are the #dev channel code-review specialist."
+        allow_silence: true        # bare [SILENT]/NO_REPLY ends a user turn quietly
       "987654321098765432":
         model: openai/gpt-5-mini
 ```
 
 Details:
 
-- All three keys are optional — set only `model`, only `system_prompt`, or any combination. Unset fields fall back to the global defaults.
+- All keys are optional — set only `model`, only `system_prompt`, or any combination. Unset fields fall back to the global defaults. `allow_silence: true` lets a user-facing turn in that channel end on a bare [silence token](#intentional-silence-tokens) without the ⚠️ fallback notice; threads inherit it from the parent channel like the other keys.
 - Lookup order is exact channel/thread id first, then the **parent** channel/forum id — so Discord threads inherit their parent channel's override automatically.
 - Resolution priority for the model is: session `/model` override → `channel_overrides` → global config. A user running `/model` in a chat still wins over the channel default.
 - The `system_prompt` override replaces the global gateway prompt for that channel (it is ephemeral — injected per turn, not stored in history).

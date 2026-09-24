@@ -1534,9 +1534,11 @@ class GatewayTurnMixin:
             response = ""
         _intentional_silence = self._is_intentional_silence(agent_result, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
-        # opened the chain: an internal follow-up may go silent, a human one must not.
+        # opened the chain: an internal follow-up may go silent, a human one must not — unless
+        # the channel opted in via channel_overrides.allow_silence.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
-        if _intentional_silence and not is_machinery_display_kind(_silence_kind):
+        if (_intentional_silence and not is_machinery_display_kind(_silence_kind)
+                and not self._channel_silence_allowed(source)):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
@@ -3738,7 +3740,7 @@ class GatewayTurnMixin:
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
-            if is_machinery_display_kind(turn_ctx.persist_user_display_kind):
+            if is_machinery_display_kind(turn_ctx.persist_user_display_kind) or self._channel_silence_allowed(turn_ctx.source):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",

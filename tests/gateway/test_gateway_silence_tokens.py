@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import GatewayConfig, Platform
+from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource
 from gateway.response_filters import (
@@ -115,6 +115,81 @@ async def test_human_turn_gets_a_visible_fallback_for_a_silence_marker(monkeypat
     )
 
     assert response and not is_intentional_silence_response(response)
+
+
+def _silent_agent_result():
+    return {
+        "final_response": "[SILENT]",
+        "messages": [
+            {"role": "user", "content": "side chatter"},
+            {"role": "assistant", "content": "[SILENT]"},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_allow_silence_channel_suppresses_human_turn_marker(monkeypatch, tmp_path):
+    """channel_overrides.allow_silence lets a HUMAN turn end on a bare marker: delivery is
+    suppressed like a machinery turn and the transcript still keeps the marker row."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        channel_overrides={"-1001": ChannelOverride(allow_silence=True)})
+    runner._run_agent = AsyncMock(return_value=_silent_agent_result())
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == ""
+    appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+    assert {"role": "assistant", "content": "[SILENT]"}.items() <= appended[-1].items()
+
+
+@pytest.mark.asyncio
+async def test_allow_silence_false_keeps_visible_fallback(monkeypatch, tmp_path):
+    """An explicit ``allow_silence: false`` is the default behavior, not an opt-in."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        channel_overrides={"-1001": ChannelOverride(allow_silence=False)})
+    runner._run_agent = AsyncMock(return_value=_silent_agent_result())
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response and not is_intentional_silence_response(response)
+
+
+@pytest.mark.asyncio
+async def test_queued_first_response_silence_allowed_channel_stays_quiet():
+    """The queued-follow-up first-response path honors allow_silence too: nothing is sent."""
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        channel_overrides={"-1001": ChannelOverride(allow_silence=True)})
+    runner._deliver_queued_first_response = AsyncMock()
+    turn_ctx = SimpleNamespace(
+        session_key="agent:main:telegram:group:-1001:12345",
+        stream_consumer_holder=[None],
+        mute_notification_reply=False,
+        persist_user_display_kind=None,
+        source=_source(),
+        _status_thread_metadata=None,
+        event_message_id=None,
+        inbound_message_id="msg-42",
+        run_generation=1,
+    )
+    result = {"final_response": "NO_REPLY", "failed": False}
+
+    await runner._run_agent_deliver_first_response(
+        turn_ctx, None, result, result, None,
+    )
+
+    runner._deliver_queued_first_response.assert_not_awaited()
 
 
 @pytest.mark.asyncio
