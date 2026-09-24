@@ -1497,9 +1497,30 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     parent_id = None
                     if hasattr(message.channel, "parent_id") and message.channel.parent_id:
                         parent_id = str(message.channel.parent_id)
+                    channel_id = str(message.channel.id)
+                    category_id = self._get_category_id(message.channel)
+                    guild_id = self._get_guild_id(message)
                     free_channels = self._discord_free_response_channels()
                     channel_keys = self._discord_channel_keys(message, parent_id)
-                    if "*" not in free_channels and not (channel_keys & free_channels):
+                    channel_ids = {channel_id}
+                    if parent_id:
+                        channel_ids.add(parent_id)
+                    if category_id:
+                        channel_ids.add(category_id)
+                    free_by_rule = (
+                        self._discord_effective_require_mention(
+                            channel_id=channel_id,
+                            parent_channel_id=parent_id,
+                            category_id=category_id,
+                            guild_id=guild_id,
+                        )
+                        is False
+                    )
+                    if (
+                        not free_by_rule
+                        and "*" not in free_channels
+                        and not ((channel_keys | channel_ids) & free_channels)
+                    ):
                         # Every other silent return in this function is at least guessable from
                         # the outside; this one is not, and an operator seeing no log line cannot
                         # tell it apart from the gateway never receiving the event.
@@ -2323,8 +2344,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
             free_channels = self._discord_free_response_channels()
+            require_mention = self._discord_effective_require_mention(
+                channel_id=str(message.channel.id),
+                parent_channel_id=parent_id,
+                category_id=self._get_category_id(message.channel),
+                guild_id=self._get_guild_id(message),
+            )
             if (
-                self._discord_require_mention()
+                require_mention
                 and "*" not in free_channels
                 and not (channel_keys & free_channels)
                 and not self._in_bot_thread(message)
@@ -4789,6 +4816,81 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Return whether Discord channel messages require a bot mention."""
         return self._extra_or_env_flag("require_mention", "DISCORD_REQUIRE_MENTION", "true", truthy=False)
 
+    @staticmethod
+    def _discord_bool(value: Any) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() not in {"false", "0", "no", "off", ""}
+        return bool(value)
+
+    def _discord_default_bool(
+        self,
+        key: str,
+        *,
+        channel_id: Optional[str],
+        parent_channel_id: Optional[str],
+        category_id: Optional[str],
+        guild_id: Optional[str],
+        fallback: bool,
+    ) -> bool:
+        """Resolve a per-channel Discord boolean with channel > category > guild > fallback."""
+
+        def _lookup(section_name: str, ids: list[Optional[str]]) -> Optional[bool]:
+            section = self.config.extra.get(section_name)
+            if not isinstance(section, dict):
+                return None
+            for raw_id in ids:
+                if raw_id is None:
+                    continue
+                rule = section.get(str(raw_id))
+                if isinstance(rule, dict) and key in rule:
+                    return self._discord_bool(rule.get(key))
+            return None
+
+        channel_value = _lookup("channel_defaults", [channel_id, parent_channel_id])
+        if channel_value is not None:
+            return channel_value
+        category_value = _lookup("category_defaults", [category_id])
+        if category_value is not None:
+            return category_value
+        guild_value = _lookup("guild_defaults", [guild_id])
+        if guild_value is not None:
+            return guild_value
+        return fallback
+
+    def _discord_effective_require_mention(
+        self,
+        *,
+        channel_id: Optional[str],
+        parent_channel_id: Optional[str],
+        category_id: Optional[str],
+        guild_id: Optional[str],
+    ) -> bool:
+        return self._discord_default_bool(
+            "require_mention",
+            channel_id=channel_id,
+            parent_channel_id=parent_channel_id,
+            category_id=category_id,
+            guild_id=guild_id,
+            fallback=self._discord_require_mention(),
+        )
+
+    def _discord_effective_thread_response(
+        self,
+        *,
+        channel_id: Optional[str],
+        parent_channel_id: Optional[str],
+        category_id: Optional[str],
+        guild_id: Optional[str],
+    ) -> bool:
+        return self._discord_default_bool(
+            "thread_response",
+            channel_id=channel_id,
+            parent_channel_id=parent_channel_id,
+            category_id=category_id,
+            guild_id=guild_id,
+            fallback=True,
+        )
+
     def _discord_free_response_auto_thread(self) -> bool:
         """Free-response channels also auto-thread when opted in; default replies inline."""
         return self._extra_or_env_flag(
@@ -5698,6 +5800,30 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return str(parent_id)
         return None
 
+    def _get_category_id(self, channel: Any) -> Optional[str]:
+        """Return the category ID for a Discord channel or thread, if available."""
+        category_id = getattr(channel, "category_id", None)
+        if category_id is not None:
+            return str(category_id)
+        category = getattr(channel, "category", None)
+        if category is not None and getattr(category, "id", None) is not None:
+            return str(category.id)
+        parent = getattr(channel, "parent", None)
+        if parent is not None:
+            parent_category_id = getattr(parent, "category_id", None)
+            if parent_category_id is not None:
+                return str(parent_category_id)
+            parent_category = getattr(parent, "category", None)
+            if parent_category is not None and getattr(parent_category, "id", None) is not None:
+                return str(parent_category.id)
+        return None
+
+    def _get_guild_id(self, message: Any) -> Optional[str]:
+        """Return the guild ID for a Discord message, if it is from a guild."""
+        guild = getattr(message, "guild", None) or getattr(getattr(message, "channel", None), "guild", None)
+        guild_id = getattr(guild, "id", None)
+        return str(guild_id) if guild_id is not None else None
+
     def _is_forum_parent(self, channel: Any) -> bool:
         """Best-effort check for whether a Discord channel is a forum channel."""
         if channel is None:
@@ -5946,6 +6072,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if is_thread:
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
+        category_id = self._get_category_id(message.channel)
+        guild_id = self._get_guild_id(message)
         is_voice_linked_channel = False
         # Save stripped text now: create_thread() can clobber message.content (breaks /command detection).
         raw_content = message.content.strip()
@@ -5971,6 +6099,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
+            if category_id:
+                channel_ids.add(category_id)
             channel_keys = self._discord_channel_keys(message, parent_channel_id)
             allowed_channels = self._get_allowed_channels()
             if allowed_channels:
@@ -5982,7 +6112,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_keys)
                 return False
             free_channels = self._discord_free_response_channels()
-            require_mention = self._discord_require_mention()
+            require_mention = self._discord_effective_require_mention(
+                channel_id=str(message.channel.id),
+                parent_channel_id=parent_channel_id,
+                category_id=category_id,
+                guild_id=guild_id,
+            )
             # Voice-linked text channel is free-response while voice is active (exact channel only).
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
             current_channel_id = str(message.channel.id)
@@ -6004,10 +6139,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            # Voice-linked and reply exclusions live in the auto-thread gate below, not in skip_thread.
-            skip_thread = bool(channel_keys & no_thread_channels) or (
-                is_free_channel and not self._discord_free_response_auto_thread()
+            thread_response = self._discord_effective_thread_response(
+                channel_id=str(message.channel.id),
+                parent_channel_id=parent_channel_id,
+                category_id=category_id,
+                guild_id=guild_id,
             )
+            skip_thread = bool((channel_keys | channel_ids) & no_thread_channels) or (
+                is_free_channel and not self._discord_free_response_auto_thread()
+            ) or not thread_response
             auto_thread = self._extra_or_env_flag("auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True)
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:

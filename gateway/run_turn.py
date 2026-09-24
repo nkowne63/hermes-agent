@@ -1604,12 +1604,11 @@ class GatewayTurnMixin:
     def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence):
         """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
         requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
-        from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
+        from gateway.run import _load_gateway_config, _resolve_gateway_show_reasoning
         try:
-            _show_reasoning_effective = _resolve_gateway_display_bool(
-                _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
-                default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
-                require_platform_override_for={Platform.MATTERMOST},
+            _show_reasoning_effective = _resolve_gateway_show_reasoning(
+                _load_gateway_config(), source,
+                default=bool(getattr(self, "_show_reasoning", False)),
             )
         except Exception:
             _show_reasoning_effective = (
@@ -2941,10 +2940,20 @@ class GatewayTurnMixin:
             _platform_config_key,
         )
         from agent.secret_scope import get_secret
-        from gateway.display_config import resolve_display_setting, resolve_tool_progress
+        from gateway.display_config import (
+            is_thread_only_display_channel,
+            resolve_display_setting,
+            resolve_tool_progress,
+        )
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        thread_only_parent = is_thread_only_display_channel(
+            user_config,
+            channel_id=getattr(source, "chat_id", None),
+            thread_id=getattr(source, "thread_id", None),
+            parent_channel_id=getattr(source, "parent_chat_id", None),
+        )
         enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
         adapter = self._delivery_adapter_for(source)
         # Tool preview length (0 = no limit) and friendly tool labels (default on), per-platform.
@@ -2963,6 +2972,8 @@ class GatewayTurnMixin:
         progress_mode, _tool_progress_explicit = resolve_tool_progress(
             user_config, platform_key, get_secret("HERMES_TOOL_PROGRESS_MODE"),
         )
+        if thread_only_parent:
+            progress_mode = "off"
         # "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         _generic_status_recent: List[str] = []
@@ -3011,10 +3022,14 @@ class GatewayTurnMixin:
         interim_assistant_messages_mode = _display_surface_mode(
             "interim_assistant_messages", default=True, require_platform_override_for={Platform.MATTERMOST},
         )
+        if thread_only_parent:
+            interim_assistant_messages_mode = "off"
         interim_assistant_messages_enabled = not is_webhook and interim_assistant_messages_mode != "off"
         _thinking_enabled = _display_surface_mode(
             "thinking_progress", default=False, require_platform_override_for={Platform.MATTERMOST},
         ) != "off"
+        if thread_only_parent:
+            _thinking_enabled = False
         # Slack-native task cards need the progress queue even with text tool_progress off.
         # Slack-native task cards (#29483): when the Slack adapter's opt-in is set, tool progress renders as
         # native plan/task cards via chat.startStream — the progress queue is needed even though Slack keeps

@@ -204,3 +204,32 @@ def _normalise(setting: str, value: Any) -> Any:
     """Normalise a user-supplied value for *setting*; unknown settings pass through."""
     norm = _NORMALISERS.get(setting)
     return norm(value) if norm else value
+
+
+def is_thread_only_display_channel(
+    user_config: dict,
+    *,
+    channel_id: str | None,
+    thread_id: str | None,
+    parent_channel_id: str | None = None,
+) -> bool:
+    """Return whether transient display output is parent-channel-only suppressed.
+
+    ``display.thread_only_channels`` contains parent channel IDs where tool
+    progress, thinking progress, and displayed reasoning should stay out of
+    the channel itself but remain available in an explicit thread. A thread
+    event is never suppressed by this rule; its parent ID is accepted in the
+    signature so callers can pass the complete ``SessionSource`` shape.
+    """
+    if thread_id:
+        return False
+    display_cfg = user_config.get("display") or {}
+    if not isinstance(display_cfg, dict):
+        return False
+    configured = display_cfg.get("thread_only_channels") or []
+    if isinstance(configured, (str, int)):
+        configured = [configured]
+    if not isinstance(configured, (list, tuple, set)):
+        return False
+    targets = {str(value).strip() for value in configured if str(value).strip()}
+    return bool(channel_id and str(channel_id).strip() in targets)
