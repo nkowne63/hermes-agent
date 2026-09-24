@@ -880,6 +880,54 @@ def _resolve_gateway_display_bool(
     return bool(value)
 
 
+def _resolve_gateway_show_reasoning(
+    user_config: dict,
+    source: Any,
+    *,
+    default: bool = False,
+) -> bool:
+    """Resolve final-response reasoning visibility for one gateway source.
+
+    Parent-only display channels suppress transient output in the parent while
+    leaving explicit threads unaffected.  Keep that decision local to the
+    final-response path instead of relying on state computed by the agent-run
+    path (which is a different function scope).
+    """
+    config = user_config if isinstance(user_config, dict) else {}
+    platform = getattr(source, "platform", None)
+    platform_key = _platform_config_key(platform)
+
+    try:
+        from gateway.display_config import is_thread_only_display_channel
+
+        thread_only_parent = is_thread_only_display_channel(
+            config,
+            channel_id=getattr(source, "chat_id", None),
+            thread_id=getattr(source, "thread_id", None),
+            parent_channel_id=getattr(source, "parent_chat_id", None),
+        )
+    except Exception:
+        thread_only_parent = False
+
+    try:
+        show_reasoning = _resolve_gateway_display_bool(
+            config,
+            platform_key,
+            "show_reasoning",
+            default=default,
+            platform=platform,
+            require_platform_override_for={Platform.MATTERMOST},
+        )
+    except Exception:
+        show_reasoning = (
+            False
+            if platform == Platform.MATTERMOST
+            else bool(default)
+        )
+
+    return False if thread_only_parent else show_reasoning
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid names (lowercase/digits/underscore); no-op elsewhere."""
     platform_value = getattr(platform, "value", platform)
