@@ -2361,6 +2361,24 @@ def init_agent(
         setattr(agent, _name, _params[_name])
     for _name in _GATEWAY_IDENTITY_PARAMS:
         setattr(agent, f"_{_name}", _params[_name])
+    # Explicit operator opt-in for skills that must be present in every
+    # top-level and delegated agent.  Loading here covers CLI, gateway, TUI,
+    # and delegate_task uniformly without mutating a live system prompt.
+    try:
+        from agent.skill_commands import build_always_loaded_skills_prompt
+
+        _always_prompt, _always_loaded, _always_missing = build_always_loaded_skills_prompt(
+            task_id=session_id,
+        )
+        if _always_prompt:
+            agent.ephemeral_system_prompt = (
+                f"{_always_prompt}\n\n{agent.ephemeral_system_prompt}"
+                if agent.ephemeral_system_prompt
+                else _always_prompt
+            )
+    except Exception:
+        # A malformed optional skill must never prevent an agent from starting.
+        pass
     agent.session_cwd = cwd or None
     # Shared iteration budget: parent creates, children inherit.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
@@ -2449,6 +2467,17 @@ def init_agent(
     _clamp_compressor_to_ollama_num_ctx(agent)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
+
+    # Register only top-level agents.  delegate_tool registers children after
+    # assigning their stable subagent_id, so a child never briefly claims the
+    # parent's logical agmsg identity.
+    if parent_session_id is None:
+        try:
+            from tools.agmsg_bridge import register_top_level_agent
+
+            register_top_level_agent(agent)
+        except Exception:
+            pass
 
 
 __all__ = ["init_agent"]

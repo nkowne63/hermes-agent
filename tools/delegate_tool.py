@@ -200,10 +200,32 @@ def _build_child_agent(
     # as auxiliary.review.
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
-        goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
+        goal, context, workspace_path=workspace_hint, role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
     )
+    # If the parent has an active agmsg identity, give the child a stable
+    # runtime identity before it starts.  The sender-side agmsg script can
+    # then discover this child through the team's live runtime roster and push
+    # messages directly into its safe AIAgent.steer boundary.
+    _agmsg_team = getattr(parent_agent, "_agmsg_team", None)
+    _agmsg_parent_name = getattr(parent_agent, "_agmsg_agent", None)
+    _agmsg_child_name = (
+        f"{_agmsg_parent_name}-{subagent_id}"
+        if _agmsg_team and _agmsg_parent_name
+        else None
+    )
+    if _agmsg_child_name:
+        child_prompt += (
+            "\n\n## agmsg Runtime Identity\n"
+            f"You are `{_agmsg_child_name}` in team `{_agmsg_team}`.\n"
+            f"Your parent identity is `{_agmsg_parent_name}`.\n"
+            "Messages sent to this identity are pushed into your next safe "
+            "agent iteration; you do not need to poll inbox.sh for live push. "
+            "Use the agmsg scripts with these explicit team/identity values "
+            "when replying."
+        )
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
         parent_api_key = parent_agent._client_kwargs.get("api_key")
@@ -264,6 +286,17 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    try:
+        from tools.agmsg_bridge import register_child_agent
+
+        register_child_agent(
+            child,
+            parent_agent,
+            subagent_id=subagent_id,
+            project=workspace_hint or "",
+        )
+    except Exception:
+        logger.debug("agmsg child registration failed", exc_info=True)
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
