@@ -16,7 +16,8 @@ def _reset_computer_use_state():
     from tools.computer_use.tool import reset_backend_for_tests
 
     reset_backend_for_tests()
-    yield
+    with patch("tools.computer_use.cua_backend._cua_no_overlay", return_value=False):
+        yield
     reset_backend_for_tests()
 
 
@@ -175,6 +176,30 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
     assert env["CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS"] == "1"
     assert proxy_command == "/opt/cua-driver"
     assert proxy_args == ["mcp", "--embedded", "--socket", daemon.socket_path]
+
+
+def test_unrestricted_embedded_daemon_passes_no_overlay_to_server_when_enabled():
+    from tools.computer_use import cua_backend, cua_backend_daemon
+
+    process = Mock()
+    process.poll.return_value = None
+    process.stderr = []
+    status = SimpleNamespace(returncode=0, stdout="running", stderr="")
+
+    daemon = cua_backend_daemon._EmbeddedCuaDaemon("cua-driver", "unrestricted")
+    with patch.object(
+        cua_backend_driver,
+        "_resolve_mcp_invocation",
+        return_value=("/opt/cua-driver", ["mcp"]),
+    ), patch.object(cua_backend, "_cua_no_overlay", return_value=True), patch.object(
+        cua_backend_driver, "_cua_driver_supports_no_overlay", return_value=True
+    ), patch.object(cua_backend_daemon.subprocess, "Popen", return_value=process) as popen, patch.object(
+        cua_backend_daemon.subprocess, "run", return_value=status
+    ):
+        daemon.start()
+        command = popen.call_args.args[0]
+
+    assert command[-1] == "--no-overlay"
 
 
 def test_standard_backend_does_not_spawn_an_embedded_daemon():
