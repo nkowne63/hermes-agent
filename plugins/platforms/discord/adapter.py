@@ -2959,8 +2959,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def _message_reference_from_ids(message_id, channel) -> "discord.MessageReference":
         """ids-built reply reference — no fetch_message round trip. fail_if_not_exists=False
         keeps sends to deleted targets degrading to the send-side 10008 retry."""
+        channel_id = getattr(channel, "id", None)
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id is not None and str(channel_id) == str(message_id):
+            # Discord auto-threads reuse the parent message ID as the thread
+            # ID.  The source message is in the parent channel, while the
+            # response is sent to the thread, so the reference must use the
+            # parent's channel ID in this one cross-channel case.
+            channel_id = parent_id
+
         return discord.MessageReference(
-            message_id=int(message_id), channel_id=getattr(channel, "id", None),
+            message_id=int(message_id), channel_id=channel_id,
             guild_id=getattr(getattr(channel, "guild", None), "id", None), fail_if_not_exists=False,
         )
 
@@ -3241,11 +3250,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     @staticmethod
     def _is_reply_reference_rejected(err: Exception) -> bool:
-        """Discord refused the reply anchor: system-message target (50035) or deleted target (10008)."""
+        """Discord refused the reply anchor: any 50035 validation rejection (cross-channel
+        auto-thread starter, system-message target, stale channel metadata) or deleted
+        target (10008). The destination channel is still valid, so callers retry as a
+        plain send."""
         err_text = str(err)
-        return (
-            "error code: 50035" in err_text and "Cannot reply to a system message" in err_text
-        ) or "error code: 10008" in err_text
+        return "error code: 50035" in err_text or "error code: 10008" in err_text
 
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
