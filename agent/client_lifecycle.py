@@ -105,6 +105,13 @@ class ClientLifecycleMixin:
         """Release task resources without treating a shared environment as process ownership."""
         from run_agent import _quietly, cleanup_browser, cleanup_vm
 
+        try:
+            from tools.agmsg_bridge import unregister_agent
+
+            unregister_agent(self)
+        except Exception:
+            pass
+
         def kill_processes() -> None:
             from tools.process_registry import process_registry
             # A session can run several task IDs; delegated IDs also differ from session_id.

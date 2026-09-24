@@ -1438,6 +1438,10 @@ DEFAULT_CONFIG = {
         # Resolved once when the agent's prompt is first built; missing/disabled names warn and
         # skip; HERMES_IGNORE_RULES suppresses the list like the other auto-injected context.
         "auto_load": [],
+        # Full SKILL.md payloads listed here are prepended to every new agent's
+        # ephemeral system prompt, including delegate_task children.  This is
+        # explicit operator opt-in; an installed skill is not auto-executed.
+        "always_loaded": [],
         # Substitute ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} in SKILL.md content.
         "template_vars": True,
         # Pre-execute !`cmd` snippets in SKILL.md, inlining stdout (dates, git state...). Off:
