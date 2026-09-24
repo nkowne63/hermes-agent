@@ -176,7 +176,7 @@ class GatewayConfigLoadersMixin:
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         model: str = "",
     ) -> dict | None:
-        """Session ``/reasoning --session`` > per-model ``agent.reasoning_overrides`` > global.
+        """Session ``/reasoning --session`` > channel override > per-model ``agent.reasoning_overrides`` > global.
 
         ``model`` must be the session's *effective* model (session ``/model`` override included);
         empty uses ``model.default``.
@@ -186,6 +186,35 @@ class GatewayConfigLoadersMixin:
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+
+        # Channel overrides are resolved after the session-scoped setting but
+        # before model/global config. Use the same thread/parent lookup as the
+        # existing model and system-prompt channel overrides so a Discord
+        # thread inherits its parent channel's reasoning policy.
+        if source is not None:
+            channel_override = self._channel_override(
+                source.platform,
+                str(source.chat_id or ""),
+                (
+                    str(source.thread_id)
+                    if getattr(source, "thread_id", None)
+                    else None
+                ),
+                (
+                    str(source.parent_chat_id)
+                    if getattr(source, "parent_chat_id", None)
+                    else None
+                ),
+            )
+            if channel_override is not None and channel_override.reasoning_effort is not None:
+                from hermes_constants import parse_reasoning_effort
+
+                channel_reasoning = parse_reasoning_effort(
+                    channel_override.reasoning_effort
+                )
+                if channel_reasoning is not None:
+                    return channel_reasoning
+
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:

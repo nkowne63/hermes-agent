@@ -137,6 +137,77 @@ class TestSendWithReplyToMode:
         assert calls[0].kwargs.get("reference") is not None  # first chunk
         assert calls[1].kwargs.get("reference") is None      # later chunks
 
+    @pytest.mark.asyncio
+    async def test_thread_starter_reply_references_parent_channel(self):
+        """A reply to an auto-thread's parent message uses the parent channel."""
+        adapter = DiscordAdapter(
+            PlatformConfig(enabled=True, token="test-token", reply_to_mode="first")
+        )
+        channel = SimpleNamespace(
+            id=222,
+            parent_id=111,
+            guild=SimpleNamespace(id=333),
+            send=AsyncMock(return_value=SimpleNamespace(id=444)),
+        )
+        adapter._client = SimpleNamespace(get_channel=MagicMock(return_value=channel))
+        adapter.truncate_message = lambda content, max_len, **kw: ["single chunk"]
+
+        with patch(
+            "plugins.platforms.discord.adapter.discord.MessageReference",
+            side_effect=lambda **kwargs: SimpleNamespace(**kwargs),
+        ):
+            await adapter.send(
+                "111",
+                "test content",
+                reply_to="222",
+                metadata={"thread_id": "222"},
+            )
+
+        reference = channel.send.await_args.kwargs["reference"]
+        assert reference.message_id == 222
+        assert reference.channel_id == 111
+        assert reference.guild_id == 333
+
+    @pytest.mark.asyncio
+    async def test_cross_channel_reference_retries_without_reply_reference(self):
+        """An invalid Discord reference must not turn a final reply into ❌."""
+        adapter = DiscordAdapter(
+            PlatformConfig(enabled=True, token="test-token", reply_to_mode="first")
+        )
+        sent_msg = SimpleNamespace(id=445)
+        channel = SimpleNamespace(
+            id=222,
+            parent_id=None,
+            guild=SimpleNamespace(id=333),
+            send=AsyncMock(
+                side_effect=[
+                    RuntimeError(
+                        "HTTP 400 error code: 50035: "
+                        "message_reference channel_id is different from the channel_id"
+                    ),
+                    sent_msg,
+                ]
+            ),
+        )
+        adapter._client = SimpleNamespace(get_channel=MagicMock(return_value=channel))
+        adapter.truncate_message = lambda content, max_len, **kw: ["single chunk"]
+
+        with patch(
+            "plugins.platforms.discord.adapter.discord.MessageReference",
+            side_effect=lambda **kwargs: SimpleNamespace(**kwargs),
+        ):
+            result = await adapter.send(
+                "111",
+                "test content",
+                reply_to="222",
+                metadata={"thread_id": "222", "notify": True},
+            )
+
+        assert result.success is True
+        assert channel.send.await_count == 2
+        assert channel.send.await_args_list[0].kwargs["reference"] is not None
+        assert channel.send.await_args_list[1].kwargs["reference"] is None
+
 
 class TestConfigSerialization:
     """Tests for reply_to_mode serialization (shared with Telegram)."""

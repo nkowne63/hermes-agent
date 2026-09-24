@@ -154,3 +154,70 @@ class TestResolveSessionAgentRuntimePriority:
         assert runtime["provider"] == "openrouter"
 
 
+class TestResolveSessionReasoningConfigPriority:
+    def test_channel_reasoning_override_beats_global_and_per_model(self, monkeypatch):
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "food": ChannelOverride(reasoning_effort="medium"),
+                    },
+                ),
+            },
+        )
+        runner._peek_session_state = lambda _session_key: None
+        monkeypatch.setattr(
+            GatewayRunner,
+            "_load_reasoning_config",
+            staticmethod(lambda _model="": {"enabled": True, "effort": "max"}),
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="food",
+            user_id="u1",
+        )
+
+        result = runner._resolve_session_reasoning_config(
+            source=source,
+            session_key="agent:main:discord:group:food",
+            model="gpt-5.6-luna",
+        )
+
+        assert result == {"enabled": True, "effort": "medium"}
+
+    def test_session_reasoning_override_beats_channel_override(self):
+        from types import SimpleNamespace
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "food": ChannelOverride(reasoning_effort="medium"),
+                    },
+                ),
+            },
+        )
+        runner._peek_session_state = lambda _session_key: SimpleNamespace(
+            conversation=SimpleNamespace(
+                reasoning_override={"enabled": True, "effort": "low"},
+            ),
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="food",
+            user_id="u1",
+        )
+
+        result = runner._resolve_session_reasoning_config(
+            source=source,
+            session_key="agent:main:discord:group:food",
+            model="gpt-5.6-luna",
+        )
+
+        assert result == {"enabled": True, "effort": "low"}
+
+

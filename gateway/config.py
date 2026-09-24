@@ -384,10 +384,13 @@ class SessionResetPolicy:
 
 @dataclass
 class ChannelOverride:
-    """Per-channel model/provider/system_prompt override (``platforms.<name>.channel_overrides[channel_id]``)."""
+    """Per-channel model/provider/system_prompt/reasoning_effort override (``platforms.<name>.channel_overrides[channel_id]``)."""
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
+    # Raw value is preserved here so YAML ``false`` can explicitly disable
+    # reasoning, while the gateway resolves it through parse_reasoning_effort.
+    reasoning_effort: Any = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
