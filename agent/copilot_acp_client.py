@@ -290,13 +290,25 @@ class CopilotACPClient:
     def __init__(
         self, *, api_key: str | None = None, base_url: str | None = None, default_headers: dict[str, str] | None = None,
         acp_command: str | None = None, acp_args: list[str] | None = None, acp_cwd: str | None = None, command: str | None = None,
-        args: list[str] | None = None, **_: Any,
+        args: list[str] | None = None, extra_env: dict[str, str] | None = None, model_env_var: str = "",
+        model_env_skip: tuple = (), model_env_normalize: Any = None, acp_settings: dict[str, Any] | None = None, **_: Any,
     ):
         self.api_key, self.base_url = api_key or "copilot-acp", base_url or ACP_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        # Provider-supplied env merged into every spawned subprocess (e.g. Devin's
+        # DEVIN_REASONING_EFFORT from ``acp.devin`` config); ``model_env_var`` names the
+        # env var the CLI reads its model from (DEVIN_MODEL / ANTHROPIC_MODEL), set per
+        # spawn from the requested model unless it is one of ``model_env_skip``.
+        self._extra_env = dict(extra_env or {})
+        self._model_env_var = str(model_env_var or "").strip()
+        self._model_env_skip = {str(v).strip().lower() for v in model_env_skip or ()}
+        self._model_env_normalize = model_env_normalize if callable(model_env_normalize) else None
+        # The provider's ``acp.<name>`` config section, stored for consumers the minimal
+        # port does not ship yet (tool restriction / MCP bridge).
+        self.acp_settings = dict(acp_settings or {})
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False
         # Clients are cached and shared across concurrent callers (auxiliary tasks, async
@@ -305,6 +317,19 @@ class CopilotACPClient:
         # while its own leaked.
         self._active_processes: set[subprocess.Popen[str]] = set()
         self._active_process_lock = threading.Lock()
+
+    def _subprocess_env(self, model: str | None = None) -> dict[str, str]:
+        env = _build_subprocess_env()
+        env.update(self._extra_env)
+        model_value = str(model or "").strip()
+        if self._model_env_var and model_value and model_value.lower() not in self._model_env_skip:
+            if self._model_env_normalize is not None:
+                try:
+                    model_value = str(self._model_env_normalize(model_value) or model_value)
+                except Exception:
+                    pass
+            env[self._model_env_var] = model_value
+        return env
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen[str]) -> None:
@@ -350,7 +375,7 @@ class CopilotACPClient:
         )
         return _completion_to_stream_chunks(completion) if stream else completion
 
-    def _spawn(self) -> subprocess.Popen[str]:
+    def _spawn(self, model: str | None = None) -> subprocess.Popen[str]:
         # Fast-fail when the CLI rejects --acp (else the parent waits the full child timeout for stdout that
         # never arrives). ``None`` falls through to the spawn's established start error.
         if _acp_supported(self._acp_command, self._acp_args) is False:
@@ -368,7 +393,7 @@ class CopilotACPClient:
             # pipes stay intact for the ACP wire.
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8', errors='replace', bufsize=1, cwd=self._acp_cwd, env=_build_subprocess_env(),
+                text=True, encoding='utf-8', errors='replace', bufsize=1, cwd=self._acp_cwd, env=self._subprocess_env(model),
                 creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as exc:
@@ -384,10 +409,10 @@ class CopilotACPClient:
 
     @contextlib.contextmanager
     def _session(
-        self, timeout_seconds: float, *, allow_file_requests: bool = True
+        self, timeout_seconds: float, *, allow_file_requests: bool = True, model: str | None = None
     ) -> Iterator[tuple[dict[str, Any], Callable[..., Any]]]:
         """Start one ACP process and yield its ``session/new`` result plus request callable."""
-        proc = self._spawn()
+        proc = self._spawn(model)
         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)
 
@@ -453,9 +478,9 @@ class CopilotACPClient:
         # The CLI's `--model` spawn flag is deliberately NOT used: `copilot --acp` validates it (unknown id
         # aborts the spawn) but ignores it for the session; the model is applied after session/new instead.
         requested_model = str(model or "").strip()
-        with self._session(timeout_seconds) as (session, _request):
+        with self._session(timeout_seconds, model=requested_model or None) as (session, _request):
             session_id = str(session.get("sessionId") or "").strip()
-            if requested_model and requested_model != "copilot-acp":
+            if requested_model and requested_model != "copilot-acp" and not self._model_env_var:
                 try:
                     if (selection := _model_selection_request(session, requested_model)) is not None:
                         _request(*selection)

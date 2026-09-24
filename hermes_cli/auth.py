@@ -95,7 +95,8 @@ from hermes_cli.auth_constants import (  # noqa: F401  re-exported
     DEFAULT_XAI_OAUTH_BASE_URL, MINIMAX_OAUTH_CLIENT_ID, MINIMAX_OAUTH_SCOPE,
     MINIMAX_OAUTH_GLOBAL_BASE, MINIMAX_OAUTH_CN_BASE, MINIMAX_OAUTH_GLOBAL_INFERENCE,
     MINIMAX_OAUTH_CN_INFERENCE, MINIMAX_OAUTH_REFRESH_SKEW_SECONDS, DEFAULT_QWEN_BASE_URL,
-    DEFAULT_GITHUB_MODELS_BASE_URL, DEFAULT_COPILOT_ACP_BASE_URL, DEFAULT_OLLAMA_CLOUD_BASE_URL,
+    DEFAULT_GITHUB_MODELS_BASE_URL, DEFAULT_COPILOT_ACP_BASE_URL, DEFAULT_DEVIN_ACP_BASE_URL,
+    DEFAULT_CLAUDE_ACP_BASE_URL, DEFAULT_OLLAMA_CLOUD_BASE_URL,
     DEFAULT_ACTUAL_BASE_URL, DEFAULT_ACTUAL_LOCAL_BASE_URL, STEPFUN_STEP_PLAN_INTL_BASE_URL,
     STEPFUN_STEP_PLAN_CN_BASE_URL, CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL,
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_SCOPE,
@@ -187,6 +188,12 @@ _REGISTRY_ROWS: Tuple[Any, ...] = (
     ProviderConfig(
         "copilot-acp", "GitHub Copilot ACP", "external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL, base_url_env_var="COPILOT_ACP_BASE_URL"),
+    ProviderConfig(
+        "devin-acp", "Devin ACP", "external_process",
+        inference_base_url=DEFAULT_DEVIN_ACP_BASE_URL, base_url_env_var="DEVIN_ACP_BASE_URL"),
+    ProviderConfig(
+        "claude-acp", "Claude ACP", "external_process",
+        inference_base_url=DEFAULT_CLAUDE_ACP_BASE_URL, base_url_env_var="CLAUDE_ACP_BASE_URL"),
     ("gemini", "Google AI Studio", "https://generativelanguage.googleapis.com/v1beta",
      ("GOOGLE_API_KEY", "GEMINI_API_KEY"), "GEMINI_BASE_URL"),
     ("zai", "Z.AI / GLM", "https://api.z.ai/api/paas/v4",
@@ -1383,6 +1390,8 @@ _PROVIDER_ALIASES: Dict[str, str] = {
     "github": "copilot", "github-copilot": "copilot",
     "github-models": "copilot", "github-model": "copilot",
     "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
+    "devin": "devin-acp", "devin-acp-agent": "devin-acp",
+    "claude-agent-acp": "claude-acp", "anthropic-acp": "claude-acp",
     "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
     "opencode": "opencode-zen", "zen": "opencode-zen",
     "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
