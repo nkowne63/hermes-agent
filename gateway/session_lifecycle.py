@@ -1,4 +1,5 @@
-"""SessionStore explicit suspension, crash-recovery markers, pruning and shared clock/id helpers."""
+"""SessionStore reset policy (idle/daily suspend + routing-time reset), explicit suspension,
+crash-recovery markers, pruning and shared clock/id helpers."""
 
 from __future__ import annotations
 
@@ -56,7 +57,59 @@ def auto_continue_freshness_window() -> float:
 
 
 class SessionLifecycleMixin:
-    """SessionStore explicit boundaries and crash-recovery markers."""
+    """SessionStore reset policy, explicit boundaries and crash-recovery markers."""
+
+    @staticmethod
+    def _policy_reset_reason(policy, updated_at: datetime) -> Optional[str]:
+        """Return "idle"/"daily" when *updated_at* is overdue under *policy*, else None."""
+        if policy.mode == "none":
+            return None
+        now = _now()
+        if policy.mode in {"idle", "both"} and now > updated_at + timedelta(minutes=policy.idle_minutes):
+            return "idle"
+        if policy.mode in {"daily", "both"}:
+            today_reset = now.replace(hour=policy.at_hour, minute=0, second=0, microsecond=0)
+            if now.hour < policy.at_hour:
+                today_reset -= timedelta(days=1)
+            if updated_at < today_reset:
+                return "daily"
+        return None
+
+    def _should_reset(self, entry: "SessionEntry") -> Optional[str]:
+        """Reset reason ("idle"/"daily") if policy says reset, else None; sessions with active
+        background processes are never reset."""
+        if self._has_active_processes_safe(entry.session_key, context="reset"):
+            logger.debug("Session reset skipped for %s — active background processes", entry.session_key)
+            return None
+        policy = self.config.get_reset_policy(platform=entry.platform, session_type=entry.chat_type)
+        return self._policy_reset_reason(policy, entry.updated_at)
+
+    def suspend_due_sessions(self) -> int:
+        """Suspend every session whose reset policy is overdue so the next inbound message starts
+        fresh (``suspended`` boundary). The routing-time ``_should_reset`` check covers the gap
+        between the boundary and this sweep; suspending early only makes the boundary durable and
+        the reason uniform. Returns the number newly suspended."""
+        policy = self.config.default_reset_policy
+        if policy.mode == "none" and not self.config.reset_by_type and not self.config.reset_by_platform:
+            return 0
+        with self._lock:
+            self._ensure_loaded_locked()
+            entries = list(self._entries.values())
+        # Policy evaluation (process-registry probe) stays outside ``_lock``.
+        due_keys = {
+            entry.session_key for entry in entries
+            if not entry.suspended and self._should_reset(entry)
+        }
+        if not due_keys:
+            return 0
+
+        def _suspend(entry: "SessionEntry") -> bool:
+            if entry.session_key in due_keys and not entry.suspended:
+                entry.suspended = True
+                return True
+            return False
+
+        return self._update_all_entries_locked(_suspend)
 
     def _is_session_ended_in_db(self, session_id: str) -> bool:
         """True iff state.db has this session with a non-null end_reason (same staleness test as
@@ -81,9 +134,11 @@ class SessionLifecycleMixin:
             return False
         return bool(row is not None and row.get("end_reason") is not None)
 
-    def _route_reset_reason(self, entry: SessionEntry) -> Optional[str]:
-        """Only explicit suspension replaces a routed conversation; time never does."""
-        return "suspended" if entry.suspended else None
+    def _route_reset_reason(self, entry: "SessionEntry") -> Optional[str]:
+        """``suspended`` always resets; otherwise the reset policy decides."""
+        if entry.suspended:
+            return "suspended"
+        return self._should_reset(entry)
 
     def _update_entry(self, session_key: str, mutate) -> bool:
         """Apply ``mutate(entry)`` under ``_lock`` and full-save; False when the entry is missing

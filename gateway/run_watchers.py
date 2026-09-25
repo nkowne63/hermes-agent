@@ -48,7 +48,7 @@ class GatewaySessionWatchersMixin:
             await _interruptible_sleep(self, interval)
 
     async def _session_housekeeping(self) -> None:
-        """Idle/pressure agent-cache sweeps plus the hourly SessionStore prune."""
+        """Idle/pressure agent-cache sweeps, reset-policy suspension, and the hourly SessionStore prune."""
         try:
             if evicted := self._sweep_idle_cached_agents():
                 logger.info("Agent cache idle sweep: evicted %d agent(s)", evicted)
@@ -63,6 +63,13 @@ class GatewaySessionWatchersMixin:
             self._sweep_agent_cache_under_pressure()
         except Exception as e:
             logger.debug("Agent cache pressure sweep failed: %s", e)
+        # Suspend sessions overdue under session_reset (idle/daily): the next inbound message then
+        # starts a fresh session. Routing-time _should_reset covers the boundary-to-sweep gap.
+        try:
+            if suspended := await self.async_session_store.suspend_due_sessions():
+                logger.info("Session reset policy: suspended %d overdue session(s)", suspended)
+        except Exception as e:
+            logger.debug("Session reset suspend sweep failed: %s", e)
         # Prune stale SessionStore entries: the dict + sessions.json otherwise grow unbounded.
         prune_ts = getattr(self, "_last_session_store_prune_ts", 0.0)  # tests may omit
         if time.time() - prune_ts > _SESSION_STORE_PRUNE_INTERVAL:

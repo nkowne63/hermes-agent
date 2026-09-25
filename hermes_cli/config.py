@@ -978,7 +978,7 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "known_builtin_toolsets",  # ditto — builtin toolsets a platform's checklist has offered
     "tool_gateway_declined_tools",  # per-tool Tool Gateway offer declines
     # Top-level forms read/bridged by gateway/config.py:
-    "group_sessions_per_user", "thread_sessions_per_user",
+    "session_reset", "group_sessions_per_user", "thread_sessions_per_user",
     "stt_echo_transcripts", "reset_triggers", "always_log_local", "filter_silence_narration",
     "multiplex_profiles", "profile_routes", "platforms", "require_mention",
     "unauthorized_dm_behavior", "signal", "allow_all_users",

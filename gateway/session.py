@@ -1015,6 +1015,10 @@ class SessionStore(
         recovered = self._query_recoverable_session(session_key=session_key, source=source, now=now)
         if recovered is None:
             return
+        reset_reason = self._should_reset(recovered)
+        if reset_reason:
+            decision.schedule_reset(reset_reason, recovered, recovered.reset_had_activity)
+            return
         self._reopen_session_row(session_key, recovered.session_id)
         with self._lock:
             decision.entry = self._entries.setdefault(session_key, recovered)
