@@ -4719,7 +4719,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         channel_id = str(interaction.channel_id)
         return MessageEvent(
             text=text, message_type=msg_type, source=source, raw_message=interaction,
-            channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+            channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None, interaction.channel),
         )
 
     # --- Thread creation helpers ---
@@ -4776,7 +4776,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             guild_id=self._interaction_guild_id(interaction), parent_chat_id=_parent_id or None,
         )
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
-        _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None)
+        _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None, _chan)
         event = MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, raw_message=interaction,
             auto_skill=_skills, channel_prompt=_channel_prompt,
@@ -4794,10 +4794,54 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         from gateway.platforms.base import resolve_channel_skills
         return resolve_channel_skills(self.config.extra, channel_id, parent_id)
 
-    def _resolve_channel_prompt(self, channel_id: str, parent_id: str | None = None) -> str | None:
-        """Resolve a Discord per-channel prompt, preferring the exact channel over its parent."""
+    def _resolve_channel_prompt(
+        self, channel_id: str, parent_id: str | None = None, channel: Any = None,
+    ) -> str | None:
+        """Resolve a Discord per-channel prompt, preferring the exact channel over its parent.
+
+        When ``description_as_prompt`` is on for this scope (see ``_channel_description_prompt``),
+        the channel description (topic) is prepended as an instruction section, ahead of the configured
+        ``channel_prompts`` text so explicit config keeps the last word.
+        """
         from gateway.platforms.base import resolve_channel_prompt
-        return resolve_channel_prompt(self.config.extra, channel_id, parent_id)
+        configured = resolve_channel_prompt(self.config.extra, channel_id, parent_id)
+        description = self._channel_description_prompt(channel_id, parent_id, channel)
+        return "\n\n".join(part for part in (description, configured) if part) or None
+
+    def _channel_description_prompt(
+        self, channel_id: str, parent_id: str | None, channel: Any = None,
+    ) -> str | None:
+        """Channel description as a prompt section, or None when disabled/absent.
+
+        Enabled per scope via ``description_as_prompt`` in ``channel_defaults`` / ``category_defaults`` /
+        ``guild_defaults`` (channel > category > guild), else the global ``channel_description_as_prompt``.
+        Threads inherit the description of their parent channel (text channel topic or forum guidelines).
+        Without a *channel* object (voice path passes only ids) the channel is looked up in the client cache.
+        """
+        if channel is None and self._client is not None:
+            with suppress(Exception):
+                channel = self._client.get_channel(int(channel_id))
+        if channel is None:
+            return None
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        if not self._discord_default_bool(
+            "description_as_prompt",
+            channel_id=channel_id,
+            parent_channel_id=parent_id,
+            category_id=self._get_category_id(channel),
+            guild_id=str(guild_id) if guild_id is not None else None,
+            fallback=self._discord_bool(self.config.extra.get("channel_description_as_prompt", False)),
+        ):
+            return None
+        topic = getattr(channel, "topic", None) or getattr(getattr(channel, "parent", None), "topic", None)
+        topic = str(topic).strip() if topic else ""
+        if not topic:
+            return None
+        return (
+            "## Channel Description\n\n"
+            "The following is this Discord channel's description. Treat it as standing instructions "
+            f"for this channel.\n\n{topic}"
+        )
 
     def _extra_or_env_flag(self, key: str, env_key: str, env_default: str, *, truthy: bool) -> bool:
         """Boolean: explicit scoped ``env_key`` → ``config.extra[key]`` (str parsed permissively) →
@@ -6266,7 +6310,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
-        _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
+        _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None, _chan)
         reply_to_id = None
         reply_to_text = None
         if message.reference:

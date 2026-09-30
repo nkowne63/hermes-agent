@@ -526,6 +526,25 @@ Behavior:
 - If a message arrives inside a thread or forum post and that thread has no explicit entry, Hermes falls back to the parent channel/forum ID.
 - Prompts are applied ephemerally at runtime, so changing them affects future turns immediately without rewriting past session history.
 
+#### `discord.channel_description_as_prompt`
+
+**Type:** boolean — **Default:** `false`
+
+When on, the Discord channel description (topic) is injected on every turn as a standing-instruction section (`## Channel Description`), ahead of any `channel_prompts` text. Threads use their parent channel's description. Like `channel_prompts`, it is ephemeral and never written to the transcript. Anyone who can edit the channel description can therefore instruct the agent in that channel — enable it only where that is acceptable.
+
+Override per scope with `description_as_prompt` in `channel_defaults` / `category_defaults` / `guild_defaults`. Precedence: channel (thread, then parent channel) > category > guild > the global flag:
+
+```yaml
+discord:
+  channel_description_as_prompt: false
+  category_defaults:
+    "1111111111":                    # every channel in this category
+      description_as_prompt: true
+  channel_defaults:
+    "2222222222":                    # ...except this one
+      description_as_prompt: false
+```
+
 #### `discord.history_backfill`
 
 **Type:** boolean — **Default:** `true`
