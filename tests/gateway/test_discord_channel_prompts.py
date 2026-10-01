@@ -63,6 +63,7 @@ def _make_adapter():
     adapter = object.__new__(DiscordAdapter)
     adapter.config = MagicMock()
     adapter.config.extra = {}
+    adapter._client = None
     return adapter
 
 
@@ -101,6 +102,12 @@ def _make_source() -> SessionSource:
     )
 
 
+def _channel(channel_id, topic, category_id=None, parent=None):
+    return SimpleNamespace(
+        id=int(channel_id), topic=topic, category_id=category_id, parent=parent, guild=SimpleNamespace(id=1),
+    )
+
+
 class TestResolveChannelPrompts:
     def test_no_prompt_returns_none(self):
         adapter = _make_adapter()
@@ -110,6 +117,55 @@ class TestResolveChannelPrompts:
         adapter = _make_adapter()
         adapter.config.extra = {"channel_prompts": {"100": "Research mode"}}
         assert adapter._resolve_channel_prompt("100") == "Research mode"
+
+    def test_description_off_by_default(self):
+        adapter = _make_adapter()
+        assert adapter._resolve_channel_prompt("100", None, _channel("100", topic="Be terse")) is None
+
+    def test_global_flag_prepends_description_before_configured_prompt(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_description_as_prompt": True, "channel_prompts": {"100": "Research mode"},
+        }
+        prompt = adapter._resolve_channel_prompt("100", None, _channel("100", topic="Be terse"))
+        assert "Be terse" in prompt
+        assert prompt.index("Be terse") < prompt.index("Research mode")
+
+    def test_category_on_channel_override_off(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "category_defaults": {"9": {"description_as_prompt": True}},
+            "channel_defaults": {"101": {"description_as_prompt": False}},
+        }
+        assert "Alpha" in adapter._resolve_channel_prompt("100", None, _channel("100", "Alpha", category_id=9))
+        assert adapter._resolve_channel_prompt("101", None, _channel("101", "Beta", category_id=9)) is None
+        assert adapter._resolve_channel_prompt("102", None, _channel("102", "Gamma", category_id=8)) is None
+
+    def test_channel_on_overrides_global_off_and_category_off(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "category_defaults": {"9": {"description_as_prompt": False}},
+            "channel_defaults": {"100": {"description_as_prompt": True}},
+        }
+        assert "Alpha" in adapter._resolve_channel_prompt("100", None, _channel("100", "Alpha", category_id=9))
+
+    def test_thread_uses_parent_topic_and_parent_override(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_defaults": {"100": {"description_as_prompt": True}}}
+        parent = _channel("100", "Parent topic")
+        thread = _channel("555", None, parent=parent)
+        assert "Parent topic" in adapter._resolve_channel_prompt("555", "100", thread)
+
+    def test_blank_topic_yields_nothing(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_description_as_prompt": True}
+        assert adapter._resolve_channel_prompt("100", None, _channel("100", "   ")) is None
+
+    def test_channel_looked_up_from_client_when_not_given(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_description_as_prompt": True}
+        adapter._client = SimpleNamespace(get_channel=lambda cid: _channel(str(cid), "From cache"))
+        assert "From cache" in adapter._resolve_channel_prompt("100")
 
 
 
