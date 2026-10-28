@@ -376,7 +376,10 @@ discord:
   free_response_auto_thread: false # If true, free_response_channels also auto-thread (default: inline)
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
-  no_thread_channels: []          # Channel IDs where bot responds without threading
+  no_thread_channels: []          # Channel (or category) IDs where bot responds without threading
+  guild_defaults: {}              # Per-guild require_mention / thread_response
+  category_defaults: {}           # Per-category require_mention / thread_response
+  channel_defaults: {}            # Per-channel require_mention / thread_response
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
   history_backfill_limit: 50      # Max messages to scan backwards (default: 50)
   missed_message_backfill:        # Replay messages missed while disconnected (opt-in)
@@ -512,7 +515,28 @@ discord:
     - 1234567890  # Bot responds inline here
 ```
 
-Useful for channels dedicated to bot interaction where threads would add unnecessary noise.
+Useful for channels dedicated to bot interaction where threads would add unnecessary noise. A category ID also works: every channel in that category then replies inline.
+
+#### `discord.guild_defaults`, `discord.category_defaults`, `discord.channel_defaults`
+
+**Type:** mapping of ID → `{require_mention, thread_response}` — **Default:** `{}`
+
+Scope `require_mention` and auto-threading to a server, a channel category, or a single channel. The most specific rule wins: `channel_defaults` > `category_defaults` > `guild_defaults` > the global `discord.require_mention` (for `thread_response`, auto-threading stays on when no rule sets it). A thread follows its own `channel_defaults` entry, then its parent channel's, then the parent's category.
+
+```yaml
+discord:
+  require_mention: true
+  guild_defaults:
+    "111111111111111111": { require_mention: true, thread_response: true }
+  category_defaults:
+    "222222222222222222": { require_mention: false, thread_response: true }  # no mention, still threads
+  channel_defaults:
+    "333333333333333333": { require_mention: true }                          # beats the category rule
+```
+
+- `require_mention: false` lets a scope answer without an `@mention` (and admits messages that mention someone else, like a free-response channel). `free_response_channels`, voice-linked channels and threads the bot already joined never need a mention, whatever a scoped rule says.
+- `thread_response: false` replies inline instead of auto-creating a thread. `thread_response: true` never overrides `no_thread_channels`, a free-response channel's inline default, or `auto_thread: false`.
+- `ignored_channels` and `allowed_channels` are checked first and still win.
 
 #### `discord.channel_prompts`
 

@@ -1738,7 +1738,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                         parent_id = str(message.channel.parent_id)
                     free_channels = self._discord_free_response_channels()
                     channel_keys = self._discord_channel_keys(message, parent_id)
-                    if "*" not in free_channels and not (channel_keys & free_channels):
+                    # A scoped ``require_mention: false`` rule marks the channel free-response the
+                    # same way ``free_response_channels`` does; the global flag keeps its old shape.
+                    scoped_free = self._discord_scoped_flag(message, "require_mention") is False
+                    if not scoped_free and "*" not in free_channels and not (channel_keys & free_channels):
                         # Every other silent return in this function is at least guessable from
                         # the outside; this one is not, and an operator seeing no log line cannot
                         # tell it apart from the gateway never receiving the event.
@@ -2565,7 +2568,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             channel_keys = self._discord_channel_keys(message, parent_id)
             free_channels = self._discord_free_response_channels()
             if (
-                self._discord_require_mention()
+                self._discord_effective_require_mention(message)
                 and "*" not in free_channels
                 and not (channel_keys & free_channels)
                 and not self._in_bot_thread(message)
@@ -4948,6 +4951,51 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         """Return whether Discord channel messages require a bot mention."""
         return self._extra_or_env_flag("require_mention", "DISCORD_REQUIRE_MENTION", "true", truthy=False)
 
+    # Most specific scope first; a thread inherits its parent channel's rule (and, through the
+    # parent, the category's), so ``channel_defaults`` lists the thread then the parent.
+    _DISCORD_DEFAULT_SCOPES = ("channel_defaults", "category_defaults", "guild_defaults")
+
+    def _discord_scoped_flag(self, message: Any, key: str) -> Optional[bool]:
+        """``key`` from ``channel_defaults`` > ``category_defaults`` > ``guild_defaults``; None = no rule.
+
+        Each section maps an ID to a dict of overrides (``require_mention``, ``thread_response``).
+        IDs are compared as strings, so unquoted YAML integer keys work too."""
+        extra = getattr(self.config, "extra", None)
+        if not isinstance(extra, dict):
+            return None
+        channel = getattr(message, "channel", None)
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        scope_ids = {
+            "channel_defaults": (getattr(channel, "id", None), self._get_parent_channel_id(channel)),
+            "category_defaults": (self._get_category_id(channel),),
+            "guild_defaults": (getattr(guild, "id", None),),
+        }
+        for section_name in self._DISCORD_DEFAULT_SCOPES:
+            section = extra.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            rules = {str(rule_id).strip(): rule for rule_id, rule in section.items()}
+            for raw_id in scope_ids[section_name]:
+                if raw_id is None:
+                    continue
+                rule = rules.get(str(raw_id))
+                if isinstance(rule, dict) and rule.get(key) is not None:
+                    value = rule[key]
+                    if isinstance(value, bool):
+                        return value
+                    return str(value).strip().lower() in {"true", "1", "yes", "on"}
+        return None
+
+    def _discord_effective_require_mention(self, message: Any) -> bool:
+        """Scoped ``require_mention`` (channel > category > guild) over the global flag."""
+        scoped = self._discord_scoped_flag(message, "require_mention")
+        return self._discord_require_mention() if scoped is None else scoped
+
+    def _discord_effective_thread_response(self, message: Any) -> bool:
+        """Scoped ``thread_response`` (channel > category > guild); auto-threading allowed by default."""
+        scoped = self._discord_scoped_flag(message, "thread_response")
+        return True if scoped is None else scoped
+
     def _discord_free_response_auto_thread(self) -> bool:
         """Free-response channels also auto-thread when opted in; default replies inline."""
         return self._extra_or_env_flag(
@@ -5890,6 +5938,18 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             return str(parent_id)
         return None
 
+    def _get_category_id(self, channel: Any) -> Optional[str]:
+        """Return the category ID of a channel, or of a thread's parent channel, if known."""
+        for candidate in (channel, getattr(channel, "parent", None)):
+            if candidate is None:
+                continue
+            category_id = getattr(candidate, "category_id", None)
+            if category_id is None:
+                category_id = getattr(getattr(candidate, "category", None), "id", None)
+            if category_id is not None:
+                return str(category_id)
+        return None
+
     def _is_forum_parent(self, channel: Any) -> bool:
         """Best-effort check for whether a Discord channel is a forum channel."""
         if channel is None:
@@ -6117,6 +6177,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
         #   discord.free_response_auto_thread: Free-response channels also auto-thread (default: false)
+        #   discord.{channel,category,guild}_defaults: {<id>: {require_mention, thread_response}}
+        #     per-scope overrides (channel > category > guild > global); free-response channels,
+        #     voice-linked channels and bot threads still skip the mention, and a scoped
+        #     thread_response: true never overrides no_thread_channels / free-response inline replies.
         thread_id = None
         parent_channel_id = None
         is_thread = isinstance(message.channel, discord.Thread)
@@ -6159,7 +6223,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_keys)
                 return False
             free_channels = self._discord_free_response_channels()
-            require_mention = self._discord_require_mention()
+            require_mention = self._discord_effective_require_mention(message)
             # Voice-linked text channel is free-response while voice is active (exact channel only).
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
             current_channel_id = str(message.channel.id)
@@ -6182,8 +6246,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
             # Voice-linked and reply exclusions live in the auto-thread gate below, not in skip_thread.
-            skip_thread = bool(channel_keys & no_thread_channels) or (
-                is_free_channel and not self._discord_free_response_auto_thread()
+            # no_thread_channels also matches the channel's category; a scoped thread_response: false
+            # (channel > category > guild) opts out, but thread_response: true never overrides an exclusion.
+            category_id = self._get_category_id(message.channel)
+            no_thread_keys = channel_keys | ({category_id} if category_id else set())
+            skip_thread = (
+                bool(no_thread_keys & no_thread_channels)
+                or (is_free_channel and not self._discord_free_response_auto_thread())
+                or not self._discord_effective_thread_response(message)
             )
             auto_thread = self._extra_or_env_flag("auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True)
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
