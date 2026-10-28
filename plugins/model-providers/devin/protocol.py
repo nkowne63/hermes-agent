@@ -37,7 +37,7 @@ class F:
 
     no: int
     kind: str  # string | bytes | bool | uint | int | double | float | message | map
-    schema: Optional[Mapping[str, "F"]] = None
+    schema: Optional[Mapping[str, F]] = None
     repeated: bool = False
 
 

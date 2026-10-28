@@ -240,7 +240,7 @@ def test_streaming_turn_maps_history_and_streams_openai_chunks():
         model="swe-1-6", messages=HISTORY, tools=TOOLS, stream=True, extra_body={"devin_cascade_id": "cascade-1"}))
 
     assert fake.paths() == [wire.GET_USER_JWT_PATH, wire.GET_CHAT_MESSAGE_PATH]
-    chat_url = [r for p, r in fake.calls if p == wire.GET_CHAT_MESSAGE_PATH][0].url
+    chat_url = next(r for p, r in fake.calls if p == wire.GET_CHAT_MESSAGE_PATH).url
     assert str(chat_url).startswith("https://chat.example/")  # GetUserJwt's custom_api_server_url wins
     auth_meta = wire.decode(wire.GET_USER_JWT_REQUEST, fake.calls[0][1].content)["metadata"]
     assert auth_meta["api_key"] == f"devin-session-token${SESSION_JWT}" and auth_meta["ide_name"] == "devin-cli"
@@ -309,7 +309,7 @@ def test_router_model_is_assigned_before_chat_and_gemini_schemas_are_normalized(
     response = _client(fake).chat.completions.create(model="adaptive", messages=HISTORY, tools=TOOLS)
     assert response.choices[0].message.content == "ok" and response.choices[0].finish_reason == "stop"
     assert fake.paths() == [wire.GET_USER_JWT_PATH, wire.ASSIGN_MODEL_PATH, wire.GET_CHAT_MESSAGE_PATH]
-    assign = wire.decode(wire.ASSIGN_MODEL_REQUEST, [r for p, r in fake.calls if p == wire.ASSIGN_MODEL_PATH][0].content)
+    assign = wire.decode(wire.ASSIGN_MODEL_REQUEST, next(r for p, r in fake.calls if p == wire.ASSIGN_MODEL_PATH).content)
     assert assign["model_router_uid"] == "adaptive" and assign["chat_message_prompt"]["prompt"] == "thanks"
     assert "message_id" not in assign["chat_message_prompt"]
     req = fake.chat_request()
@@ -322,7 +322,7 @@ def test_router_model_is_assigned_before_chat_and_gemini_schemas_are_normalized(
 def test_large_request_is_gzip_framed():
     fake = FakeCascade(_frames({"delta_text": "ok"}))
     _client(fake).chat.completions.create(model="swe-1-6", messages=[{"role": "user", "content": "x" * 5000}])
-    chat = [r for p, r in fake.calls if p == wire.GET_CHAT_MESSAGE_PATH][0]
+    chat = next(r for p, r in fake.calls if p == wire.GET_CHAT_MESSAGE_PATH)
     assert chat.headers["connect-content-encoding"] == "gzip" and chat.content[0] == wire.FLAG_COMPRESSED
     assert fake.chat_request()["chat_message_prompts"][0]["prompt"] == "x" * 5000
 

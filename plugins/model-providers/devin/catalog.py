@@ -57,7 +57,7 @@ def _cost(config: dict[str, Any]) -> dict[str, float]:
             break
         if dimension.get("kind") not in wire.COST_KINDS or label not in labels:
             continue
-        match = re.match(r"\s*(\d+(?:\.\d+)?)\s*([kmb])?", str(dimension.get("denominator") or ""), re.I)
+        match = re.match(r"\s*(\d+(?:\.\d+)?)\s*([kmb])?", str(dimension.get("denominator") or ""), re.IGNORECASE)
         tokens = 1_000_000.0
         if match:
             scale = {"k": 1e3, "m": 1e6, "b": 1e9}.get((match.group(2) or "").lower(), 1.0)

@@ -143,7 +143,7 @@ def _message_id(cascade_id: str, index: int, role: str) -> str:
 
 
 def _image(url: str) -> Optional[dict[str, str]]:
-    match = re.match(r"data:([^;,]+);base64,(.*)$", url or "", re.S)
+    match = re.match(r"data:([^;,]+);base64,(.*)$", url or "", re.DOTALL)
     return {"base64_data": match.group(2), "mime_type": match.group(1)} if match else None
 
 
@@ -411,13 +411,13 @@ class DevinClient:
         with contextlib.suppress(Exception):
             self._http.close()
 
-    def __enter__(self) -> "DevinClient":
+    def __enter__(self) -> DevinClient:
         return self
 
-    def __exit__(self, *_: Any) -> None:
+    def __exit__(self, *_: object) -> None:
         self.close()
 
-    def as_async_client(self) -> "AsyncDevinClient":
+    def as_async_client(self) -> AsyncDevinClient:
         return AsyncDevinClient(self)
 
     # ── unary RPCs ──
@@ -560,7 +560,7 @@ class DevinClient:
         if code == "unauthenticated":
             self._forget_auth()
         if not produced and code == "invalid_argument" and re.search(r"\binternal error\b", str(error.details.get("message")),
-                                                                      re.I):
+                                                                      re.IGNORECASE):
             # Only the history can be compacted: the active user turn and the system prompt/tools stay.
             history = request["chat_message_prompts"]
             if history and history[-1]["source"] == wire.SOURCE_USER:
