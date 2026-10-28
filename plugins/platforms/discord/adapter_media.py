@@ -318,6 +318,10 @@ class DiscordMediaMixin:
                 }
                 if reference is not None:
                     payload_data["message_reference"] = {"message_id": str(reply_to), "fail_if_not_exists": False}
+                    # Same channel as the MessageReference: an auto-thread starter lives in the parent.
+                    reference_channel_id = self._reply_reference_channel_id(reply_to, channel)
+                    if reference_channel_id is not None:
+                        payload_data["message_reference"]["channel_id"] = str(reference_channel_id)
                 form = [
                     {"name": "payload_json", "value": json.dumps(payload_data)},
                     {

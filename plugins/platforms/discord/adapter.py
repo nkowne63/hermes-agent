@@ -3204,12 +3204,27 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
-    @staticmethod
-    def _message_reference_from_ids(message_id, channel) -> discord.MessageReference:
+    def _reply_reference_channel_id(self, message_id, channel) -> Any:
+        """Channel that holds ``message_id`` for a reply sent into ``channel``: the send target, except
+        a thread started from a text-channel message. Discord gives that thread the starter message's
+        id, but the message itself lives in the parent channel — inside the thread it only exists as a
+        THREAD_STARTER_MESSAGE system stub that cannot be replied to — so the reference names the
+        parent. Forum/media posts keep their real starter inside the thread, and an uncached parent
+        stays on the thread (upstream behavior); both degrade to the plain-send retry if rejected."""
+        channel_id = getattr(channel, "id", None)
+        if channel_id is None or str(channel_id) != str(message_id):
+            return channel_id
+        parent = getattr(channel, "parent", None)
+        parent_id = getattr(channel, "parent_id", None)
+        if parent is None or parent_id is None or self._is_forum_parent(parent):
+            return channel_id
+        return parent_id
+
+    def _message_reference_from_ids(self, message_id, channel) -> discord.MessageReference:
         """ids-built reply reference — no fetch_message round trip. fail_if_not_exists=False
         keeps sends to deleted targets degrading to the send-side 10008 retry."""
         return discord.MessageReference(
-            message_id=int(message_id), channel_id=getattr(channel, "id", None),
+            message_id=int(message_id), channel_id=self._reply_reference_channel_id(message_id, channel),
             guild_id=getattr(getattr(channel, "guild", None), "id", None), fail_if_not_exists=False,
         )
 
@@ -3487,11 +3502,16 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
 
     @staticmethod
     def _is_reply_reference_rejected(err: Exception) -> bool:
-        """Discord refused the reply anchor: system-message target (50035) or deleted target (10008)."""
+        """Discord refused the reply anchor, not the message: deleted target (10008) or a 50035
+        form error on ``message_reference`` (system-message target, cross-channel thread starter).
+        discord.py renders form errors as ``In <field path>: <reason>``, so other 50035 failures
+        (content length, embeds, ...) are not retried without the reference."""
         err_text = str(err)
-        return (
-            "error code: 50035" in err_text and "Cannot reply to a system message" in err_text
-        ) or "error code: 10008" in err_text
+        if "error code: 10008" in err_text:
+            return True
+        return "error code: 50035" in err_text and (
+            "In message_reference" in err_text or "Cannot reply to a system message" in err_text
+        )
 
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
