@@ -488,3 +488,32 @@ def test_browser_login_sends_no_client_id_and_pools_the_session_token(monkeypatc
     # API-key adds and the other actions stay on the built-in path.
     assert devin_plugin._auth_handler("add", SimpleNamespace(provider="devin", auth_type="api-key")) is False
     assert devin_plugin._auth_handler("status", SimpleNamespace(provider="devin")) is False
+
+
+def test_production_request_assembly_keeps_the_devin_carrier_for_devin_only():
+    """The agent's request path must hand the client its own replay record (and nobody else's)."""
+    from unittest.mock import patch
+
+    from agent.turn_api_request import build_api_request
+    from agent.turn_context import _PER_TURN_RESET_STATE
+    from run_agent import AIAgent
+
+    record = {"type": "devin.native_assistant", "model": "swe-1-6", "message_id": "bot-1", "signature": "s"}
+    foreign = {"type": "other.native_assistant", "blob": "x"}
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok", "reasoning_content": "plan", "reasoning_details": [record, foreign]},
+                {"role": "user", "content": "next"}]
+    with patch("model_tools.get_tool_definitions", return_value=[]), \
+         patch("model_tools.check_toolset_requirements", return_value={}):
+        agent = AIAgent(provider="devin", model="swe-1-6", base_url="https://server.codeium.com", api_key="sk-ws-test",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True, session_id="s1")
+    for name, value in _PER_TURN_RESET_STATE:
+        setattr(agent, name, value)
+    assert isinstance(agent.client, transport.DevinClient)
+    built = build_api_request(
+        agent, api_messages=messages, _moa_prepared_request=None, tools_for_api=None, system_message="sys",
+        messages=messages, original_user_message="next", approx_tokens=0, total_chars=0, retry_count=0,
+        api_call_count=1, api_request_id="req-1", api_start_time=0.0, effective_task_id="task-1", turn_id="turn-1")
+    sent = next(m for m in built.api_kwargs["messages"] if m["role"] == "assistant")
+    assert sent["reasoning_details"] == [record]
+    assert built.api_kwargs["extra_body"]["devin_cascade_id"] == "s1"
