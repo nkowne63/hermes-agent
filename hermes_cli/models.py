@@ -2120,11 +2120,11 @@ def cached_provider_model_ids(
         # Read path: never touch the network in the caller's thread. A same-credentials row past the
         # SWR window is still served (hour-old catalog beats an empty picker) while a daemon thread
         # warms the next open; a cold row returns [] and the caller falls back to its curated list.
+        # No live fetch happened here, so account-gated (Astra) rows from the same-credential
+        # discovery stay: the fingerprint binds them to this account, and SWR revalidates.
         _spawn_swr_refresh(normalized)
         if _cache_entry_valid(entry, fp, allow_empty=is_ollama):
-            return _chat_catalog_rows([
-                model for model in entry["models"]
-                if not _model_requires_account_discovery(normalized, model)])
+            return _chat_catalog_rows(list(entry["models"]))
         return []
 
     live = provider_model_ids(normalized, force_refresh=force_refresh)
