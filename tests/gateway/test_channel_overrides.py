@@ -154,3 +154,69 @@ class TestResolveSessionAgentRuntimePriority:
         assert runtime["provider"] == "openrouter"
 
 
+
+class TestResolveSessionReasoningConfigPriority:
+    """Reasoning priority: session /reasoning → channel_overrides → per-model/global."""
+
+    @staticmethod
+    def _runner(monkeypatch, overrides, *, session_reasoning=None):
+        from types import SimpleNamespace
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(enabled=True, channel_overrides=overrides),
+            },
+        )
+        runner._peek_session_state = lambda _key: (
+            None if session_reasoning is None
+            else SimpleNamespace(conversation=SimpleNamespace(reasoning_override=session_reasoning))
+        )
+        monkeypatch.setattr(
+            GatewayRunner, "_load_reasoning_config",
+            staticmethod(lambda _model="": {"enabled": True, "effort": "xhigh"}),
+        )
+        return runner
+
+    @staticmethod
+    def _resolve(runner, source):
+        return runner._resolve_session_reasoning_config(
+            source=source, session_key="agent:main:discord:group:food", model="some/model",
+        )
+
+    def test_channel_override_beats_per_model_and_global(self, monkeypatch):
+        runner = self._runner(monkeypatch, {"food": ChannelOverride(reasoning_effort="medium")})
+        source = SessionSource(platform=Platform.DISCORD, chat_id="food", user_id="u1")
+        assert self._resolve(runner, source) == {"enabled": True, "effort": "medium"}
+
+    def test_session_override_beats_channel_override(self, monkeypatch):
+        runner = self._runner(
+            monkeypatch, {"food": ChannelOverride(reasoning_effort="medium")},
+            session_reasoning={"enabled": True, "effort": "low"},
+        )
+        source = SessionSource(platform=Platform.DISCORD, chat_id="food", user_id="u1")
+        assert self._resolve(runner, source) == {"enabled": True, "effort": "low"}
+
+    def test_thread_inherits_parent_channel_override(self, monkeypatch):
+        runner = self._runner(monkeypatch, {"food": ChannelOverride(reasoning_effort="low")})
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id="thread_7", thread_id="thread_7",
+            parent_chat_id="food", user_id="u1",
+        )
+        assert self._resolve(runner, source) == {"enabled": True, "effort": "low"}
+
+    @pytest.mark.parametrize("value", ["none", False, "disabled"])
+    def test_channel_override_can_disable_reasoning(self, monkeypatch, value):
+        runner = self._runner(monkeypatch, {"food": ChannelOverride(reasoning_effort=value)})
+        source = SessionSource(platform=Platform.DISCORD, chat_id="food", user_id="u1")
+        assert self._resolve(runner, source) == {"enabled": False}
+
+    def test_other_channel_and_unparseable_value_fall_through(self, monkeypatch):
+        runner = self._runner(monkeypatch, {
+            "food": ChannelOverride(reasoning_effort="medium"),
+            "typo": ChannelOverride(reasoning_effort="hgih"),
+        })
+        other = SessionSource(platform=Platform.DISCORD, chat_id="elsewhere", user_id="u1")
+        typo = SessionSource(platform=Platform.DISCORD, chat_id="typo", user_id="u1")
+        assert self._resolve(runner, other) == {"enabled": True, "effort": "xhigh"}
+        assert self._resolve(runner, typo) == {"enabled": True, "effort": "xhigh"}

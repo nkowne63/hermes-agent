@@ -336,16 +336,18 @@ platforms:
         model: anthropic/claude-sonnet-4.6
         provider: anthropic
         system_prompt: "You are the #dev channel code-review specialist."
+        reasoning_effort: low      # or none/false to disable reasoning here
       "987654321098765432":
         model: openai/gpt-5-mini
 ```
 
 Details:
 
-- All three keys are optional — set only `model`, only `system_prompt`, or any combination. Unset fields fall back to the global defaults.
+- All keys are optional — set only `model`, only `system_prompt`, or any combination. Unset fields fall back to the global defaults.
 - Lookup order is exact channel/thread id first, then the **parent** channel/forum id — so Discord threads inherit their parent channel's override automatically.
 - Resolution priority for the model is: session `/model` override → `channel_overrides` → global config. A user running `/model` in a chat still wins over the channel default.
 - The `system_prompt` override replaces the global gateway prompt for that channel (it is ephemeral — injected per turn, not stored in history).
+- Resolution priority for `reasoning_effort` is: session `/reasoning` override → `channel_overrides` → per-model `agent.reasoning_overrides` → global `agent.reasoning_effort`. `none`/`false` disables reasoning for the channel; an unrecognized value is ignored.
 
 ## Security
 
