@@ -1,0 +1,5 @@
+name: devin-provider
+kind: model-provider
+version: 0.1.0
+description: Devin (Cognition) via Codeium Cascade (Connect + protobuf)
+author: nkowne63
