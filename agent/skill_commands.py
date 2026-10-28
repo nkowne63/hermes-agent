@@ -999,3 +999,36 @@ def build_auto_load_prompt(
     finally:
         if home_token is not None:
             reset_hermes_home_override(home_token)
+
+
+def resolve_always_loaded_skills(user_config: dict | None = None) -> list[str]:
+    """``skills.always_loaded`` from *user_config* (else the active profile config), deduplicated.
+    Accepts a list or a comma/newline-separated string; empty when unset, malformed, or unreadable."""
+    if user_config is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            user_config = load_config_readonly()
+        except Exception:
+            return []
+    skills_block = user_config.get("skills") if isinstance(user_config, dict) else None
+    raw = skills_block.get("always_loaded") if isinstance(skills_block, dict) else None
+    if isinstance(raw, str):
+        raw = raw.replace("\n", ",").split(",")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    names = [str(entry).strip() for entry in raw if isinstance(entry, (str, int)) and str(entry).strip()]
+    return list(dict.fromkeys(names))
+
+
+def build_always_loaded_prompt(
+    task_id: str | None = None, user_config: dict | None = None, already_loaded: set[str] | None = None,
+) -> tuple[str, list[str], list[str]]:
+    """Render ``skills.always_loaded`` as preloaded skill blocks; returns ``(prompt_text, loaded_names,
+    missing)``. Unlike ``skills.auto_load`` this is meant for EVERY agent (delegate children and
+    internal forks included) and does not depend on the skills toolset. Missing and operator-disabled
+    names are reported, never raised. *already_loaded* names (e.g. carried in an inherited ephemeral
+    prompt) resolve as loaded but are not rendered again."""
+    names = resolve_always_loaded_skills(user_config)
+    if not names:
+        return "", [], []
+    return build_preloaded_skills_prompt(names, task_id=task_id, excluded_loaded_names=already_loaded)

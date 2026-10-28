@@ -2246,6 +2246,33 @@ _USAGE_STATE: dict[str, Any] = {
 }
 
 
+_PRELOADED_SKILL_MARKER = re.compile(r'with the "([^"]+)" skill\s+preloaded')
+_warned_missing_always_loaded: set[tuple[str, str]] = set()  # deduped like the provider warning above
+
+
+def _inject_always_loaded_skills(agent, agent_cfg: dict) -> None:
+    """``skills.always_loaded``: prepend the listed skills to the ephemeral system prompt of EVERY
+    agent built here — CLI, gateway, TUI and delegate_task children alike, with or without the skills
+    toolset (``skills.auto_load`` deliberately skips both). Forks that inherit a parent's ephemeral
+    prompt (background review) already carry the blocks, so those names are not rendered twice."""
+    try:
+        from agent.skill_commands import build_always_loaded_prompt
+
+        existing = agent.ephemeral_system_prompt or ""
+        prompt, _loaded, missing = build_always_loaded_prompt(
+            task_id=agent.session_id, user_config=agent_cfg,
+            already_loaded=set(_PRELOADED_SKILL_MARKER.findall(existing)),
+        )
+        if missing and (key := _unavailable_warning_key(", ".join(missing))) not in _warned_missing_always_loaded:
+            _warned_missing_always_loaded.add(key)
+            logger.warning("skills.always_loaded: skill(s) not found or disabled, skipped: %s", key[1])
+        if prompt:
+            agent.ephemeral_system_prompt = f"{prompt}\n\n{existing}" if existing else prompt
+    except Exception:
+        # A malformed optional skill must never prevent an agent from starting.
+        logger.debug("skills.always_loaded: injection skipped", exc_info=True)
+
+
 def init_agent(
     agent, base_url: str | None = None, api_key: str | None = None, provider: str | None = None, api_mode: str | None = None,
     acp_command: str | None = None, acp_args: list[str] | None = None, command: str | None = None,
@@ -2372,6 +2399,7 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    _inject_always_loaded_skills(agent, _agent_cfg)
     _apply_display_config(agent, _agent_cfg, platform)
     _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=memory_manager)
     _apply_agent_section(agent, _agent_cfg)

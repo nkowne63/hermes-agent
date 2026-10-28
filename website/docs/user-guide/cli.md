@@ -379,6 +379,16 @@ Each entry is a skill name. The list is resolved once when a session's system pr
 
 `--ignore-rules` (equivalently `HERMES_IGNORE_RULES=1`) skips auto-load together with AGENTS.md, SOUL.md, `.cursorrules` and memory injection; explicit `-s` skills still load. The setting is profile-scoped: each profile's `config.yaml` controls its own list.
 
+`auto_load` deliberately stays out of `delegate_task` subagents, internal forks and sessions without the skills toolset. For a skill that must reach **every** agent — subagents included, with or without the skills toolset — use `skills.always_loaded` instead:
+
+```yaml
+skills:
+  always_loaded:
+    - agmsg
+```
+
+Listed skills are rendered when each agent is built and prepended to its ephemeral system prompt (added at API-call time, never saved to trajectories). Missing or disabled skills log a warning once and are skipped; `--ignore-rules` does not suppress this list.
+
 ## Skill Slash Commands
 
 Every installed skill in `~/.hermes/skills/` is automatically registered as a slash command. The skill name becomes the command:
