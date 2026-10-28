@@ -319,6 +319,22 @@ def test_router_model_is_assigned_before_chat_and_gemini_schemas_are_normalized(
     assert not isinstance(schema["properties"]["command"].get("type"), list)
 
 
+def test_router_turn_signature_is_bound_to_the_assigned_model():
+    fake = FakeCascade(_frames({"message_id": "bot-9", "delta_thinking": "t", "delta_signature": "sig-9"},
+                               {"delta_text": "ok"}))
+    client = _client(fake)
+    first = client.chat.completions.create(model="adaptive", messages=[{"role": "user", "content": "hi"}])
+    (record,) = first.choices[0].message.reasoning_details
+    assert record["model"] == "MODEL_GOOGLE_GEMINI_3" and record["signature"] == "sig-9"
+    convo = [{"role": "user", "content": "hi"},
+             {"role": "assistant", "content": "ok", "reasoning_content": "t", "reasoning_details": [record]},
+             {"role": "user", "content": "again"}]
+    client.chat.completions.create(model="adaptive", messages=convo)  # assigned to the same signer again
+    assert fake.chat_request()["chat_message_prompts"][1]["signature"] == "sig-9"
+    client.chat.completions.create(model="swe-1-6", messages=convo)  # a different model never gets it
+    assert "signature" not in fake.chat_request()["chat_message_prompts"][1]
+
+
 def test_large_request_is_gzip_framed():
     fake = FakeCascade(_frames({"delta_text": "ok"}))
     _client(fake).chat.completions.create(model="swe-1-6", messages=[{"role": "user", "content": "x" * 5000}])

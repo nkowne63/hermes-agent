@@ -272,8 +272,11 @@ def _usage(stats: dict[str, Any]) -> SimpleNamespace:
 class _Turn:
     """Accumulates one streamed turn and translates each frame into OpenAI chunks."""
 
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, signer: str = "") -> None:
         self.model = model
+        # The concrete chat uid that produced (and alone may verify) this turn's thinking signature: a router
+        # (``adaptive``) can land on a different model next turn.
+        self.signer = signer or model
         self.id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         self.created = int(time.time())
         self.text: list[str] = []
@@ -346,7 +349,7 @@ class _Turn:
         """Private replay carrier: the response id and thinking signature, valid for this model only."""
         if not (self.signature or self.message_id):
             return None
-        record = {"type": NATIVE_DETAILS_TYPE, "model": self.model, "message_id": self.message_id}
+        record = {"type": NATIVE_DETAILS_TYPE, "model": self.signer, "message_id": self.message_id}
         if self.signature:
             record.update(signature=self.signature, signature_type=self.signature_type)
         return [record]
@@ -483,10 +486,9 @@ class DevinClient:
         if not model:
             raise DevinAPIError("Devin request has no model", code="devin_no_model", status_code=400)
         cascade_id = str(extra.get("devin_cascade_id") or "") or str(uuid.uuid4())
-        system_prompt, prompts = build_prompts(list(messages or ()), cascade_id, model)
         known = catalog.cached_model(model)
         request: dict[str, Any] = {
-            "prompt": system_prompt, "chat_message_prompts": prompts, "request_type": wire.REQUEST_TYPE_CASCADE,
+            "request_type": wire.REQUEST_TYPE_CASCADE,
             "planner_mode": wire.PLANNER_MODE_DEFAULT, "tool_choice": _tool_choice(tool_choice),
             "system_prompt_cache_options": {"type": wire.CACHE_CONTROL_EPHEMERAL},
             "disable_parallel_tool_calls": not (known.supports_parallel_tool_calls if known else False),
@@ -501,7 +503,7 @@ class DevinClient:
                 "stop_patterns": [stop] if isinstance(stop, str) else list(stop or ()),
             },
         }
-        turn = self._stream(model, request, tools, timeout)
+        turn = self._stream(model, list(messages or ()), request, tools, timeout)
         if stream:
             return _chunks_only(turn)
         state = None
@@ -510,15 +512,19 @@ class DevinClient:
                 state = item
         return state.completion() if state is not None else _Turn(model).completion()
 
-    def _stream(self, model: str, request: dict[str, Any], tools: Any, timeout: Any) -> Iterator[Any]:
+    def _stream(self, model: str, messages: list[dict[str, Any]], request: dict[str, Any], tools: Any,
+                timeout: Any) -> Iterator[Any]:
         """Chunks of one turn, then the finished ``_Turn`` (read by the non-streaming path only)."""
         user_jwt, chat_base = self._user_jwt(timeout)
         chat_uid = model
         if catalog.is_router(model):
-            assignment = self._assign(model, request["cascade_id"], request["chat_message_prompts"], user_jwt, chat_base,
-                                      timeout)
+            _, router_prompts = build_prompts(messages, request["cascade_id"], model)
+            assignment = self._assign(model, request["cascade_id"], router_prompts, user_jwt, chat_base, timeout)
             chat_uid = assignment["model_uid"]
             request["model_assignment_jwt"] = assignment["assignment_jwt"]
+        # History is built for the concrete uid: replayed thinking signatures go back only to their signer.
+        system_prompt, prompts = build_prompts(messages, request["cascade_id"], chat_uid)
+        request.update(prompt=system_prompt, chat_message_prompts=prompts)
         request.update(metadata=wire.cli_metadata(self.api_key, user_jwt), chat_model_uid=chat_uid,
                        execution_id=str(uuid.uuid4()),
                        tools=build_tools(tools, gemini=_uses_gemini_schema(model, chat_uid)))
@@ -528,9 +534,9 @@ class DevinClient:
                    "Accept-Encoding": "identity", "Connect-Accept-Encoding": "gzip", "User-Agent": wire.USER_AGENT,
                    **({"Connect-Content-Encoding": "gzip"} if compress else {}), **self._default_headers}
         payload = wire.frame(gzip.compress(body) if compress else body, wire.FLAG_COMPRESSED if compress else 0)
-        logger.debug("devin: chat request model=%s uid=%s bytes=%d tools=%d", model, chat_uid, len(body),
-                     len(request["tools"]))
-        turn = _Turn(model)
+        logger.debug("devin: chat request model=%s uid=%s bytes=%d tools=%d signed=%d", model, chat_uid, len(body),
+                     len(request["tools"]), sum(1 for p in prompts if p.get("signature")))
+        turn = _Turn(model, chat_uid)
         kwargs = {"timeout": timeout} if timeout is not None else {}
         try:
             with self._http.stream("POST", chat_base + wire.GET_CHAT_MESSAGE_PATH, content=payload, headers=headers,
