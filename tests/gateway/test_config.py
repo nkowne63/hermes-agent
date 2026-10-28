@@ -158,6 +158,12 @@ class TestChannelOverride:
         assert ChannelOverride.from_dict({}).model is None
         assert ChannelOverride.from_dict(None).model is None
 
+    def test_from_dict_reads_reasoning_and_silence_keys(self):
+        ov = ChannelOverride.from_dict({"reasoning_effort": False, "allow_silence": True})
+        assert ov.reasoning_effort is False
+        assert ov.allow_silence is True
+        assert ov.to_dict() == {"reasoning_effort": False, "allow_silence": True}
+
 
 class TestPlatformConfigMalformedSections:
     def test_from_dict_ignores_malformed_nested_sections(self):

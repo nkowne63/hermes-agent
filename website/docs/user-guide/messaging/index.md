@@ -154,7 +154,9 @@ user: next message
 
 Failed turns still surface as errors; Hermes does not hide failures just because the text resembles a silence token.
 
-On a message from a person, a bare silence token is replaced by a short notice, because a message that needed a reply must not vanish. Internal wakes such as background-process notifications may stay silent, and so may a message the platform adapter reports as not addressed to the bot. Slack reports this for messages that open by @mentioning someone else and for unmentioned top-level messages that start a new thread in a free-response channel; other platforms always get the notice.
+On a message from a person, a bare silence token is replaced by a short notice, because a message that needed a reply must not vanish. Internal wakes such as background-process notifications may stay silent, and so may a message the platform adapter reports as not addressed to the bot. Slack reports this for messages that open by @mentioning someone else and for unmentioned top-level messages that start a new thread in a free-response channel; other platforms get the notice unless the channel opts out as below.
+
+Channels where the agent may legitimately choose not to reply can opt out per channel with `allow_silence: true` under [`channel_overrides`](#per-channel-model--system-prompt-overrides) on any platform: every message from a person in that channel (and in threads under it) is treated as not addressed to the bot, so a bare silence token ends the turn quietly.
 
 ## Quick Setup
 
@@ -337,6 +339,7 @@ platforms:
         provider: anthropic
         system_prompt: "You are the #dev channel code-review specialist."
         reasoning_effort: low      # or none/false to disable reasoning here
+        allow_silence: true        # a bare [SILENT]/NO_REPLY ends a user turn quietly
       "987654321098765432":
         model: openai/gpt-5-mini
 ```

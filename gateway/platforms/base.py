@@ -424,7 +424,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import Platform, PlatformConfig, _coerce_bool
 from gateway.platforms.helpers import fence_state_after
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
@@ -4008,6 +4008,9 @@ class BasePlatformAdapter(ABC):
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
             return
+        # Before any queueing/merging: a busy-path follow-up or a merged burst must carry the
+        # channel's verdict too, and the persisted user row records it for crash recovery.
+        self._apply_channel_silence_policy(event)
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
         # Explicitly routed events already name their destination; recovering a
         # different topic would redirect them and yield before the session claim.
@@ -4029,6 +4032,23 @@ class BasePlatformAdapter(ABC):
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
+
+    def _apply_channel_silence_policy(self, event: MessageEvent) -> None:
+        """``channel_overrides.<id>.allow_silence: true`` makes a human turn in that channel (or a
+        thread under it) unaddressed (``reply_expected=False``): a bare silence marker then ends the
+        turn quietly instead of with the visible ⚠️ fallback. Internal turns keep their own verdict."""
+        if event.internal:
+            return
+        overrides = getattr(getattr(self, "config", None), "channel_overrides", None)
+        if not overrides:
+            return
+        from gateway.run import _channel_override_lookup_keys  # lazy: gateway.run imports us
+        source = event.source
+        keys = _channel_override_lookup_keys(
+            str(source.chat_id or ""), thread_id=source.thread_id, parent_id=source.parent_chat_id)
+        override = next((overrides[key] for key in keys if key in overrides), None)
+        if override is not None and _coerce_bool(override.allow_silence, False):
+            event.reply_expected = False
 
     def _shared_runtime_owns_input(self, event: MessageEvent) -> bool:
         """True when a non-command input belongs to the shared runtime's session authority."""
