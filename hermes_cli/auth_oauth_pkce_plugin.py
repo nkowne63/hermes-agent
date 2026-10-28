@@ -179,6 +179,8 @@ def login(provider: str, cfg: OAuthPKCEConfig, *, open_browser: bool = True) -> 
         **cfg.extra_authorize_params, "client_id": cfg.client_id, "response_type": "code",
         "redirect_uri": redirect_uri, "state": state, "code_challenge": _pkce_code_challenge(verifier),
         "code_challenge_method": "S256"}
+    if not cfg.client_id:  # a brokered login with no public client id (Devin's CLI login) sends none
+        del params["client_id"]
     if cfg.scopes:
         params["scope"] = " ".join(cfg.scopes)
     if cfg.audience:
