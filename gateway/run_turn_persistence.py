@@ -154,15 +154,20 @@ class GatewayTurnPersistenceMixin:
 
     def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence):
         """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
-        requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
+        requires an explicit per-platform opt-in (scratch text, not final-answer content), and a
+        ``display.thread_only_channels`` channel shows it only inside its threads."""
         if source.platform == Platform.LOCAL and not _acp_launch(self, source):
             # Local viewers receive reasoning.delta through their event stream; projecting it into
             # the final response duplicates it and leaks messaging-platform formatting into Desktop.
             return response
+        from gateway.display_config import is_thread_only_display_channel
         from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
         try:
-            _show_reasoning_effective = _resolve_gateway_display_bool(
-                _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
+            _user_config = _load_gateway_config()
+            _show_reasoning_effective = not is_thread_only_display_channel(
+                _user_config, source,
+            ) and _resolve_gateway_display_bool(
+                _user_config, _platform_config_key(source.platform), "show_reasoning",
                 default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
                 require_platform_override_for={Platform.MATTERMOST},
             )

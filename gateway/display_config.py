@@ -228,3 +228,25 @@ def local_display_config(display: Any) -> dict[str, Any]:
             value = {**display[key], **value}
         display[key] = _normalise(key, value)
     return display
+
+
+def is_thread_only_display_channel(user_config: Any, source: Any) -> bool:
+    """True when *source* is a channel listed in ``display.thread_only_channels`` and not a thread.
+
+    Those channels keep transient output (tool progress, interim assistant messages, thinking
+    progress, prepended reasoning) inside threads only: a turn in the channel itself shows just
+    the final answer, while a thread under it (``source.thread_id`` set) is not affected.
+    Accepts a list or a comma-separated string of IDs.
+    """
+    if getattr(source, "thread_id", None):
+        return False
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    display = user_config.get("display") if isinstance(user_config, dict) else None
+    configured = display.get("thread_only_channels") if isinstance(display, dict) else None
+    if not chat_id or not configured:
+        return False
+    if isinstance(configured, (str, int)):
+        configured = str(configured).split(",")
+    if not isinstance(configured, (list, tuple, set)):
+        return False
+    return chat_id in {str(value).strip() for value in configured}

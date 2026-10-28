@@ -2448,6 +2448,13 @@ Signal is listed as a valid platform key because the setting can be saved per pl
 
 `show_commentary` (default `true`) controls Codex Responses models' commentary channel — the polished progress narration these models produce alongside their private reasoning. When enabled, each completed commentary message is delivered as a visible mid-turn update (on the gateway this also requires `interim_assistant_messages`). Set it to `false` if the extra narration annoys you: commentary then falls back to the reasoning channel and is only shown when `show_reasoning` is enabled.
 
+`thread_only_channels` (default `[]`, gateway-only) lists channel IDs where transient output stays inside threads. A turn in a listed channel itself sends only the final answer: tool progress, interim assistant messages, `thinking_progress` and the `show_reasoning` block are suppressed there (`tool_progress: log` still writes its log file). Threads under the channel keep the normal display settings. Accepts a YAML list or a comma-separated string:
+
+```yaml
+display:
+  thread_only_channels: ["1234567890"]
+```
+
 ## Privacy
 
 ```yaml

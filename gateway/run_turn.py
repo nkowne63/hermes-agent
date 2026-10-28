@@ -1007,7 +1007,9 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             _platform_config_key,
         )
         from agent.secret_scope import get_secret
-        from gateway.display_config import resolve_display_setting, resolve_tool_progress
+        from gateway.display_config import (
+            is_thread_only_display_channel, resolve_display_setting, resolve_tool_progress,
+        )
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
         from gateway.session_policy import policy_for_source, policy_turn_toolsets
         policy = policy_for_source(self, source)
@@ -1034,6 +1036,11 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         progress_mode, _tool_progress_explicit = resolve_tool_progress(
             user_config, platform_key, get_secret("HERMES_TOOL_PROGRESS_MODE"),
         )
+        # display.thread_only_channels: transient chat output stays in threads; the channel itself
+        # only gets the final answer. "log" writes to a file, not the chat, so it is kept.
+        thread_only_parent = is_thread_only_display_channel(user_config, source)
+        if thread_only_parent and progress_mode != "log":
+            progress_mode = "off"
         # "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         _generic_status_recent: list[str] = []
@@ -1084,8 +1091,10 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         interim_assistant_messages_mode = _display_surface_mode(
             "interim_assistant_messages", default=True, require_platform_override_for={Platform.MATTERMOST},
         )
-        interim_assistant_messages_enabled = not is_webhook and interim_assistant_messages_mode != "off"
-        _thinking_enabled = _display_surface_mode(
+        interim_assistant_messages_enabled = (
+            not is_webhook and not thread_only_parent and interim_assistant_messages_mode != "off"
+        )
+        _thinking_enabled = not thread_only_parent and _display_surface_mode(
             "thinking_progress", default=False, require_platform_override_for={Platform.MATTERMOST},
         ) != "off"
         # Slack-native task cards need the progress queue even with text tool_progress off.
