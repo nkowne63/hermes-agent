@@ -4720,6 +4720,11 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
         if isinstance(sync_client, GeminiNativeClient):
             return AsyncGeminiNativeClient(sync_client), model
+    # A provider-supplied client (ProviderProfile.create_client) that is not OpenAI-over-HTTP names its own
+    # async twin; rebuilding it as AsyncOpenAI from base_url would speak the wrong wire. Looked up on the
+    # class so mocks (whose attributes auto-create) never take this path.
+    if callable(getattr(type(sync_client), "as_async_client", None)):
+        return sync_client.as_async_client(), model
     # ACP shims (subprocess, not an HTTP pool) are already async-safe and opt out of the wrapper.
     if _client_declares(sync_client, "HERMES_SKIP_ASYNC_WRAP"):
         return sync_client, model
