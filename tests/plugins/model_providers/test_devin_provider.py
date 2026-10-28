@@ -377,6 +377,18 @@ def test_opaque_invalid_argument_on_large_history_classifies_as_context_overflow
     assert small.value.details["large_history"] is False and small.value.status_code == 400
 
 
+def test_retired_model_classifies_as_model_entitlement_not_auth():
+    # Recorded live: the shape Devin streams for a model the account can no longer use.
+    retired = _frames(trailer={"error": {"code": "permission_denied", "message":
+                                         "This model is no longer available for your account. Please switch to a different model."}})
+    with pytest.raises(transport.DevinAPIError) as excinfo:
+        _client(FakeCascade(retired)).chat.completions.create(model="swe-1-6-fast", messages=HISTORY)
+    assert excinfo.value.status_code == 403
+
+    from agent.error_classifier import FailoverReason, classify_api_error
+    assert classify_api_error(excinfo.value, provider="devin", model="swe-1-6-fast").reason == FailoverReason.model_entitlement
+
+
 def test_async_twin_streams_through_the_auxiliary_seam():
     from agent.auxiliary_client import _to_async_client
 

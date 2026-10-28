@@ -21,10 +21,11 @@ from . import catalog
 from . import protocol as wire
 from .auth import AUTHORIZE_URL, REDIRECT_PORT, TOKEN_URL, token_request
 
-FALLBACK_MODELS = ("swe-1-6", "swe-1-6-fast")
-# Seed context windows (verified live against GetCliModelConfigs by the oh-my-pi Devin provider); the
-# fetched catalog is authoritative when present.
-_SEED_CONTEXT = {"swe-1-6": 200_000, "swe-1-6-fast": 200_000}
+# Curated floor merged into the live picker, so only a model Devin still serves (live 2026-10: SWE-1.6 Fast
+# answers permission_denied "no longer available for your account").
+FALLBACK_MODELS = ("swe-1-6",)
+# Seed context window (GetCliModelConfigs reports 200k); the fetched catalog is authoritative when present.
+_SEED_CONTEXT = {"swe-1-6": 200_000}
 
 _LOGIN = OAuthPKCEConfig(
     client_id="", authorize_url=AUTHORIZE_URL, token_url=TOKEN_URL, redirect_port=REDIRECT_PORT,
@@ -44,9 +45,15 @@ def _auth_handler(action: str, args: Any) -> bool:
 
 def _classify_api_error(error: Any, **_: Any) -> Optional[Mapping[str, Any]]:
     details = getattr(error, "details", None)
-    if isinstance(details, dict) and details.get("large_history"):
+    if not isinstance(details, dict):
+        return None
+    if details.get("large_history"):
         # Opaque invalid_argument on a large history: compress instead of failing as a bad request.
         return {"reason": "context_overflow"}
+    if str(details.get("connect_code") or "").lower() == "permission_denied" and "model" in str(
+            details.get("message") or "").lower():
+        # A model the account may not use (retired, plan-gated) is not a dead credential.
+        return {"reason": "model_entitlement"}
     return None
 
 
@@ -82,7 +89,7 @@ register_provider(DevinProfile(
     description="Devin (Cognition) — SWE models and frontier models via your Devin/Windsurf account",
     signup_url="https://app.devin.ai/", env_vars=("DEVIN_API_KEY", "DEVIN_BASE_URL"),
     base_url=wire.DEFAULT_BASE_URL, auth_type="api_key", supports_health_check=False,
-    fallback_models=FALLBACK_MODELS, default_aux_model="swe-1-6-fast",
+    fallback_models=FALLBACK_MODELS, default_aux_model="swe-1-6",
     native_reasoning_details_type="devin.native_assistant",
     auth_handler=_auth_handler, classify_api_error=_classify_api_error,
 ))
