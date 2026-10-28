@@ -39,6 +39,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **Alibaba Cloud (Coding Plan)** | `ALIBABA_CODING_PLAN_API_KEY` (falls back to `DASHSCOPE_API_KEY`) (provider: `alibaba-coding-plan`, alias: `alibaba_coding`; mainland-China endpoint: `alibaba-coding-plan-cn` with `ALIBABA_CODING_PLAN_CN_API_KEY`, falling back to the shared keys) — separate billing SKU, different endpoint |
 | **Alibaba Cloud (Token Plan)** | `ALIBABA_TOKEN_PLAN_API_KEY` in `~/.hermes/.env` (provider: `alibaba-token-plan`; mainland-China endpoint: `alibaba-token-plan-cn` with `ALIBABA_TOKEN_PLAN_CN_API_KEY`, falling back to the shared key) — Model Studio flat-token tier |
 | **Kilo Code** | `KILOCODE_API_KEY` in `~/.hermes/.env` (provider: `kilocode`) |
+| **Devin (Cognition)** | `hermes auth add devin` — Devin CLI browser login, or `DEVIN_API_KEY` (a Devin/Windsurf API key) in `~/.hermes/.env` (provider: `devin`, aliases: `cognition`, `devin-cli`) |
 | **Xiaomi MiMo** | `XIAOMI_API_KEY` in `~/.hermes/.env` (provider: `xiaomi`, aliases: `mimo`, `xiaomi-mimo`) |
 | **Tencent TokenHub** | `TOKENHUB_API_KEY` in `~/.hermes/.env` (provider: `tencent-tokenhub`, aliases: `tencent`, `tokenhub`, `tencentmaas`) |
 | **Tencent TokenPlan** | `TOKENPLAN_API_KEY` in `~/.hermes/.env` (provider: `tencent-tokenplan`, aliases: `tokenplan`, `tencent-lkeap`; Anthropic Messages endpoint) |
@@ -536,6 +537,18 @@ hermes chat --provider alibaba_coding --model qwen3-coder-plus
 `alibaba_coding` uses the same `DASHSCOPE_API_KEY` your `alibaba` entry already uses — no separate key needed, just a different routing target. Before this provider was registered, users who set `provider: alibaba_coding` in `config.yaml` silently fell through to OpenRouter routing.
 
 For the mainland-China endpoint (`alibaba-coding-plan-cn`, `https://coding.dashscope.aliyuncs.com/v1`) set `ALIBABA_CODING_PLAN_CN_API_KEY`. The CN provider still falls back to `ALIBABA_CODING_PLAN_API_KEY` / `DASHSCOPE_API_KEY`, but with only the shared key set the `/model` picker lists just the international row — set the CN key (or `provider: alibaba-coding-plan-cn` in `config.yaml`) to surface the CN one. The same applies to `alibaba-token-plan-cn` with `ALIBABA_TOKEN_PLAN_CN_API_KEY`.
+
+### Devin (Cognition)
+
+The models your Devin account serves (SWE-1.x plus the frontier models on your plan), reached the way the Devin CLI reaches them: Codeium Cascade's Connect/protobuf API at `https://server.codeium.com`, not an OpenAI-compatible endpoint. Hermes speaks that wire itself — no subprocess.
+
+```bash
+hermes auth add devin                 # browser sign-in (Devin CLI login, http://127.0.0.1:59653/callback)
+hermes auth add devin --type api-key  # or paste a Devin / Windsurf API key (same as DEVIN_API_KEY)
+hermes chat --provider devin --model swe-1-6
+```
+
+The model list comes live from your account (`hermes model` → Devin); `adaptive` is Devin's server-side router and is resolved to a concrete model per turn. The sign-in token has no refresh grant: when it expires, run `hermes auth add devin` again. `DEVIN_BASE_URL` overrides the API server.
 
 ### MiniMax (OAuth)
 
