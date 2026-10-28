@@ -162,6 +162,31 @@ class TestProviderModelsSWR:
             assert mod.cached_provider_model_ids("openai-codex", non_blocking=True) == []
         spawn.assert_called_once_with("openai-codex")
 
+    def test_non_blocking_read_keeps_account_gated_models_past_stale_window(self):
+        import hermes_cli.models as mod
+
+        # Past the stale-serve window the blocking path would live-fetch; the picker read path
+        # must not, and the same-credential row's Astra models stay instead of being stripped.
+        age = mod._PROVIDER_MODELS_STALE_SERVE_MAX + 60
+        models = ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-astra-900k"]
+        cache = {"openai-codex": self._cache_entry(models, age_seconds=age)}
+        with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
+             patch.object(mod, "_credential_fingerprint", return_value="fp"), \
+             patch.object(mod, "_spawn_swr_refresh") as spawn, \
+             patch.object(mod, "provider_model_ids") as live:
+            out = mod.cached_provider_model_ids("openai-codex", non_blocking=True)
+        assert out == models
+        spawn.assert_called_once_with("openai-codex")
+        live.assert_not_called()
+
+        # A different fingerprint (another account) still gets nothing from the row.
+        with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
+             patch.object(mod, "_credential_fingerprint", return_value="other"), \
+             patch.object(mod, "_spawn_swr_refresh"), \
+             patch.object(mod, "provider_model_ids") as live:
+            assert mod.cached_provider_model_ids("openai-codex", non_blocking=True) == []
+        live.assert_not_called()
+
     def test_force_refresh_bypasses_swr(self):
         import hermes_cli.models as mod
 
