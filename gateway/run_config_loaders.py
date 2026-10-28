@@ -178,7 +178,7 @@ class GatewayConfigLoadersMixin:
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         model: str = "",
     ) -> dict | None:
-        """Session ``/reasoning --session`` > per-model ``agent.reasoning_overrides`` > global.
+        """Session ``/reasoning --session`` > ``channel_overrides`` > per-model ``agent.reasoning_overrides`` > global.
 
         ``model`` must be the session's *effective* model (session ``/model`` override included);
         empty uses ``model.default``.
@@ -188,6 +188,18 @@ class GatewayConfigLoadersMixin:
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+        # Channel tier: same chat/thread/parent lookup as the model and system-prompt overrides, so a
+        # Discord thread inherits its parent channel's reasoning policy. Unparseable values fall through.
+        if source is not None:
+            channel_override = self._channel_override(
+                source.platform, str(source.chat_id or ""),
+                str(source.thread_id) if getattr(source, "thread_id", None) else None,
+                str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
+            )
+            if channel_override is not None and channel_override.reasoning_effort is not None:
+                from hermes_constants import parse_reasoning_effort
+                if (channel_reasoning := parse_reasoning_effort(channel_override.reasoning_effort)) is not None:
+                    return channel_reasoning
         from gateway.session_setting_commands import local_policy
         if (policy := local_policy(self, source)) is not None:
             # A local session runs its frozen (or followed) level, not the profile's.
