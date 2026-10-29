@@ -417,17 +417,21 @@ def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = Fal
 
 
 def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> int:
-    """Offer this home's completions whose owner died after THIS process started (#97202).
+    """Offer this home's completions whose owner died after THIS process started (#97202), and any
+    completion whose delivery claim was abandoned.
 
     Startup replay (``restore_undelivered_completions``) covers owners that died before the process
     started; this covers the rest while it runs. Abandoned in-flight rows are first classified by
     ``recover_abandoned_delegations``. A terminal row qualifies when it is pending with an event, idle
-    past ``_ORPHAN_STALE_S``, not under a live delivery claim, and its owner fails the shared liveness
-    check. A row is offered once per live in-memory copy: a consumer that discards the copy with the row
-    still pending hands it back for the next sweep. The consumer's ``claim_completion_delivery`` stays
-    the atomic cross-process gate, so two processes offering one row never both deliver it. Rows past
-    the delivery budget or the replay age converge to ``dropped``. Reads the current profile's ledger:
-    callers bind the owning profile first."""
+    past ``_ORPHAN_STALE_S``, not under a live delivery claim, and either its owner fails the shared
+    liveness check or it carries a claim older than ``_CLAIM_LEASE_S``. A live owner's unclaimed row is
+    left alone (its copy is in that owner's memory), but an expired claim means no consumer holds the
+    completion any more: a settle that failed after the claim, or a consumer that discarded its copy. A
+    row is offered once per live in-memory copy: a consumer that discards the copy with the row still
+    pending hands it back for the next sweep. The consumer's ``claim_completion_delivery`` stays the
+    atomic cross-process gate, so two copies of one row never both deliver it. Rows past the delivery
+    budget or the replay age converge to ``dropped``. Reads the current profile's ledger: callers bind
+    the owning profile first."""
     alive = _owner_liveness()
     if alive is None or not _db_path().exists():
         return 0  # never create a ledger just to sweep it
@@ -438,18 +442,19 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
         offered = {delegation_id for key, delegation_id in _offered if key == home}
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
-                      owner_pid, owner_started_at, delivery_attempts
+                      owner_pid, owner_started_at, delivery_attempts, delivery_claim
                FROM async_delegations
                WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
                  AND event_json IS NOT NULL AND updated_at < ?
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
                ORDER BY completed_at, delegation_id""", (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S)).fetchall()
         orphans = []
-        for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts in rows:
-            if delegation_id in offered or alive(pid, started):
+        for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts, claim in rows:
+            if delegation_id in offered or (claim is None and alive(pid, started)):
                 continue
             if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
-                # Its last claimant died holding the final attempt; converge like release_completion_delivery.
+                # Its last claimant died or gave up holding the final attempt; converge like
+                # release_completion_delivery.
                 conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
                               delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
                        WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
@@ -509,6 +514,19 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
             (claim_id, now, now, delegation_id, now - _CLAIM_LEASE_S))
         return cur.rowcount == 1
+
+
+def completion_delivery_pending(delegation_id: str) -> bool:
+    """Whether a durable completion still awaits delivery. A consumer whose claim was refused keeps its
+    copy while this holds: the claim is another consumer's, or its own that a failed settle left behind,
+    and either lapses after ``_CLAIM_LEASE_S``. Once the row is delivered or dropped the copy is spent."""
+    if remote := worker_ledger():
+        saved = remote.read(delegation_id)
+        return bool(saved) and saved.get("delivery_state") == "pending"
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
+    return row is not None and row[0] == "pending"
 
 
 def is_interim_delegation_event(evt: dict[str, Any]) -> bool:

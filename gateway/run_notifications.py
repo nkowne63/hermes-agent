@@ -1068,6 +1068,16 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         return verdict, parent_session_id, target_session_id or parent_session_id
 
     @staticmethod
+    def _claim_durable_completion(delegation_id: str, claim_id: str) -> Optional[bool]:
+        """Claim one durable completion row: True when claimed, False while it stays pending under another
+        claim, None once it is delivered or dropped (the copy is spent). Blocking (``state.db``): run it
+        off the loop."""
+        from tools.async_delegation import claim_completion_delivery, completion_delivery_pending
+        if claim_completion_delivery(delegation_id, claim_id):
+            return True
+        return False if completion_delivery_pending(delegation_id) else None
+
+    @staticmethod
     def _settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> None:
         """Best-effort ``drop``/``release`` of a durable completion claim. Blocking (``state.db``):
         async callers go through ``_settle_durable_claims``."""
@@ -1133,7 +1143,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         claim = self._CompletionClaim()
         evt_type = evt.get("type")
         if evt_type == "async_delegation" and not await self._completion_delivery_ready(evt):
-            claim.proceed, claim.early_result = False, False
+            claim.proceed, claim.early_result, claim.defer = False, False, True
             return claim
         # An interim per-task notice shares the batch's delegation_id but is not the durable
         # completion; claiming that row here would acknowledge the FINAL result before it exists.
@@ -1141,14 +1151,19 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             claim.delegation_id = str(evt.get("delegation_id") or "")
             if claim.delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
                     claim.claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not await asyncio.to_thread(claim_completion_delivery, claim.delegation_id, claim.claim_id):
-                        claim.proceed = False
-                        return claim
+                    claimed = await asyncio.to_thread(self._claim_durable_completion, claim.delegation_id,
+                                                      claim.claim_id)
                 except Exception as exc:
                     logger.warning("Could not claim durable async completion %s: %s", claim.delegation_id, exc)
-                    claim.proceed, claim.early_result = False, False
+                    claimed = False
+                if claimed is not True:
+                    # Nothing to settle, and a pending row keeps its copy for a paced retry (another
+                    # consumer's claim, or this one's own that a failed settle left behind, lapses
+                    # after its lease); only a delivered or dropped row spends the copy.
+                    claim.claim_id = ""
+                    claim.proceed, claim.defer = False, True
+                    claim.early_result = None if claimed is None else False
                     return claim
         elif evt_type != "completion":
             return claim
@@ -1171,6 +1186,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     claim.delegation_id or "<legacy>", parent_session_id,
                 )
                 await self._settle_durable_claims("drop", [(claim.delegation_id, claim.claim_id)])
+                claim.claim_id = ""  # settled: the delivery's own settle has nothing left to release
             else:
                 logger.warning(
                     "Background process %s completion targets "
@@ -1470,7 +1486,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         """Deliver a same-session batch of async completions as ONE turn: the primary carries the
         consolidated text of every sibling THIS runner claimed (siblings owned elsewhere are excluded;
         their claims are acked only after adapter acceptance). True after acceptance, False to requeue
-        the group, None when nothing is deliverable here (retry siblings requeued)."""
+        the group, None when nothing is deliverable here. Copies this turn did not take whose rows are
+        still pending go back on the queue themselves."""
         # The group shares one session_key, hence one profile: scope the pre-checks and sibling claims too.
         async with self._completion_event_scope(group[0]):
             return await self._deliver_async_delegation_group_scoped(group)
@@ -1489,6 +1506,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return False if False in outcomes else True
         deliverable: list[tuple[dict, str]] = []
         acknowledged = False
+        identities = set()
         for evt in group:
             synth_text = _format_gateway_process_notification(evt)
             if not synth_text:
@@ -1503,8 +1521,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 await self._deliver_completion_notification(synth_text, evt)
                 continue
             identity = self._completion_delivery_identity(evt)
-            if identity is not None and self._completion_identity_seen(identity):
-                continue
+            if identity is not None:
+                # A second copy of one row (a replay or sweep re-offer beside the live copy) would hold the
+                # row's claim against the first and turn every retry of the group into a refusal.
+                if identity in identities or self._completion_identity_seen(identity):
+                    continue
+                identities.add(identity)
             deliverable.append((evt, synth_text))
         if not deliverable:
             return True if acknowledged else None
@@ -1522,46 +1544,56 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return False  # the ledger failed mid-claim and every sibling it claimed was deferred: retry the group
         blocks = [primary_text]
         siblings: list[tuple[dict, str]] = []
-        for evt, synth_text, claim_id in claimed:
+        held: list[dict] = []
+        for evt, synth_text, claim_id, pending in claimed:
             if claim_id is None:
-                # Another consumer owns this row: keep it out of our text so it is never double-injected.
+                # Another claim holds this row (another consumer's, or one a failed settle left behind):
+                # keep it out of our text so it is never double-injected, but keep a pending row's copy.
+                if pending:
+                    held.append(evt)
                 continue
             siblings.append((evt, claim_id))
             blocks.append(synth_text)
-        if not siblings:
-            return await self._deliver_completion_notification(primary_text, primary_evt)
-        header = (
-            f"[IMPORTANT: {len(blocks)} background subagent delegations "
-            "completed for this session. Treat these results as one "
-            "completion batch and send at most one consolidated user-facing "
-            "response. If a result does not change the current conclusion, absorb it silently.]"
-        )
-        consolidated = "\n\n".join([header, *blocks])
-        if getattr(self, 'session_authority', None) is not None:
-            from gateway.session_automation import producer_identity
-            primary_evt = dict(primary_evt, _automation_identities=[
-                producer_identity(self, event) for event in [primary_evt, *(e for e, _ in siblings)]])
-        delivered = await self._deliver_completion_notification(
-            consolidated, primary_evt, sibling_claims=siblings,
-        )
-        if delivered is None:
-            # Primary dropped/owned elsewhere: retry the unadmitted siblings.
-            for evt, _claim_id in siblings:
+        if siblings:
+            header = (
+                f"[IMPORTANT: {len(blocks)} background subagent delegations "
+                "completed for this session. Treat these results as one "
+                "completion batch and send at most one consolidated user-facing "
+                "response. If a result does not change the current conclusion, absorb it silently.]"
+            )
+            consolidated = "\n\n".join([header, *blocks])
+            if getattr(self, 'session_authority', None) is not None:
+                from gateway.session_automation import producer_identity
+                primary_evt = dict(primary_evt, _automation_identities=[
+                    producer_identity(self, event) for event in [primary_evt, *(e for e, _ in siblings)]])
+            delivered = await self._deliver_completion_notification(
+                consolidated, primary_evt, sibling_claims=siblings,
+            )
+        else:
+            delivered = await self._deliver_completion_notification(primary_text, primary_evt)
+        if delivered is not False:
+            # False requeues the whole group. Otherwise hand back what this turn did not take: held rows
+            # (paced, their claim may be one that lapses) and, with the primary spent, the claimed siblings.
+            self._back_off_refused_completions(held)
+            for evt in [*held, *(evt for evt, _claim_id in siblings if delivered is None)]:
                 _pr.completion_queue.put(evt)
         return delivered
 
-    def _claim_async_siblings(self, candidates) -> Optional[list[tuple[dict, str, Optional[str]]]]:
-        """Claim each sibling's durable row: ``(evt, text, claim_id)``, ``claim_id`` None where another
-        consumer holds the row. Blocking (``state.db``): run it off the loop. ``None`` when the ledger failed
-        mid-way; the rows this call already claimed are deferred (no attempt spent), never left claimed."""
-        from tools.async_delegation import claim_event_delivery
-        claimed: list[tuple[dict, str, Optional[str]]] = []
+    def _claim_async_siblings(self, candidates) -> Optional[list[tuple[dict, str, Optional[str], bool]]]:
+        """Claim each sibling's durable row: ``(evt, text, claim_id, pending)``, ``claim_id`` None where
+        another claim holds the row and ``pending`` whether that row still awaits delivery. Blocking
+        (``state.db``): run it off the loop. ``None`` when the ledger failed mid-way; the rows this call
+        already claimed are deferred (no attempt spent), never left claimed."""
+        from tools.async_delegation import claim_event_delivery, completion_delivery_pending
+        claimed: list[tuple[dict, str, Optional[str], bool]] = []
         try:
             for evt, synth_text in candidates:
-                claimed.append((evt, synth_text, claim_event_delivery(evt, f"gateway-batch:{id(self)}")))
+                claim_id = claim_event_delivery(evt, f"gateway-batch:{id(self)}")
+                pending = claim_id is None and completion_delivery_pending(str(evt.get("delegation_id") or ""))
+                claimed.append((evt, synth_text, claim_id, pending))
         except Exception as exc:
             logger.warning("Could not claim async completion siblings: %s", exc)
-            for evt, _text, claim_id in claimed:
+            for evt, _text, claim_id, _pending in claimed:
                 if claim_id:
                     self._settle_durable_claim("defer", str(evt.get("delegation_id") or ""), claim_id)
             return None

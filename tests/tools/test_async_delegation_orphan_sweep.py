@@ -198,6 +198,41 @@ def test_in_flight_claim_is_left_to_its_holder(tmp_path):
     assert q.empty()
 
 
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_live_owner_row_with_an_abandoned_claim_is_re_offered(tmp_path, exhausted):
+    """A live owner's unclaimed row is left to it (the copy is in its memory), but a claim past its lease
+    means no consumer holds the completion any more: a settle that failed after the claim, or a consumer
+    that discarded its copy. The sweep offers it again; a row whose last attempt was abandoned drops."""
+    home = tmp_path / "home"
+    home.mkdir()
+    q = queue.Queue()
+    with _Home(home):
+        handle = ad.dispatch_async_delegation(
+            goal="mine", context=None, toolsets=None, role="leaf", model="m", session_key="live",
+            runner=lambda: {"status": "completed", "summary": "done"})
+        deadline = time.monotonic() + 10
+        while ad.active_count() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        delegation_id = handle["delegation_id"]
+        assert _row(home, delegation_id)["owner_pid"] == os.getpid()
+        abandoned_at = time.time() - 3600
+        _set(home, delegation_id, delivery_claim="gateway:stale", delivery_claimed_at=abandoned_at,
+             updated_at=abandoned_at, delivery_attempts=ad._MAX_DELIVERY_ATTEMPTS if exhausted else 1)
+        # Inside the lease the claim is still its holder's.
+        assert ad.sweep_orphaned_completions(q, now=abandoned_at + ad._CLAIM_LEASE_S - 1) == 0
+        if exhausted:
+            assert ad.sweep_orphaned_completions(q) == 0
+            assert q.empty() and _row(home, delegation_id)["delivery_state"] == "dropped"
+            return
+        assert ad.sweep_orphaned_completions(q) == 1
+        (evt,) = _drain(q)
+        assert evt["delegation_id"] == delegation_id
+        assert ad.sweep_orphaned_completions(q) == 0  # offered once per live copy
+        claim = ad.claim_event_delivery(evt, "gateway")
+        assert claim and ad.complete_completion_delivery(delegation_id, claim)
+    assert _row(home, delegation_id)["delivery_state"] == "delivered"
+
+
 def test_gateway_watcher_sweeps_each_served_ledger_in_its_own_scope(tmp_path, monkeypatch):
     """The gateway's delivery loop re-offers a secondary profile's orphan while it runs."""
     from gateway.run import GatewayRunner
