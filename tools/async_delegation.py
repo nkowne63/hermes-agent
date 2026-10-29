@@ -613,6 +613,19 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def completion_delivery_pending(delegation_id: str) -> bool:
+    """Whether a durable completion still awaits delivery. A consumer whose claim was refused keeps its
+    copy while this holds: the claim is another consumer's, or its own that a failed settle left behind,
+    and either lapses after ``_CLAIM_LEASE_S``. Once the row is delivered or dropped the copy is spent."""
+    if remote := worker_ledger():
+        saved = remote.read(delegation_id)
+        return bool(saved) and saved.get("delivery_state") == "pending"
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
+    return row is not None and row[0] == "pending"
+
+
 def is_interim_delegation_event(evt: dict[str, Any]) -> bool:
     """An early per-task notice for a batch that is still running. It shares the batch's
     ``delegation_id`` but is NOT the durable completion: it must never claim, acknowledge or

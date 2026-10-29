@@ -1145,3 +1145,135 @@ def test_sibling_claim_failure_defers_claimed_siblings_and_retries_the_group(mon
         row = async_delegation.get_durable_delegation(event["delegation_id"])
         assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
         assert _claim_column(event["delegation_id"]) is None
+
+
+def test_failed_claim_settle_keeps_the_completion_until_its_claim_lapses(monkeypatch, isolated_registry):
+    """A settle that fails on a locked state.db leaves this runner's own claim on the row, so the next
+    attempt's claim is refused while that claim's lease runs. The runner must keep its copy and retry
+    (paced) instead of treating the refusal as settled and forgetting the result until a restart, then
+    deliver it exactly once when the lease lapses."""
+    from gateway.wake import WakeNotAccepted
+    from tools import async_delegation
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _distinct_async_event("deleg_stranded")
+    _persist_pending_completion(event)
+    isolated.put(dict(event))
+    real_defer = async_delegation.defer_completion_delivery
+
+    def _locked_once(_delegation_id, _claim_id):
+        monkeypatch.setattr(async_delegation, "defer_completion_delivery", real_defer)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(async_delegation, "defer_completion_delivery", _locked_once)
+    refusal = WakeNotAccepted("busy", reason="admission_conflict")
+    adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=[refusal, None]))
+    runner = _runner(adapter)
+    clock = install_module_clock(monkeypatch, run_notifications)
+    sleeps = 0
+
+    async def _next_pass(_delay):
+        nonlocal sleeps
+        sleeps += 1
+        clock.now += 60  # every watcher pass is a minute later, so a paced retry is due
+        if sleeps == 3:  # pass 1 was refused (its defer failed), pass 2 found its own claim: it lapses now
+            with sqlite3.connect(async_delegation._db_path()) as conn:
+                conn.execute("UPDATE async_delegations SET delivery_claimed_at=delivery_claimed_at-? "
+                             "WHERE delegation_id='deleg_stranded'", (async_delegation._CLAIM_LEASE_S + 1,))
+        if sleeps >= 5:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", _next_pass)
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert adapter.handle_message.await_count == 2  # the refusal, then the one delivery
+    row = async_delegation.get_durable_delegation("deleg_stranded")
+    assert row["delivery_state"] == "delivered"
+    assert _claim_column("deleg_stranded") is None
+    assert isolated.empty()
+
+
+@pytest.mark.parametrize("primary_failure", ["locked", "held"])
+def test_transient_primary_claim_failure_keeps_the_group_and_spends_no_sibling_attempt(
+    monkeypatch, isolated_registry, primary_failure,
+):
+    """The primary's row is locked or held by another claim after its siblings were claimed: nothing was
+    offered to the chat, so the siblings return to pending without spending an attempt and the whole
+    group stays queued for a paced retry."""
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_primary_{i}") for i in range(3)]
+    for event in events:
+        _persist_pending_completion(event)
+    primary = events[0]["delegation_id"]
+    if primary_failure == "held":
+        assert async_delegation.claim_completion_delivery(primary, "other-consumer:claim")
+    else:
+        real_claim = async_delegation.claim_completion_delivery
+
+        def _claim(delegation_id, claim_id):
+            if delegation_id == primary:
+                raise sqlite3.OperationalError("database is locked")
+            return real_claim(delegation_id, claim_id)
+
+        monkeypatch.setattr(async_delegation, "claim_completion_delivery", _claim)
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+
+    assert asyncio.run(runner._deliver_async_delegation_group([dict(event) for event in events])) is False
+
+    adapter.handle_message.assert_not_awaited()
+    for event in events[1:]:
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+        assert _claim_column(event["delegation_id"]) is None
+
+
+def test_held_sibling_stays_offered_and_a_settled_sibling_does_not(monkeypatch, isolated_registry):
+    """A sibling another claim holds is kept out of the turn but not forgotten: its row is still pending,
+    so its copy goes back on the queue (paced). A sibling another consumer already delivered is spent."""
+    from tools import async_delegation
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    events = [_distinct_async_event(f"deleg_sib_{i}") for i in range(3)]
+    for event in events:
+        _persist_pending_completion(event)
+    assert async_delegation.claim_completion_delivery("deleg_sib_1", "other-consumer:claim")
+    assert async_delegation.claim_completion_delivery("deleg_sib_2", "other-consumer:done")
+    assert async_delegation.complete_completion_delivery("deleg_sib_2", "other-consumer:done")
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+
+    assert asyncio.run(runner._deliver_async_delegation_group([dict(event) for event in events])) is True
+
+    adapter.handle_message.assert_awaited_once()
+    text = adapter.handle_message.await_args.args[0].text
+    assert "Result for deleg_sib_0" in text and "deleg_sib_1" not in text and "deleg_sib_2" not in text
+    requeued = []
+    while not isolated.empty():
+        requeued.append(isolated.get_nowait())
+    assert [evt["delegation_id"] for evt in requeued] == ["deleg_sib_1"]
+    assert requeued[0]["_watch_next_retry_at"] > 0
+
+
+def test_two_copies_of_one_row_in_a_group_deliver_it_once(monkeypatch, isolated_registry):
+    """A sweep re-offer beside the live copy lands in the same group. Claiming the second copy as a sibling
+    would hold the row against the primary on every retry; one copy per row goes into the turn."""
+    from tools import async_delegation
+
+    events = [_distinct_async_event("deleg_twice"), _distinct_async_event("deleg_twice"),
+              _distinct_async_event("deleg_beside")]
+    for event in (events[0], events[2]):
+        _persist_pending_completion(event)
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+
+    assert asyncio.run(runner._deliver_async_delegation_group([dict(event) for event in events])) is True
+
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].text.count("Result for deleg_twice") == 1
+    for delegation_id in ("deleg_twice", "deleg_beside"):
+        row = async_delegation.get_durable_delegation(delegation_id)
+        assert (row["delivery_state"], row["delivery_attempts"]) == ("delivered", 1)
