@@ -11,6 +11,7 @@ import json
 import queue
 import sqlite3
 import threading
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1277,3 +1278,104 @@ def test_two_copies_of_one_row_in_a_group_deliver_it_once(monkeypatch, isolated_
     for delegation_id in ("deleg_twice", "deleg_beside"):
         row = async_delegation.get_durable_delegation(delegation_id)
         assert (row["delivery_state"], row["delivery_attempts"]) == ("delivered", 1)
+
+
+_THREAD_ROUTE = "agent:main:discord:thread:111:222"
+
+
+def _discord_runner(**adapter_kwargs):
+    adapter = SimpleNamespace(send=AsyncMock(), **adapter_kwargs)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.DISCORD: adapter}
+    return runner, adapter
+
+
+@pytest.mark.parametrize(("completed_minutes_ago", "notices_after_each_refusal"), [
+    (1, [0, 0, 0, 0, 1, 1, 1]),  # the fifth refusal in a row
+    (31, [1, 1, 1, 1, 1, 1, 1]),  # already undelivered for 30 minutes: the first refusal
+])
+def test_a_completion_refused_again_and_again_tells_its_chat_once(
+    monkeypatch, isolated_registry, caplog, completed_minutes_ago, notices_after_each_refusal,
+):
+    """A non-permanent refusal is retried for as long as it lasts (#141153); a result that keeps being refused
+    must not stay invisible. Once per process its chat hears which delegation is waiting, why, and where the
+    result is kept, while delivery keeps retrying and the row stays pending."""
+    from gateway.wake import WakeNotAccepted
+    from tools import async_delegation
+
+    event = dict(_distinct_async_event("deleg_refused", session_key=_THREAD_ROUTE),
+                 completed_at=time.time() - completed_minutes_ago * 60)
+    _persist_pending_completion(event)
+    refusal = WakeNotAccepted("refused", reason="admission_conflict")
+    runner, adapter = _discord_runner(handle_message=AdmittingHandler(side_effect=refusal))
+
+    notices = []
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        for _attempt in range(7):
+            assert asyncio.run(runner._deliver_async_delegation_group([dict(event)])) is False
+            notices.append(adapter.send.await_count)
+
+    assert notices == notices_after_each_refusal
+    chat_id, text = adapter.send.await_args.args
+    assert chat_id == "111"
+    assert adapter.send.await_args.kwargs["metadata"] == {"thread_id": "222", "non_conversational": True}
+    for fragment in ("deleg_refused", "admission_conflict", "`delegate_task` status",
+                     "cache/delegation/live/deleg_refused/", "delivery keeps retrying"):
+        assert fragment in text
+    row = async_delegation.get_durable_delegation("deleg_refused")
+    assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+    assert len([r for r in caplog.records if "telling the chat" in r.getMessage()]) == 1
+
+
+def test_a_refused_group_tells_its_chat_once_for_every_completion_it_carries(monkeypatch, isolated_registry):
+    """A consolidated turn is refused as a whole: one notice names every delegation it carried."""
+    from gateway.wake import WakeNotAccepted
+    from tools import async_delegation
+
+    refusal = WakeNotAccepted("refused", reason="admission_conflict")
+    runner, adapter = _discord_runner(handle_message=AdmittingHandler(side_effect=refusal))
+    events = [dict(_distinct_async_event(f"deleg_group_{i}", session_key=_THREAD_ROUTE), completed_at=time.time())
+              for i in range(2)]
+    for event in events:
+        _persist_pending_completion(event)
+
+    for _attempt in range(7):
+        assert asyncio.run(runner._deliver_async_delegation_group([dict(event) for event in events])) is False
+
+    adapter.send.assert_awaited_once()
+    text = adapter.send.await_args.args[1]
+    assert "deleg_group_0, deleg_group_1" in text
+    assert "cache/delegation/live/deleg_group_0/" in text and "cache/delegation/live/deleg_group_1/" in text
+    for event in events:
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+
+
+def test_a_completion_dropped_for_good_tells_its_chat_once(monkeypatch, isolated_registry):
+    """The spawning session ended at /new: the pre-flight drops the row for good. The chat it came from hears
+    once that the result will not arrive and where it is kept."""
+    from tools import async_delegation
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = dict(_distinct_async_event("deleg_after_new", session_key=_THREAD_ROUTE),
+                 parent_session_id="ended-session")
+    _persist_pending_completion(event)
+    isolated.put(dict(event))
+    runner, adapter = _discord_runner(handle_message=AdmittingHandler())
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(
+        return_value={"ended_at": 1.0, "end_reason": "new_session"}))
+    _stop_after_sleeps(monkeypatch, runner, count=4)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    chat_id, text = adapter.send.await_args.args
+    assert chat_id == "111"
+    assert adapter.send.await_args.kwargs["metadata"] == {"thread_id": "222", "non_conversational": True}
+    for fragment in ("deleg_after_new", "will not be retried", "the session it belonged to has ended",
+                     "cache/delegation/live/deleg_after_new/"):
+        assert fragment in text
+    assert async_delegation.get_durable_delegation("deleg_after_new")["delivery_state"] == "dropped"
+    assert isolated.empty()
