@@ -70,6 +70,13 @@ _COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
 # Drain retries of a refused watch event follow the same bounded-backoff policy, keyed to the
 # 2 s drain cadence instead of the watcher's check interval (#140899).
 _WATCH_INJECTION_RETRY_BASE_DELAY = 4.0
+# A durable async completion refused (not permanently) this many times without an acceptance in between, or
+# still undelivered this long after it completed, is reported once per process in its chat; delivery keeps
+# retrying and nothing is dropped.
+_ASYNC_REFUSAL_NOTICE_AFTER = 5
+_ASYNC_REFUSAL_NOTICE_AGE_S = 30 * 60.0
+# Bounds one delivery-notice send so a wedged transport cannot hold the async-delegation watcher.
+_ASYNC_NOTICE_SEND_TIMEOUT_S = 15.0
 
 
 def _refusal_retry_at(step: int) -> float:
@@ -85,6 +92,34 @@ _DURABLE_CLAIM_OPS = {
     "defer": ("defer_completion_delivery", "Could not defer unadmitted completion claim"),
     "complete": ("complete_completion_delivery", "Could not acknowledge durable completion claim"),
 }
+
+
+def _delegation_records_hint(delegation_ids) -> str:
+    """Where a background result stays readable in the ACTIVE profile (call it under the event's scope)."""
+    from tools.delegation_live_log import live_transcript_root
+    root = live_transcript_root()
+    with contextlib.suppress(ValueError):
+        root = Path("~") / root.relative_to(Path.home())
+    return "`delegate_task` status, " + ", ".join(f"{root}/{delegation_id}/" for delegation_id in delegation_ids)
+
+
+def _async_refusal_notice_text(delegation_ids, reason: str, refusals: int) -> str:
+    return (f"A background task result could not be delivered to this chat yet: delegation "
+            f"{', '.join(delegation_ids)} was refused by the session {refusals} time(s) ({reason}). The result is "
+            f"kept in the delegation records ({_delegation_records_hint(delegation_ids)}), and delivery keeps "
+            "retrying.")
+
+
+def _dropped_completion_notice_text(delegation_id: str, reason: str) -> str:
+    from tools.async_delegation import _MAX_COMPLETION_REPLAY_AGE_S, _MAX_DELIVERY_ATTEMPTS
+    why = {
+        "replay_age": f"it waited longer than {_MAX_COMPLETION_REPLAY_AGE_S / 3600:.0f} h for delivery",
+        "attempts_exhausted": f"its {_MAX_DELIVERY_ATTEMPTS} delivery attempts were used up",
+        "target_gone": "the session it belonged to has ended",
+    }.get(reason, reason)
+    return (f"A background task result was not delivered to this chat and will not be retried: delegation "
+            f"{delegation_id} was dropped because {why}. The result is kept in the delegation records "
+            f"({_delegation_records_hint([delegation_id])}).")
 
 
 INTERNAL_NOTIFICATION_FOOTER = (
@@ -1263,6 +1298,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
         accepted = identity_claimed = refused = False
+        refusal: Optional[WakeNotAccepted] = None
         try:
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
@@ -1296,7 +1332,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # A proven-permanent refusal spends its durable attempt, so the row converges to
             # ``dropped`` across restarts too (#141153); any other (restart wait, full FIFO, an owner
             # not yet proven) is refunded and never drops a completion the owner will take later.
-            refused = not exc.permanent
+            refused, refusal = not exc.permanent, exc
             return False
         finally:
             if identity_claimed and not accepted:
@@ -1308,6 +1344,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 *((sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims)])
             if accepted and sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
+            # The durable rows this turn carried: an acceptance clears their refusal streak, a refusal extends it.
+            durable = [evt] if claim.claim_id else []
+            durable += [sibling for sibling, claim_id in sibling_claims if claim_id]
+            if accepted:
+                self._forget_async_refusals(durable)
+            elif refused and durable:
+                await self._note_refused_async_completions(durable, refusal)
 
     @staticmethod
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
@@ -1690,6 +1733,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         for evt in group:
                             _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
+                # Undelivered results the ledger dropped for good (this pass, a sweep, or the boot replay).
+                await self._notify_dropped_async_completions()
             await asyncio.sleep(interval)
 
     @staticmethod
@@ -1701,6 +1746,77 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             step = int(evt.get("_watch_retry_step") or 0) + 1
             evt["_watch_retry_step"] = step
             evt["_watch_next_retry_at"] = _refusal_retry_at(step)
+
+    def _async_refusal_tracking(self) -> tuple[dict[str, int], set[str]]:
+        """``(refusals in a row per delegation, delegations whose chat was told)`` for this process. Lazy:
+        lifecycle tests build the runner via ``object.__new__``."""
+        tracking = getattr(self, "_async_refusal_state", None)
+        if tracking is None:
+            tracking = self._async_refusal_state = ({}, set())
+        return tracking
+
+    def _forget_async_refusals(self, events: list[dict]) -> None:
+        counts, _told = self._async_refusal_tracking()
+        for evt in events:
+            counts.pop(str(evt.get("delegation_id") or ""), None)
+
+    async def _note_refused_async_completions(self, events: list[dict], refusal) -> None:
+        """Count one more non-permanent refusal for each durable completion a refused turn carried. One
+        refused ``_ASYNC_REFUSAL_NOTICE_AFTER`` times in a row, or still undelivered
+        ``_ASYNC_REFUSAL_NOTICE_AGE_S`` after it completed, is reported once per process: a WARNING and a
+        notice in its chat. Delivery keeps retrying; nothing is dropped."""
+        counts, told = self._async_refusal_tracking()
+        now, due = time.time(), []
+        for evt in events:
+            delegation_id = str(evt.get("delegation_id") or "")
+            counts[delegation_id] = counts.get(delegation_id, 0) + 1
+            try:
+                waited = now - float(evt.get("completed_at") or now)
+            except (TypeError, ValueError):
+                waited = 0.0
+            if delegation_id not in told and (
+                    counts[delegation_id] >= _ASYNC_REFUSAL_NOTICE_AFTER or waited >= _ASYNC_REFUSAL_NOTICE_AGE_S):
+                told.add(delegation_id)
+                due.append(delegation_id)
+        if not due:
+            return
+        reason = getattr(refusal, "reason", None) or "not accepted"
+        refusals = max(counts[delegation_id] for delegation_id in due)
+        logger.warning("Async delegation %s: completion refused %d time(s) in a row by its session (%s); "
+                       "telling the chat, delivery keeps retrying.", ", ".join(due), refusals, reason)
+        await self._send_async_delegation_notice(
+            events[0], lambda: _async_refusal_notice_text(due, reason, refusals))
+
+    async def _notify_dropped_async_completions(self) -> None:
+        """Tell each origin chat once about an undelivered background result the ledger dropped for good."""
+        from tools.async_delegation import drain_dropped_completions
+        for dropped in drain_dropped_completions():
+            delegation_id, reason = dropped["delegation_id"], dropped["reason"]
+            self._async_refusal_tracking()[0].pop(delegation_id, None)
+            await self._send_async_delegation_notice(
+                dropped["event"], lambda: _dropped_completion_notice_text(delegation_id, reason))
+
+    async def _send_async_delegation_notice(self, evt: dict, compose) -> None:
+        """Tell a background result's origin chat about its delivery: a non-conversational send through the
+        route's adapter (``_send_watcher_message``; no agent turn) under the event's profile scope and its
+        diagnostic presentation policy, bounded so a wedged transport cannot hold the delivery watcher.
+        ``compose()`` builds the text inside that scope, where the records path is the profile's."""
+        from gateway.warning_notifications import present_notification
+        evt = dict(evt)
+        self._enrich_async_delegation_routing(evt)
+        platform_name, chat_id = str(evt.get("platform") or ""), str(evt.get("chat_id") or "")
+        if not platform_name or not chat_id:
+            logger.info("Async delegation %s has no chat route for its delivery notice", evt.get("delegation_id"))
+            return
+        try:
+            async with self._completion_event_scope(evt):
+                text = compose()
+                await present_notification(lambda: asyncio.wait_for(
+                    self._send_watcher_message(platform_name, chat_id, evt.get("thread_id"), text, evt),
+                    timeout=_ASYNC_NOTICE_SEND_TIMEOUT_S), platform=platform_name)
+        except Exception as exc:
+            logger.warning("Could not send the delivery notice for async delegation %s: %s",
+                           evt.get("delegation_id"), exc)
 
     @staticmethod
     def _redacted_output_tail(session, limit: int) -> str:

@@ -9,6 +9,7 @@ crash-recovery wiring. Only the async lifecycle lives here; the child run is an 
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import logging
@@ -17,6 +18,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
@@ -60,6 +62,16 @@ _DB_LOCK = threading.Lock()
 # Resolved state.db path -> its ``PRAGMA schema_version`` right after this process reconciled it: a matching
 # cookie proves nothing changed the schema since, so later connections skip the DDL replay.
 _reconciled_schemas: dict[str, int] = {}
+# Undelivered completions this process turned terminally ``dropped`` (replay age, delivery budget, a target
+# gone for good), oldest first, for a delivery loop to tell their chat (``drain_dropped_completions``). Only a
+# committed drop is published; bounded, so a process that never drains (TUI, CLI) keeps just the tail.
+_MAX_DROPPED_NOTICES = 256
+_dropped_completions: deque = deque(maxlen=_MAX_DROPPED_NOTICES)
+_dropped_lock = threading.Lock()
+_staged_drops = threading.local()  # this thread's open transaction's drops, published on commit
+# The event fields a drop notice needs to find its chat (never the result itself).
+_DROP_NOTICE_FIELDS = ("type", "delegation_id", "session_key", "platform", "chat_type", "chat_id", "thread_id",
+                       "user_id", "user_name", "scope_id", "origin_session_id", "parent_session_id", "completed_at")
 
 # ── Orphaned-completion sweep ────────────────────────────────────────────────
 # Startup replay runs once per process, so a completion whose owner died while THIS process was
@@ -162,10 +174,52 @@ def _initialize_schema(conn: sqlite3.Connection, db_key: Optional[str] = None) -
         _reconciled_schemas[db_key] = _schema_cookie(conn)
 
 
+@contextlib.contextmanager
 def _transaction():
+    """One ledger transaction (commit, or rollback, then close). Completions it dropped are published for
+    ``drain_dropped_completions`` only once it committed."""
     from hermes_cli.sqlite_util import transaction
 
-    return transaction(_connect())
+    staged = _staged_drops.__dict__.setdefault("drops", [])
+    mark = len(staged)
+    try:
+        with transaction(_connect()) as conn:
+            yield conn
+    except BaseException:
+        del staged[mark:]
+        raise
+    committed = staged[mark:]
+    del staged[mark:]
+    if committed:
+        with _dropped_lock:
+            _dropped_completions.extend(committed)
+
+
+def _stage_dropped(conn, delegation_id: str, reason: str, payload: Optional[str] = None) -> None:
+    """Note an undelivered completion the open transaction just dropped for good; ``reason`` is
+    ``replay_age``, ``attempts_exhausted`` or ``target_gone``. ``payload`` is its stored event_json
+    (read from the row when not given)."""
+    if payload is None:
+        row = conn.execute("SELECT event_json FROM async_delegations WHERE delegation_id=?",
+                           (delegation_id,)).fetchone()
+        payload = row[0] if row else None
+    try:
+        evt = json.loads(payload) if payload else {}
+    except (TypeError, ValueError):
+        evt = {}
+    evt = evt if isinstance(evt, dict) else {}
+    route = {key: evt[key] for key in _DROP_NOTICE_FIELDS if evt.get(key) is not None}
+    _staged_drops.__dict__.setdefault("drops", []).append(
+        {"delegation_id": delegation_id, "reason": reason, "event": {**route, "delegation_id": delegation_id}})
+
+
+def drain_dropped_completions() -> list[dict[str, Any]]:
+    """Pop the ``{delegation_id, reason, event}`` records of undelivered completions this process dropped
+    since the last drain (``event`` holds only the routing fields of the stored completion event)."""
+    with _dropped_lock:
+        drained = list(_dropped_completions)
+        _dropped_completions.clear()
+    return drained
 
 
 def _capture_routing_origin() -> dict[str, Any]:
@@ -386,10 +440,12 @@ def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = Fal
     for delegation_id, payload, completed_at, dispatched_at in rows:
         age_basis = completed_at or dispatched_at
         if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
-            conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+            dropped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
                           delivery_claim=NULL, delivery_claimed_at=NULL,
                           updated_at=?
                    WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
+            if dropped.rowcount == 1:
+                _stage_dropped(conn, delegation_id, "replay_age", payload)
             logger.warning("Async delegation %s: pending completion is %.1fh old "
                            "(cap %.1fh); terminally dropping the replay (result remains queryable).",
                            delegation_id, (now - age_basis) / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
@@ -455,9 +511,11 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
             if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
                 # Its last claimant died or gave up holding the final attempt; converge like
                 # release_completion_delivery.
-                conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+                dropped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
                               delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
                        WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
+                if dropped.rowcount == 1:
+                    _stage_dropped(conn, delegation_id, "attempts_exhausted", payload)
                 logger.warning("Async delegation %s exhausted its %d delivery attempts; "
                                "marking terminally dropped (result remains queryable).",
                                delegation_id, _MAX_DELIVERY_ATTEMPTS)
@@ -561,6 +619,7 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND delivery_claim=? AND delivery_attempts>=?""",
             (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS))
         if capped.rowcount == 1:
+            _stage_dropped(conn, delegation_id, "attempts_exhausted")
             logger.warning("Async delegation %s exhausted its %d delivery attempts; "
                            "marking terminally dropped (result remains queryable).",
                            delegation_id, _MAX_DELIVERY_ATTEMPTS)
@@ -590,11 +649,15 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     restart recovery from replaying it into a fail-closed drop forever."""
     if remote := worker_ledger():
         return remote.drop(delegation_id, claim_id)
-    return _update_delivery("""UPDATE async_delegations SET delivery_state='dropped',
-                  updated_at=?, delivery_claim=NULL,
-                  delivery_claimed_at=NULL
-           WHERE delegation_id=? AND delivery_state='pending'
-             AND delivery_claim=?""", (time.time(), delegation_id, claim_id))
+    with _DB_LOCK, _transaction() as conn:
+        dropped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+                      updated_at=?, delivery_claim=NULL,
+                      delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""", (time.time(), delegation_id, claim_id)).rowcount == 1
+        if dropped:
+            _stage_dropped(conn, delegation_id, "target_gone")
+        return dropped
 
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -621,6 +684,7 @@ def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
                WHERE delegation_id=? AND delivery_state='delivered' AND delivery_attempts>=?""",
             (now, delegation_id, _MAX_DELIVERY_ATTEMPTS))
         if exhausted.rowcount == 1:
+            _stage_dropped(conn, delegation_id, "attempts_exhausted")
             logger.warning("Async delegation %s exhausted its %d delivery attempts; "
                            "marking terminally dropped (result remains queryable).",
                            delegation_id, _MAX_DELIVERY_ATTEMPTS)
@@ -1372,3 +1436,4 @@ def _reset_for_tests() -> None:
         _startup_replayed.clear()
         _last_orphan_sweep.clear()
     _reconciled_schemas.clear()
+    drain_dropped_completions()
