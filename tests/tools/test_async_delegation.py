@@ -100,6 +100,42 @@ def test_schema_init_preserves_shared_state_db_wal_mode(tmp_path):
         conn.close()
 
 
+def test_ledger_reconciles_the_schema_once_per_database(tmp_path, monkeypatch):
+    """Every ledger op opens a fresh connection; replaying the canonical DDL on each one made every claim a
+    schema write on a busy state.db. Barriers stay per connection; the replay runs once per database until
+    something changes its schema (another migrator, or the file was recreated)."""
+    import hermes_state_repair
+    import hermes_state_schema
+
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db)
+    reconciles, barriers = [], []
+    real_reconcile, real_barriers = hermes_state_schema.reconcile_state_schema, hermes_state_repair.apply_durability_barriers
+    monkeypatch.setattr(hermes_state_schema, "reconcile_state_schema",
+                        lambda conn: reconciles.append(conn) or real_reconcile(conn))
+    monkeypatch.setattr(hermes_state_repair, "apply_durability_barriers",
+                        lambda conn: barriers.append(conn) or real_barriers(conn))
+
+    assert ad.get_durable_delegation("missing") is None
+    assert ad.claim_completion_delivery("missing", "claim")
+    assert (len(reconciles), len(barriers)) == (1, 2)
+
+    other_writer = sqlite3.connect(db)
+    try:
+        other_writer.execute("CREATE TABLE another_writers_table (x)")
+        other_writer.commit()
+    finally:
+        other_writer.close()
+    ad.get_durable_delegation("missing")
+    ad.get_durable_delegation("missing")
+    assert (len(reconciles), len(barriers)) == (2, 4)
+
+    for suffix in ("", "-wal", "-shm"):
+        db.with_name(db.name + suffix).unlink(missing_ok=True)
+    assert ad.get_durable_delegation("missing") is None
+    assert (len(reconciles), len(barriers)) == (3, 5)
+
+
 @pytest.mark.platforms("macos")
 def test_connect_preserves_wal_and_applies_macos_durability_barriers(
     tmp_path, monkeypatch

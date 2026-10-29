@@ -57,6 +57,9 @@ _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 # A delivery claim older than this is abandoned and may be re-claimed.
 _CLAIM_LEASE_S = 300.0
 _DB_LOCK = threading.Lock()
+# Resolved state.db path -> its ``PRAGMA schema_version`` right after this process reconciled it: a matching
+# cookie proves nothing changed the schema since, so later connections skip the DDL replay.
+_reconciled_schemas: dict[str, int] = {}
 
 # ── Orphaned-completion sweep ────────────────────────────────────────────────
 # Startup replay runs once per process, so a completion whose owner died while THIS process was
@@ -123,19 +126,30 @@ def _connect() -> sqlite3.Connection:
     # A late replay or writer must not resurrect a removed named profile (#123265).
     mkdir_under_hermes_home(path.parent)
     _secure_state_db_files(path, create_main=True)
+    db_key = str(path.resolve())
     # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
     conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
-                   wal=False, row_factory=None, initialize=_initialize_schema)
+                   wal=False, row_factory=None, initialize=lambda c: _initialize_schema(c, db_key))
     _secure_state_db_files(path)
     return conn
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
+def _schema_cookie(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA schema_version").fetchone()[0])
+
+
+def _initialize_schema(conn: sqlite3.Connection, db_key: Optional[str] = None) -> None:
+    """Per-connection durability barriers, then the canonical schema. With ``db_key`` (the resolved path) the
+    schema is reconciled once per process and database: a later connection whose schema cookie still matches
+    the reconciled one skips the replay, so a ledger op on a busy state.db is not a DDL write every time. A
+    changed cookie (another writer migrated, or the file was recreated) reconciles again."""
     from hermes_state_repair import apply_durability_barriers
     from hermes_state_schema import reconcile_state_schema
     # Preserve the journal mode SessionDB configured on state.db: forcing WAL from
     # every short-lived connection collides with live transcript/FTS writers.
     apply_durability_barriers(conn)
+    if db_key is not None and _reconciled_schemas.get(db_key) == _schema_cookie(conn):
+        return
     # Single durable-shape authority: the canonical SCHEMA_SQL drives both
     # table creation and column backfill (reconcile_state_schema replays the
     # canonical DDL and reuses SessionDB's declarative reconciliation). This
@@ -144,6 +158,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # nullability/defaults depending on which authority touched the database
     # first (#94691).
     reconcile_state_schema(conn)
+    if db_key is not None:
+        _reconciled_schemas[db_key] = _schema_cookie(conn)
 
 
 def _transaction():
@@ -1337,3 +1353,4 @@ def _reset_for_tests() -> None:
         _offered.clear()
         _startup_replayed.clear()
         _last_orphan_sweep.clear()
+    _reconciled_schemas.clear()

@@ -1391,8 +1391,9 @@ class GatewayStartupMixin:
         from gateway.run import MultiplexConfigError
         from tools.process_registry import process_registry as _pr
         # The launch profile's durable completions replay here, not at import (#123265); the
-        # secondaries' ledgers are replayed by _restore_secondary_completion_ledgers below.
-        _pr.restore_completions()
+        # secondaries' ledgers are replayed by _restore_secondary_completion_ledgers below. Off the
+        # loop: the primary adapters are already connected and a busy state.db would stall them.
+        await asyncio.to_thread(_pr.restore_completions)
         # Secondary-profile adapters connect under their own home + credential scope.
         try:
             connected_count += await self._start_secondary_profile_adapters()

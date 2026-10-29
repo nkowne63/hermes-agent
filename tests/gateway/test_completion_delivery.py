@@ -9,6 +9,8 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+import sqlite3
+import threading
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1003,3 +1005,143 @@ def test_watch_drain_retries_transport_failure(monkeypatch, isolated_registry):
     asyncio.run(runner._async_delegation_watcher(interval=0))
     assert adapter.handle_message.await_count == 2
     assert isolated_registry.completion_queue.empty()
+
+
+_LEDGER_OPS = ("claim_completion_delivery", "complete_completion_delivery", "defer_completion_delivery",
+               "release_completion_delivery", "drop_completion_delivery")
+
+
+def _record_ledger_calls(monkeypatch):
+    """``(op, thread, hermes home)`` for every durable-ledger op; the real op still runs."""
+    from hermes_constants import get_hermes_home
+    from tools import async_delegation
+
+    calls = []
+    for name in _LEDGER_OPS:
+        def _recorded(*args, _real=getattr(async_delegation, name), _name=name):
+            calls.append((_name, threading.get_ident(), str(get_hermes_home())))
+            return _real(*args)
+        monkeypatch.setattr(async_delegation, name, _recorded)
+    return calls
+
+
+def _claim_column(delegation_id):
+    from tools import async_delegation
+    with sqlite3.connect(async_delegation._db_path()) as conn:
+        return conn.execute("SELECT delivery_claim FROM async_delegations WHERE delegation_id=?",
+                            (delegation_id,)).fetchone()[0]
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "refused"])
+def test_async_group_ledger_ops_run_off_the_event_loop(monkeypatch, isolated_registry, outcome):
+    """Each claim (primary and siblings) and each settle waits on state.db's busy timeout; on the loop that
+    stalls every adapter's heartbeat (a Discord gateway reconnects), so all of them run in a worker thread."""
+    from gateway.wake import WakeNotAccepted
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_off_loop_{i}") for i in range(3)]
+    for event in events:
+        _persist_pending_completion(event)
+    calls = _record_ledger_calls(monkeypatch)
+    refusal = WakeNotAccepted("busy", reason="admission_conflict")
+    adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=refusal if outcome == "refused" else None))
+    runner = _runner(adapter)
+
+    delivered = asyncio.run(runner._deliver_async_delegation_group([dict(event) for event in events]))
+
+    settle = "complete_completion_delivery" if outcome == "accepted" else "defer_completion_delivery"
+    assert delivered is (outcome == "accepted")
+    assert sorted(name for name, _thread, _home in calls) == ["claim_completion_delivery"] * 3 + [settle] * 3
+    loop_thread = threading.get_ident()
+    assert [name for name, thread, _home in calls if thread == loop_thread] == []
+    for event in events:
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert row["delivery_state"] == ("delivered" if outcome == "accepted" else "pending")
+        assert _claim_column(event["delegation_id"]) is None
+
+
+def test_terminal_target_drop_runs_off_the_event_loop(monkeypatch, isolated_registry):
+    from tools import async_delegation
+
+    event = dict(_async_event("deleg_gone"), parent_session_id="ended-session")
+    _persist_pending_completion(event)
+    calls = _record_ledger_calls(monkeypatch)
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(
+        return_value={"ended_at": 1.0, "end_reason": "new_session"}))
+
+    assert asyncio.run(runner._deliver_completion_notification("result", dict(event))) is None
+
+    adapter.handle_message.assert_not_awaited()
+    assert "drop_completion_delivery" in [name for name, _thread, _home in calls]
+    assert all(thread != threading.get_ident() for _name, thread, _home in calls)
+    assert async_delegation.get_durable_delegation("deleg_gone")["delivery_state"] == "dropped"
+
+
+def test_secondary_profile_ledger_ops_hit_its_own_state_db_from_the_worker_thread(
+    monkeypatch, tmp_path, isolated_registry,
+):
+    """The worker thread inherits the event's profile scope (a context variable), so a secondary
+    profile's claim and acknowledgement land in that profile's state.db, never the launch ledger."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import async_delegation
+
+    secondary = tmp_path / "profiles" / "team_b"
+    secondary.mkdir(parents=True)
+    key = "agent:team_b:telegram:dm:12345"
+    events = [_distinct_async_event(f"deleg_team_b_{i}", session_key=key) for i in range(2)]
+    token = set_hermes_home_override(str(secondary))
+    try:
+        for event in events:
+            _persist_pending_completion(event)
+    finally:
+        reset_hermes_home_override(token)
+    calls = _record_ledger_calls(monkeypatch)
+    secondary_adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner._profile_adapters = {"team_b": {Platform.TELEGRAM: secondary_adapter}}
+    runner._resolve_profile_home_for_source = lambda _source: secondary
+
+    assert asyncio.run(runner._deliver_async_delegation_group([dict(event) for event in events])) is True
+
+    secondary_adapter.handle_message.assert_awaited_once()
+    assert sorted(name for name, _thread, _home in calls) == (
+        ["claim_completion_delivery"] * 2 + ["complete_completion_delivery"] * 2)
+    assert {home for _name, _thread, home in calls} == {str(secondary)}
+    assert all(thread != threading.get_ident() for _name, thread, _home in calls)
+    token = set_hermes_home_override(str(secondary))
+    try:
+        for event in events:
+            assert async_delegation.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+    finally:
+        reset_hermes_home_override(token)
+    assert async_delegation.get_durable_delegation(events[0]["delegation_id"]) is None  # launch ledger untouched
+
+
+def test_sibling_claim_failure_defers_claimed_siblings_and_retries_the_group(monkeypatch, isolated_registry):
+    """A locked ledger mid-way through the sibling claims must not escape the group delivery holding the
+    claims already taken: they are deferred (no attempt spent) and the whole group retries."""
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_locked_{i}") for i in range(3)]
+    for event in events:
+        _persist_pending_completion(event)
+    real_claim = async_delegation.claim_event_delivery
+
+    def _claim(evt, consumer):
+        if evt["delegation_id"] == "deleg_locked_2":
+            raise sqlite3.OperationalError("database is locked")
+        return real_claim(evt, consumer)
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _claim)
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+
+    assert asyncio.run(runner._deliver_async_delegation_group([dict(event) for event in events])) is False
+
+    adapter.handle_message.assert_not_awaited()
+    for event in events:
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+        assert _claim_column(event["delegation_id"]) is None
