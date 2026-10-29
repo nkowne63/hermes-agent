@@ -716,6 +716,19 @@ every producer identity, a "N background process results" header), cancelling th
 the same transaction. Only the tail folds, so a prompt queued after a completion keeps its place
 between them; a waiting row claimed first leaves the new completion to queue alone.
 
+Durable async-delegation ledger ops (the claims and their complete/defer/release/drop settles) never
+run on the event loop: a busy `state.db` waits out its 10 s busy timeout per op, which on the loop
+stalls every adapter heartbeat. They go through `asyncio.to_thread`, whose copied context keeps the
+event's profile scope, so each op still hits that profile's `state.db`; the ledger replays the
+canonical schema once per process and database, not per op. A claim refused while the row is still
+pending (another consumer's claim, or this runner's own one that a failed settle left behind) keeps
+the in-memory copy for a paced retry; only a delivered or dropped row spends it. A completion refused
+(not permanently) 5 times in a row, or still undelivered 30 minutes after it completed, gets one
+diagnostic notice in its origin chat per process while delivery keeps retrying; one the ledger drops
+for good (replay age, delivery budget, a gone target) gets one notice too, drained from
+`drain_dropped_completions()` by the delivery watcher. Both name the delegation and where its result
+is kept.
+
 Cron execution has its own session. Eligible continuable deliveries may mirror or seed the
 reply-facing conversation: origin, origin-less home fallback, user-written bare-platform home,
 or opted-in explicit targets. `all` expansions do not gain home mirror eligibility. Mirrored
